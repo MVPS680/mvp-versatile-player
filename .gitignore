@@ -1,0 +1,9 @@
+﻿/target
+/target-sub
+/target-sub-linux
+/dist
+*.pdb
+*.ilk
+*.exp
+.DS_Store
+Thumbs.db

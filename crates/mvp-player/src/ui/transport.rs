@@ -1,0 +1,386 @@
+//! The transport bar: seek bar, timestamps and every playback control.
+
+use egui::containers::menu::MenuButton;
+use egui::{Align, Context, Layout, RichText, Ui};
+
+use crate::app::PlayerApp;
+use crate::icons::Icon;
+use crate::state::{Mode, Overlay, Toast};
+use crate::theme::{font, space, Tokens};
+use crate::ui::widgets;
+
+/// The docked transport bar under the video.
+pub fn draw(app: &mut PlayerApp, ctx: &Context) {
+    let tokens = app.theme.tokens.clone();
+    let frame = egui::Frame::new()
+        .fill(tokens.panel)
+        .inner_margin(egui::Margin::symmetric(space::MD as i8, space::SM as i8))
+        .stroke(egui::Stroke::new(1.0, tokens.border));
+
+    egui::TopBottomPanel::bottom("mvp_transport")
+        .frame(frame)
+        .exact_height(84.0)
+        .show(ctx, |ui| {
+            seek_row(app, ui, &tokens);
+            ui.add_space(2.0);
+            button_row(app, ui, &tokens);
+        });
+}
+
+/// A floating bar drawn over the video in fullscreen.
+pub fn draw_overlay(app: &mut PlayerApp, ctx: &Context) {
+    let tokens = app.theme.tokens.clone();
+    egui::Area::new(egui::Id::new("mvp_transport_overlay"))
+        .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -24.0))
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(tokens.elevated.gamma_multiply(0.94))
+                .corner_radius(egui::CornerRadius::same(12))
+                .inner_margin(egui::Margin::symmetric(space::LG as i8, space::SM as i8))
+                .stroke(egui::Stroke::new(1.0, tokens.border_strong))
+                .show(ui, |ui| {
+                    ui.set_width(720.0);
+                    seek_row(app, ui, &tokens);
+                    ui.add_space(2.0);
+                    button_row(app, ui, &tokens);
+                });
+        });
+}
+
+/// Timestamp + seek bar + duration.
+fn seek_row(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
+    let active = app.mode.is_media();
+    let duration = app.engine.duration();
+    let position = app.engine.display_position();
+    let preview = app.ui.seek_drag;
+
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = space::SM;
+        let shown = preview.unwrap_or(position);
+        ui.label(
+            RichText::new(mvp_core::util::format_duration(shown))
+                .size(font::SMALL)
+                .monospace()
+                .color(if preview.is_some() {
+                    tokens.accent
+                } else {
+                    tokens.text
+                }),
+        );
+
+        let width = (ui.available_width() - 110.0).max(120.0);
+        let output = ui.allocate_ui(egui::vec2(width, 22.0), |ui| {
+            ui.set_width(width);
+            widgets::seek_bar(ui, tokens, position, duration, preview)
+        });
+
+        let bar = output.inner;
+        if let Some(value) = bar.preview {
+            if active {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                app.ui.video_hover_time = Some(value);
+            }
+        } else {
+            app.ui.video_hover_time = None;
+        }
+
+        // While dragging, only preview; seek once on release so a slow disk is
+        // not hit dozens of times per second.
+        if let Some(value) = bar.released {
+            if active {
+                if bar.response.dragged() {
+                    app.ui.seek_drag = Some(value);
+                } else {
+                    app.engine.seek(value);
+                    app.ui.seek_drag = None;
+                }
+            }
+        }
+        if bar.response.drag_stopped() {
+            if let Some(value) = app.ui.seek_drag.take() {
+                app.engine.seek(value);
+            }
+        }
+
+        ui.label(
+            RichText::new(if duration > 0.0 {
+                mvp_core::util::format_duration(duration)
+            } else {
+                "--:--".to_string()
+            })
+            .size(font::SMALL)
+            .monospace()
+            .color(tokens.text_weak),
+        );
+    });
+}
+
+/// Transport buttons, volume, speed and window controls.
+fn button_row(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
+    let active = app.mode.is_media();
+    let playing = app.engine.is_playing();
+
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = space::SM;
+
+        // ---- playlist navigation -----------------------------------------
+        if widgets::tool_button(tokens, ui, Icon::Previous, "上一项 (P)", app.has_previous())
+            .clicked()
+        {
+            app.prev_media();
+        }
+        if widgets::tool_button(
+            tokens,
+            ui,
+            Icon::Rewind,
+            "后退 5 秒 (←)",
+            active,
+        )
+        .clicked()
+        {
+            app.engine.seek_relative(-app.settings.seek_step);
+        }
+
+        // ---- play / pause -------------------------------------------------
+        let (icon, tip) = if playing {
+            (Icon::Pause, "暂停 (空格)")
+        } else {
+            (Icon::Play, "播放 (空格)")
+        };
+        if crate::icons::primary_transport_button(
+            ui,
+            icon,
+            40.0,
+            tokens.accent,
+            tokens.accent_hover,
+            tokens.on_accent,
+        )
+        .on_hover_text(tip)
+        .clicked()
+        {
+            if active {
+                app.engine.toggle_pause();
+            } else if let Some(index) = app.playlist.current_index() {
+                app.play_index(index);
+            } else {
+                app.request_open_file();
+            }
+        }
+
+        if widgets::tool_button(tokens, ui, Icon::Forward, "前进 5 秒 (→)", active).clicked() {
+            app.engine.seek_relative(app.settings.seek_step);
+        }
+        if widgets::tool_button(tokens, ui, Icon::Next, "下一项 (N)", app.has_next()).clicked() {
+            app.next_media(false);
+        }
+
+        ui.add_space(space::MD);
+
+        // ---- volume --------------------------------------------------------
+        let muted = app.settings.muted || app.settings.volume <= 0.0;
+        let volume_icon = if muted {
+            Icon::VolumeMute
+        } else if app.settings.volume < 0.5 {
+            Icon::VolumeLow
+        } else {
+            Icon::VolumeHigh
+        };
+        if widgets::tool_button(
+            tokens,
+            ui,
+            volume_icon,
+            if muted {
+                "取消静音 (M)"
+            } else {
+                "静音 (M)"
+            },
+            true,
+        )
+        .clicked()
+        {
+            app.settings.muted = !app.settings.muted;
+            app.store.mark_dirty();
+        }
+        if let Some(value) = widgets::volume_slider(ui, tokens, app.settings.volume) {
+            app.settings.volume = value;
+            if value > 0.0 {
+                app.settings.muted = false;
+            }
+            app.store.mark_dirty();
+        }
+        let percent = (app.settings.volume * 100.0).round() as i32;
+        if ui
+            .add_sized(
+                egui::vec2(38.0, 20.0),
+                egui::Label::new(
+                    RichText::new(format!("{percent}%"))
+                        .size(font::TINY)
+                        .color(tokens.text_weak),
+                )
+                .selectable(false),
+            )
+            .on_hover_text("音量")
+            .clicked()
+        {
+            app.settings.muted = !app.settings.muted;
+            app.store.mark_dirty();
+        }
+
+        ui.add_space(space::SM);
+
+        // ---- speed ---------------------------------------------------------
+        // A menu button rather than a hand-rolled popup: it dismisses on an
+        // outside click and on Escape by itself.
+        let (speed_icon, _) =
+            ui.allocate_exact_size(egui::vec2(18.0, 20.0), egui::Sense::hover());
+        crate::icons::draw(
+            ui.painter(),
+            speed_icon.shrink(2.0),
+            Icon::Speed,
+            if (app.settings.speed - 1.0).abs() > 1e-3 {
+                tokens.accent
+            } else {
+                tokens.text_weak
+            },
+        );
+        MenuButton::new(
+            RichText::new(format!("{:.2}x", app.settings.speed))
+                .size(font::SMALL)
+                .color(if (app.settings.speed - 1.0).abs() > 1e-3 {
+                    tokens.accent
+                } else {
+                    tokens.text_weak
+                }),
+        )
+        .ui(ui, |ui| {
+            ui.set_width(150.0);
+            for speed in [0.25f64, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0] {
+                let selected = (app.settings.speed - speed).abs() < 1e-3;
+                if ui
+                    .selectable_label(
+                        selected,
+                        RichText::new(format!("{speed:.2}x")).size(font::SMALL),
+                    )
+                    .clicked()
+                {
+                    app.settings.speed = speed;
+                    app.store.mark_dirty();
+                    ui.close();
+                }
+            }
+            ui.separator();
+            if ui
+                .button(RichText::new("恢复正常速度").size(font::SMALL))
+                .clicked()
+            {
+                app.settings.speed = 1.0;
+                app.store.mark_dirty();
+                ui.close();
+            }
+        });
+
+        // ---- right-hand controls -------------------------------------------
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = space::SM;
+
+            if widgets::tool_button(
+                tokens,
+                ui,
+                if app.ui.fullscreen {
+                    Icon::ExitFullscreen
+                } else {
+                    Icon::Fullscreen
+                },
+                "全屏 (F)",
+                true,
+            )
+            .clicked()
+            {
+                app.toggle_fullscreen(ui.ctx());
+            }
+
+            if widgets::tool_button(tokens, ui, Icon::Settings, "设置 (Ctrl+,)", true).clicked() {
+                app.ui.open_overlay(Overlay::Settings);
+            }
+
+            if widgets::tool_button(tokens, ui, Icon::Snapshot, "截图 (S)", app.mode != Mode::Empty)
+                .clicked()
+            {
+                app.save_snapshot();
+            }
+
+            // ---- repeat / shuffle -------------------------------------------
+            if widgets::toggle_tool_button(
+                tokens,
+                ui,
+                if app.settings.repeat == mvp_core::playlist::RepeatMode::One {
+                    Icon::RepeatOne
+                } else {
+                    Icon::Repeat
+                },
+                "循环模式 (C)",
+                app.settings.repeat != mvp_core::playlist::RepeatMode::Off,
+                true,
+            )
+            .clicked()
+            {
+                app.settings.repeat = app.settings.repeat.next();
+                app.store.mark_dirty();
+                app.toast(Toast::info(format!(
+                    "循环模式 · {}",
+                    crate::state::repeat_label(app.settings.repeat)
+                )));
+            }
+            if widgets::toggle_tool_button(
+                tokens,
+                ui,
+                Icon::Shuffle,
+                "随机播放 (H)",
+                app.settings.shuffle,
+                true,
+            )
+            .clicked()
+            {
+                app.settings.shuffle = !app.settings.shuffle;
+                app.store.mark_dirty();
+            }
+
+            // ---- subtitles ---------------------------------------------------
+            let subtitle_on = app.settings.subtitles_enabled && app.engine.subtitle().is_some();
+            if widgets::toggle_tool_button(
+                tokens,
+                ui,
+                Icon::Subtitles,
+                "字幕开关 (V) · 加载字幕 (G)",
+                subtitle_on,
+                true,
+            )
+            .clicked()
+            {
+                app.settings.subtitles_enabled = !app.settings.subtitles_enabled;
+                app.store.mark_dirty();
+                app.toast(Toast::info(if app.settings.subtitles_enabled {
+                    "字幕已开启"
+                } else {
+                    "字幕已关闭"
+                }));
+            }
+
+            // ---- sidebar -----------------------------------------------------
+            if widgets::toggle_tool_button(
+                tokens,
+                ui,
+                Icon::Playlist,
+                "播放列表 (Ctrl+L)",
+                app.ui.sidebar_visible,
+                true,
+            )
+            .clicked()
+            {
+                app.ui.sidebar_visible = !app.ui.sidebar_visible;
+                app.store.mark_dirty();
+            }
+        });
+    });
+}

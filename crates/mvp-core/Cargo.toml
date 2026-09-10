@@ -1,0 +1,31 @@
+[package]
+name = "mvp-core"
+description = "FFmpeg-backed playback engine, image viewer model and playlist for MVP-Versatile-Player"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+log.workspace = true
+parking_lot.workspace = true
+crossbeam-channel.workspace = true
+bitflags.workspace = true
+once_cell.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+dirs.workspace = true
+walkdir.workspace = true
+bytemuck.workspace = true
+
+ffmpeg-next.workspace = true
+cpal.workspace = true
+image.workspace = true
+mvp-subtitle = { path = "../mvp-subtitle" }
+
+[dev-dependencies]
+# Integration tests drive real playback and need the engine's own log output to
+# explain a stall; without a logger a hung worker is just a silent timeout.
+env_logger.workspace = true
+log.workspace = true

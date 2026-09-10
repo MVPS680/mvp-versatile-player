@@ -1,0 +1,37 @@
+[package]
+name = "mvp-player"
+description = "MVP-Versatile-Player - versatile FFmpeg-powered audio/video/image player"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+default-run = "mvp-versatile-player"
+
+[[bin]]
+name = "mvp-versatile-player"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+dirs.workspace = true
+walkdir.workspace = true
+crossbeam-channel.workspace = true
+bytemuck.workspace = true
+
+eframe.workspace = true
+# `bytemuck` lets a decoded RGBA frame be reinterpreted as `Vec<Color32>` without
+# copying the pixels; see `PlayerApp::update_frame_texture`.
+egui = { workspace = true, features = ["bytemuck"] }
+rfd.workspace = true
+raw-window-handle = "0.6"
+image.workspace = true
+
+mvp-core = { path = "../mvp-core" }
+mvp-platform = { path = "../mvp-platform" }
+mvp-subtitle = { path = "../mvp-subtitle" }
+
+[build-dependencies]
+embed-resource = "3"

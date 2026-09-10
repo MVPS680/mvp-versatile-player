@@ -1,0 +1,10 @@
+[package]
+name = "mvp-subtitle"
+description = "Subtitle parsing and cue lookup for MVP-Versatile-Player"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+encoding_rs.workspace = true
+once_cell.workspace = true

@@ -1,0 +1,44 @@
+[package]
+name = "mvp-platform"
+description = "Windows shell integration for MVP-Versatile-Player (file association, single instance, shell helpers)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+once_cell.workspace = true
+serde = { workspace = true, optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    # Required by `WNDCLASSW` (its `hbrBackground` field is a `Graphics::Gdi::HBRUSH`),
+    # which in turn is required to register the hidden IPC window class.
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_DataExchange",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Power",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[features]
+# `serde` is on by default so that `FileKinds` carries its `Serialize`/`Deserialize`
+# impls for downstream crates that just depend on `mvp-platform` normally. It can
+# still be switched off with `default-features = false`; the derive is then simply
+# omitted (see `assoc::FileKinds`).
+default = ["serde"]
+serde = ["dep:serde"]

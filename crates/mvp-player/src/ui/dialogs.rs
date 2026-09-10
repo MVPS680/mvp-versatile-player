@@ -1,0 +1,224 @@
+//! Small modal dialogs: open URL, keyboard reference and about.
+
+use egui::{Context, RichText};
+
+use crate::app::PlayerApp;
+use crate::icons::Icon;
+use crate::state::Overlay;
+use crate::theme::{font, space};
+use crate::ui::widgets;
+
+/// Draw whichever dialog is open.
+pub fn draw(app: &mut PlayerApp, ctx: &Context) {
+    match app.ui.overlay {
+        Overlay::OpenUrl => url_dialog(app, ctx),
+        Overlay::Shortcuts => shortcuts_dialog(app, ctx),
+        Overlay::About => about_dialog(app, ctx),
+        _ => {}
+    }
+}
+
+fn url_dialog(app: &mut PlayerApp, ctx: &Context) {
+    let tokens = app.theme.tokens.clone();
+    let mut open = true;
+    let mut submit = false;
+    egui::Window::new(RichText::new("打开网络串流").size(font::H3).strong())
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -40.0))
+        .frame(
+            egui::Frame::window(&ctx.style())
+                .fill(tokens.elevated)
+                .inner_margin(egui::Margin::same(space::LG as i8)),
+        )
+        .show(ctx, |ui| {
+            ui.set_width(460.0);
+            ui.label(
+                RichText::new("支持 http、https、rtsp、rtmp、mms、udp、rtp、srt 等协议")
+                    .size(font::TINY)
+                    .color(tokens.text_weak),
+            );
+            ui.add_space(space::SM);
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut app.ui.url_input)
+                    .hint_text("https://example.com/stream.m3u8")
+                    .desired_width(f32::INFINITY),
+            );
+            if app.ui.url_focus {
+                response.request_focus();
+                app.ui.url_focus = false;
+            }
+            if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                submit = true;
+            }
+            ui.add_space(space::MD);
+            ui.horizontal(|ui| {
+                if ui
+                    .add(
+                        egui::Button::new(RichText::new("播放").size(font::BODY))
+                            .fill(tokens.accent),
+                    )
+                    .clicked()
+                {
+                    submit = true;
+                }
+                if ui.button(RichText::new("取消").size(font::BODY)).clicked() {
+                    app.ui.close_overlay();
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .button(RichText::new("添加到播放列表").size(font::SMALL))
+                        .clicked()
+                    {
+                        let url = app.ui.url_input.trim().to_string();
+                        if !url.is_empty() {
+                            app.playlist.add(mvp_core::playlist::PlaylistItem::from_url(url));
+                            app.store.mark_dirty();
+                            app.ui.close_overlay();
+                        }
+                    }
+                });
+            });
+        });
+    if submit {
+        let url = app.ui.url_input.trim().to_string();
+        if url.is_empty() {
+            app.toast(crate::state::Toast::warning("请输入网络地址"));
+        } else {
+            app.open_url(url, true);
+            app.ui.close_overlay();
+        }
+    }
+    if !open {
+        app.ui.close_overlay();
+    }
+}
+
+fn shortcuts_dialog(app: &mut PlayerApp, ctx: &Context) {
+    let tokens = app.theme.tokens.clone();
+    let mut open = true;
+    egui::Window::new(RichText::new("键盘快捷键").size(font::H3).strong())
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(true)
+        .default_size([440.0, 520.0])
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .frame(
+            egui::Frame::window(&ctx.style())
+                .fill(tokens.elevated)
+                .inner_margin(egui::Margin::same(space::LG as i8)),
+        )
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::Vec2::splat(22.0), egui::Sense::hover());
+                crate::icons::draw(ui.painter(), rect, Icon::Help, tokens.accent);
+                ui.label(
+                    RichText::new("按 Esc 关闭")
+                        .size(font::TINY)
+                        .color(tokens.text_muted),
+                );
+            });
+            ui.add_space(space::XS);
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for (key, action) in crate::ui::settings_window::SHORTCUTS {
+                        ui.horizontal(|ui| {
+                            widgets::chip(ui, key, tokens.accent);
+                            ui.label(
+                                RichText::new(*action)
+                                    .size(font::SMALL)
+                                    .color(tokens.text_weak),
+                            );
+                        });
+                    }
+                });
+        });
+    if !open {
+        app.ui.close_overlay();
+    }
+}
+
+fn about_dialog(app: &mut PlayerApp, ctx: &Context) {
+    let tokens = app.theme.tokens.clone();
+    let mut open = true;
+    let mut show_shortcuts = false;
+    egui::Window::new(RichText::new("关于").size(font::H3).strong())
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .frame(
+            egui::Frame::window(&ctx.style())
+                .fill(tokens.elevated)
+                .inner_margin(egui::Margin::same(space::LG as i8)),
+        )
+        .show(ctx, |ui| {
+            ui.set_width(400.0);
+            ui.vertical_centered(|ui| {
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::Vec2::splat(56.0), egui::Sense::hover());
+                ui.painter().circle_filled(
+                    rect.center(),
+                    28.0,
+                    tokens.accent.gamma_multiply(0.18),
+                );
+                crate::icons::draw(
+                    ui.painter(),
+                    egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(26.0)),
+                    Icon::Play,
+                    tokens.accent,
+                );
+                ui.add_space(space::SM);
+                ui.label(
+                    RichText::new("MVP-Versatile-Player")
+                        .size(font::H2)
+                        .strong()
+                        .color(tokens.text),
+                );
+                ui.label(
+                    RichText::new(format!("版本 {}", env!("CARGO_PKG_VERSION")))
+                        .size(font::SMALL)
+                        .color(tokens.text_weak),
+                );
+            });
+            ui.add_space(space::MD);
+            widgets::key_value(ui, &tokens, "内核", &app.ui.ffmpeg_version.clone());
+            widgets::key_value(ui, &tokens, "界面", "egui / eframe（OpenGL 后端）");
+            widgets::key_value(
+                ui,
+                &tokens,
+                "启动耗时",
+                &format!("{:.0} 毫秒", app.ui.startup_ms),
+            );
+            ui.add_space(space::MD);
+            ui.label(
+                RichText::new(
+                    "本程序以 GPL 许可证发布，内置的 FFmpeg 为 GPL 构建，\
+                     包含 libx264 / libx265 / libaom 等组件。",
+                )
+                .size(font::TINY)
+                .color(tokens.text_muted),
+            );
+            ui.add_space(space::SM);
+            ui.horizontal(|ui| {
+                if ui.button(RichText::new("快捷键").size(font::SMALL)).clicked() {
+                    show_shortcuts = true;
+                }
+                if ui.button(RichText::new("项目主页").size(font::SMALL)).clicked() {
+                    let _ = mvp_platform::shell::open_url(
+                        "https://github.com/mvp-versatile-player/mvp-versatile-player",
+                    );
+                }
+            });
+        });
+    if show_shortcuts {
+        app.ui.open_overlay(Overlay::Shortcuts);
+        return;
+    }
+    if !open {
+        app.ui.close_overlay();
+    }
+}
