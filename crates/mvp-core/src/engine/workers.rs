@@ -13,9 +13,9 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use ffmpeg_next as ffmpeg;
 
 use super::queue::{AudioMsg, PacketMsg, VideoMsg};
-use super::{EngineConfig, EngineEvent, MediaSource, PlaybackState, Shared};
+use super::{EngineConfig, EngineEvent, FlushRequest, MediaSource, PlaybackState, Shared};
 use crate::audio::AudioSink;
-use crate::dsp::{apply_gain, TimeStretcher};
+use crate::dsp::TimeStretcher;
 use crate::info;
 use crate::util::MediaKind;
 use crate::video::{RgbaConverter, VideoFrame};
@@ -26,7 +26,20 @@ const VIDEO_PACKET_QUEUE: usize = 48;
 /// Audio packets may queue this deep before the demuxer is throttled.
 const AUDIO_PACKET_QUEUE: usize = 192;
 /// How often the demuxer re-checks control state while blocked.
+///
+/// This is also the bound on how long a stop has to wait for a demuxer that is
+/// blocked on a full channel, so it is deliberately short of the "one second of
+/// queued packets" it could otherwise be.
 const CONTROL_POLL: Duration = Duration::from_millis(50);
+
+/// How long a decoder waits for a packet before re-checking for shutdown.
+///
+/// The wait is a condition-variable timeout, so a short one costs nothing while
+/// idle, and it bounds how long a worker can sit inside `recv_timeout` after the
+/// player has been asked to close. It used to be 200 ms, which is 200 ms of
+/// "the window is still there" on the way out.
+const WORKER_POLL: Duration = Duration::from_millis(25);
+
 /// How far ahead of the playhead the video decoder may run, in seconds.
 ///
 /// This is the decoder's lead over the master clock, not a drop threshold:
@@ -259,9 +272,14 @@ fn demuxer_main(
     let mut local_audio_request = shared.audio_track.load(Ordering::Relaxed);
     let mut sink: Option<Arc<AudioSink>> = None;
     if let (Some(index), true) = (audio_stream, config.audio_enabled) {
-        match AudioSink::new(config.audio_device.as_deref(), config.volume, config.speed) {
+        // Seed the device with the engine's *current* volume and mute state,
+        // not with the configuration the engine was built from: the user may
+        // have moved the volume slider since, and the sink is where the gain is
+        // actually applied.
+        match AudioSink::new(config.audio_device.as_deref(), shared.volume(), config.speed) {
             Ok(device) => {
                 let device = Arc::new(device);
+                device.set_muted(shared.muted.load(Ordering::Relaxed));
                 shared.clock.set_audio(Some(Arc::clone(&device)));
                 *shared.audio.lock() = Some(Arc::clone(&device));
                 sink = Some(device);
@@ -327,6 +345,10 @@ fn demuxer_main(
 
     let mut generation = shared.generation.load(Ordering::SeqCst);
     let mut reached_eof = false;
+    // `true` once the end of the file has been reported. The pipeline is not
+    // torn down then, it parks: a restart request is just a seek, so the loop
+    // below has to keep running to serve it.
+    let mut ended = false;
 
     loop {
         if shared.abort.load(Ordering::Relaxed) {
@@ -346,6 +368,7 @@ fn demuxer_main(
             shared.request_flush(generation, target);
             seek_container(&mut ictx, target)?;
             reached_eof = false;
+            ended = false;
             if shared.stepping.load(Ordering::Relaxed) > 0 {
                 shared.set_state(PlaybackState::Paused);
             }
@@ -407,7 +430,7 @@ fn demuxer_main(
 
         // -- read a packet ---------------------------------------------------
         if reached_eof {
-            if handle_eof(shared, &video_tx, &audio_tx, &embedded_cues, &mut last_published)? {
+            if handle_eof(shared, &embedded_cues, &mut last_published, &mut ended)? {
                 break;
             }
             continue;
@@ -469,19 +492,48 @@ fn demuxer_main(
 
 /// Wait until everything that was decoded has been played, then report the end.
 ///
-/// Returns `Ok(true)` when the demuxer should stop entirely.
+/// The end of the file does **not** tear the pipeline down: the workers are left
+/// idle and the demuxer parks here, with the clock stopped, until the interface
+/// asks for a replay. That request arrives as a seek, so the main loop above
+/// handles the actual restart. Shutting the workers down instead is what made
+/// "play" on a finished file run the clock past the end of the media: there was
+/// nothing left to decode, and nothing left to stop the clock either.
+///
+/// Returns `Ok(true)` when the demuxer should stop entirely, which is now only
+/// ever a shutdown.
 fn handle_eof(
     shared: &Arc<Shared>,
-    video_tx: &Sender<VideoMsg>,
-    audio_tx: &Sender<AudioMsg>,
     embedded_cues: &[Cue],
     last_published: &mut usize,
+    ended: &mut bool,
 ) -> crate::error::Result<bool> {
     if shared.abort.load(Ordering::Relaxed) {
         return Ok(true);
     }
+
+    // Looping is the one thing that revives a file on its own. It is checked
+    // before the park below because a request set while parked would otherwise
+    // never be acted on.
     if shared.looping.load(Ordering::Relaxed) {
+        if *ended {
+            // Looping was switched on *after* the file finished, so nothing else
+            // will ask for the replay this loop is about to perform.
+            shared.clock.seek(0.0);
+            shared.clock.set_running(true);
+            if let Some(sink) = shared.audio.lock().as_ref() {
+                sink.set_paused(false);
+            }
+            shared.set_state(PlaybackState::Playing);
+        }
         *shared.seek_request.lock() = Some(0.0);
+        return Ok(false);
+    }
+
+    if *ended {
+        // The end has been reported and no restart has arrived yet. Sleep a
+        // little so a parked file costs nothing; an actual request is picked up
+        // by the main loop before this function is reached.
+        std::thread::sleep(Duration::from_millis(20));
         return Ok(false);
     }
 
@@ -511,15 +563,14 @@ fn handle_eof(
     };
 
     if finished {
+        *ended = true;
         shared.clock.set_running(false);
         if let Some(sink) = shared.audio.lock().as_ref() {
             sink.set_paused(true);
         }
         shared.set_state(PlaybackState::Ended);
         let _ = shared.event_tx.send(EngineEvent::Ended);
-        let _ = video_tx.send(VideoMsg::Stop);
-        let _ = audio_tx.send(AudioMsg::Stop);
-        return Ok(true);
+        return Ok(false);
     }
 
     std::thread::sleep(Duration::from_millis(20));
@@ -646,31 +697,66 @@ fn run_video_decoder(
     let _ = config;
 
     loop {
+        // Shutting down: whatever is in the channel belongs to a playback session
+        // that no longer exists. Checking here — before the queue is read — is
+        // what keeps closing the window from waiting for a backlog of up to
+        // `VIDEO_PACKET_QUEUE` frames to be decoded and thrown away.
+        if shared.abort.load(Ordering::Relaxed) {
+            break;
+        }
         // A pending flush is honoured before anything else, including packets
         // that are already in the channel: those belong to the previous decode
         // session and would otherwise be decoded and throttled against a clock
         // that has already moved.
         if let Some(request) = shared.take_video_flush() {
-            generation = request.generation;
-            seek_target = Some(request.target);
-            last_pts = request.target;
-            decoder.flush();
-            shared.video_queue.lock().clear();
+            reset_video_session(
+                &shared,
+                &mut decoder,
+                &mut generation,
+                &mut seek_target,
+                &mut last_pts,
+                request,
+            );
         }
 
-        let msg = match rx.recv_timeout(Duration::from_millis(200)) {
+        let msg = match rx.recv_timeout(WORKER_POLL) {
             Ok(msg) => msg,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                if shared.abort.load(Ordering::Relaxed) {
-                    break;
-                }
                 continue;
             }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         };
 
+        // The `Stop` message the demuxer sends on the way out sits *behind*
+        // whatever it had already queued, so it is not enough to react to it:
+        // the abort flag is what makes the queue irrelevant.
+        if shared.abort.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // A flush is re-checked here, *after* the wait, because the packet that
+        // woke us may be the first one of the new session and it may have
+        // overtaken the request in the channel: the demuxer publishes the flush
+        // and then seeks, and a seek that lands instantly (to zero, on an empty
+        // channel) puts its keyframe in the channel before this thread is
+        // scheduled. Skipping that keyframe would leave the decoder with nothing
+        // it can decode — for a file with a single keyframe at the start, the
+        // picture would never come back.
+        if let Some(request) = shared.take_video_flush() {
+            reset_video_session(
+                &shared,
+                &mut decoder,
+                &mut generation,
+                &mut seek_target,
+                &mut last_pts,
+                request,
+            );
+        }
+
         match msg {
-            VideoMsg::Stop => break,
+            VideoMsg::Stop => {
+                break;
+            }
             VideoMsg::Eof => {
                 let _ = decoder.send_eof();
                 drain_video(
@@ -718,6 +804,27 @@ fn run_video_decoder(
     shared.pool.clear();
 }
 
+/// Move the video decoder onto the decode session a flush request describes.
+///
+/// Flushing the codec drops the frames still inside it, and clearing the
+/// presentation queue drops the ones still waiting to be shown: both belong to
+/// the position the playhead has just left.
+#[allow(clippy::too_many_arguments)]
+fn reset_video_session(
+    shared: &Shared,
+    decoder: &mut ffmpeg::decoder::Video,
+    generation: &mut u64,
+    seek_target: &mut Option<f64>,
+    last_pts: &mut f64,
+    request: FlushRequest,
+) {
+    *generation = request.generation;
+    *seek_target = Some(request.target);
+    *last_pts = request.target;
+    decoder.flush();
+    shared.video_queue.lock().clear();
+}
+
 #[allow(clippy::too_many_arguments)]
 fn drain_video(
     shared: &Arc<Shared>,
@@ -736,8 +843,10 @@ fn drain_video(
 ) {
     while decoder.receive_frame(frame).is_ok() {
         // A pending seek invalidates everything still in the pipeline; bail out
-        // so the caller can act on it instead of finishing this batch.
-        if shared.video_flush_pending() {
+        // so the caller can act on it instead of finishing this batch. A
+        // shutdown is the same thing with no destination: finishing the batch
+        // would only delay the join.
+        if shared.video_flush_pending() || shared.abort.load(Ordering::Relaxed) {
             return;
         }
 
@@ -1098,6 +1207,12 @@ fn run_audio_decoder(
     let mut scratch: Vec<f32> = Vec::new();
 
     loop {
+        // Shutting down: stop before the queued packets are decoded, so the
+        // backlog the demuxer left behind costs nothing to abandon. See the
+        // video worker for the same check.
+        if shared.abort.load(Ordering::Relaxed) {
+            break;
+        }
         // Track changes and seeks arrive through shared state, never through the
         // packet channel, so they take effect immediately even with a full queue.
         if let Some(params) = shared.take_audio_stream() {
@@ -1114,26 +1229,45 @@ fn run_audio_decoder(
             }
         }
         if let Some(request) = shared.take_audio_flush() {
-            generation = request.generation;
-            last_pts = request.target;
-            decoder.flush();
-            resampler = None;
-            stretcher.reset();
-            stretcher.set_speed(shared.speed());
-            sink.flush(request.target);
-            shared.audio_ended.store(false, Ordering::Relaxed);
+            reset_audio_session(
+                &shared,
+                &mut decoder,
+                &sink,
+                &mut generation,
+                &mut last_pts,
+                &mut resampler,
+                &mut stretcher,
+                request,
+            );
         }
 
-        let msg = match rx.recv_timeout(Duration::from_millis(200)) {
+        let msg = match rx.recv_timeout(WORKER_POLL) {
             Ok(msg) => msg,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                if shared.abort.load(Ordering::Relaxed) {
-                    break;
-                }
                 continue;
             }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         };
+
+        if shared.abort.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // Re-checked after the wait for the same reason as the video worker: the
+        // chunk that woke us may be the first of the new session and may have
+        // overtaken the request in the channel.
+        if let Some(request) = shared.take_audio_flush() {
+            reset_audio_session(
+                &shared,
+                &mut decoder,
+                &sink,
+                &mut generation,
+                &mut last_pts,
+                &mut resampler,
+                &mut stretcher,
+                request,
+            );
+        }
 
         match msg {
             AudioMsg::Stop => break,
@@ -1183,6 +1317,32 @@ fn run_audio_decoder(
     }
 }
 
+/// Move the audio decoder onto the decode session a flush request describes.
+///
+/// The resampler and the time stretcher hold samples of their own, so they are
+/// reset rather than flushed, and the sound card is re-anchored on the position
+/// the playhead has just moved to.
+#[allow(clippy::too_many_arguments)]
+fn reset_audio_session(
+    shared: &Shared,
+    decoder: &mut ffmpeg::decoder::Audio,
+    sink: &AudioSink,
+    generation: &mut u64,
+    last_pts: &mut f64,
+    resampler: &mut Option<ffmpeg::software::resampling::Context>,
+    stretcher: &mut TimeStretcher,
+    request: FlushRequest,
+) {
+    *generation = request.generation;
+    *last_pts = request.target;
+    decoder.flush();
+    *resampler = None;
+    stretcher.reset();
+    stretcher.set_speed(shared.speed());
+    sink.flush(request.target);
+    shared.audio_ended.store(false, Ordering::Relaxed);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn drain_audio(
     shared: &Arc<Shared>,
@@ -1205,6 +1365,10 @@ fn drain_audio(
     }
 
     loop {
+        // A shutdown abandons the batch: see `drain_video`.
+        if shared.abort.load(Ordering::Relaxed) {
+            return;
+        }
         let got = if flushing {
             decoder.receive_frame(frame).is_ok()
         } else {
@@ -1303,7 +1467,9 @@ fn drain_audio(
 
         scratch.clear();
         scratch.extend_from_slice(&data[..expected]);
-        apply_gain(scratch, sink.effective_gain());
+        // The volume is *not* applied here: this runs seconds ahead of the
+        // playhead, so a change would not be heard until the buffer drained.
+        // The output callback applies it as the samples are played.
 
         let mut stretched: Vec<f32> = Vec::with_capacity(expected + 4096);
         stretcher.push(scratch, &mut stretched);

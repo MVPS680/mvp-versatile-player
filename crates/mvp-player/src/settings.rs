@@ -37,7 +37,11 @@ pub enum AspectMode {
     Ratio16x9,
     /// Always 4:3.
     Ratio4x3,
-    /// Force the source ratio even if the metadata is wrong.
+    /// Deprecated: was meant to force the *coded* ratio even when the container
+    /// declares something else, but the prober exposes no separate display
+    /// aspect ratio, so it behaved exactly like [`AspectMode::Fit`]. It is kept
+    /// only so an existing `settings.json` still parses; [`Settings::load`]
+    /// migrates it to `Fit` and it no longer appears in any menu.
     Source,
 }
 
@@ -55,6 +59,10 @@ impl AspectMode {
     }
 
     /// All modes, in menu order.
+    ///
+    /// [`AspectMode::Source`] is deliberately absent: it was indistinguishable
+    /// from `Fit` and offering two menu entries that do the same thing is worse
+    /// than offering one.
     pub fn all() -> &'static [AspectMode] {
         &[
             AspectMode::Fit,
@@ -62,7 +70,6 @@ impl AspectMode {
             AspectMode::Stretch,
             AspectMode::Ratio16x9,
             AspectMode::Ratio4x3,
-            AspectMode::Source,
         ]
     }
 
@@ -125,6 +132,10 @@ pub enum EndAction {
 }
 
 /// Everything the player remembers between runs.
+///
+/// Keys that no longer exist are ignored rather than rejected, which is how a
+/// retired preference — `autoplay`, which used to leave the player unable to
+/// play a double-clicked file — is dropped instead of breaking the document.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -149,12 +160,8 @@ pub struct Settings {
     pub remember_position: bool,
     /// Only resume when at least this much of the file was watched.
     pub resume_min_seconds: f64,
-    /// Skip to the next file this many seconds before the end.
-    pub end_skip_seconds: f64,
     /// What to do at the end of the last file.
     pub end_action: EndAction,
-    /// Start playing as soon as a file is opened.
-    pub autoplay: bool,
 
     // ---- video -----------------------------------------------------------
     /// Try hardware decoding.
@@ -273,9 +280,7 @@ impl Default for Settings {
             shuffle: false,
             remember_position: true,
             resume_min_seconds: 15.0,
-            end_skip_seconds: 0.0,
             end_action: EndAction::Playlist,
-            autoplay: true,
 
             hardware_decoding: true,
             aspect: AspectMode::Fit,
@@ -372,13 +377,27 @@ impl Settings {
             return Self::default();
         };
         match serde_json::from_str::<Settings>(&text) {
-            Ok(settings) => settings,
+            Ok(mut settings) => {
+                settings.migrate();
+                settings
+            }
             Err(err) => {
                 log::warn!("设置文件损坏，已重置: {err}");
                 let backup = path.with_extension("json.broken");
                 let _ = std::fs::rename(&path, backup);
                 Self::default()
             }
+        }
+    }
+
+    /// Bring a document written by an older build up to the current shape.
+    ///
+    /// Values that no longer exist are folded into their replacement instead of
+    /// being dropped, because dropping a variant makes serde reject the whole
+    /// file and silently reset every other setting with it.
+    fn migrate(&mut self) {
+        if self.aspect == AspectMode::Source {
+            self.aspect = AspectMode::Fit;
         }
     }
 
@@ -459,6 +478,59 @@ impl Settings {
     pub fn clear_position(&mut self, key: &str) {
         self.resume_positions.remove(key);
     }
+
+    /// Fold this launch's command-line overrides into the live document.
+    ///
+    /// The overrides have to reach the document: the transport bar shows
+    /// `volume`, the speed menu shows `speed`, and `sync_engine` pushes both at
+    /// the engine every frame, so a value that only lived in the engine would be
+    /// overwritten by the stored one a frame later. [`Settings::persisted`] is
+    /// what keeps them out of the file.
+    pub fn apply_launch_overrides(&mut self, overrides: &LaunchOverrides) {
+        if let Some(volume) = overrides.volume {
+            self.volume = volume;
+        }
+        if let Some(speed) = overrides.speed {
+            self.speed = speed;
+        }
+    }
+
+    /// The document that should be written to `settings.json`.
+    ///
+    /// `--volume` and `--speed` describe one launch; writing them back would
+    /// turn a single `--volume 10` into a player that is quiet for good. An
+    /// override the user never touched during the session is therefore replaced
+    /// by the value that was already on disk, while one they moved by hand —
+    /// with the slider, the wheel, the speed menu — is a real change and is
+    /// kept.
+    pub fn persisted(&self, overrides: &LaunchOverrides, baseline: &Settings) -> Settings {
+        let mut disk = self.clone();
+        if let Some(volume) = overrides.volume {
+            if (disk.volume - volume).abs() < 1e-6 {
+                disk.volume = baseline.volume;
+            }
+        }
+        if let Some(speed) = overrides.speed {
+            if (disk.speed - speed).abs() < 1e-9 {
+                disk.speed = baseline.speed;
+            }
+        }
+        disk
+    }
+}
+
+/// Command-line values that describe one launch rather than a preference.
+///
+/// `--volume 30 --speed 2.0 movie.mkv` says what *this* run should start with.
+/// None of it may survive the session — the same rule that keeps `--no-autoplay`
+/// (see [`crate::app::StartupArgs::autoplay_command_line_files`]) and `-f` from
+/// rewriting the user's saved configuration.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct LaunchOverrides {
+    /// `--volume`, normalised to `0.0..=2.0`.
+    pub volume: Option<f32>,
+    /// `--speed`, in `0.25..=4.0`.
+    pub speed: Option<f64>,
 }
 
 /// Debounced settings writer.
@@ -490,6 +562,10 @@ impl SettingsStore {
     }
 
     /// `true` when there are unsaved changes.
+    ///
+    /// The interface asks before it builds the document that goes to disk, so a
+    /// frame that changed nothing pays nothing for the [launch
+    /// overrides](Settings::persisted) that have to be folded back out.
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }
@@ -616,8 +692,21 @@ mod tests {
     fn aspect_modes_map_to_ratios() {
         assert_eq!(AspectMode::Fit.forced_ratio(), None);
         assert!((AspectMode::Ratio16x9.forced_ratio().unwrap() - 16.0 / 9.0).abs() < 1e-6);
-        assert_eq!(AspectMode::all().len(), 6);
+        assert_eq!(AspectMode::all().len(), 5);
         assert_eq!(SidebarTab::all().len(), 4);
+    }
+
+    /// Two menu entries that do the same thing are worse than one: `Source`
+    /// produced exactly the same rectangle as `Fit`, so it is no longer offered.
+    #[test]
+    fn the_duplicate_source_aspect_is_not_offered() {
+        assert!(!AspectMode::all().contains(&AspectMode::Source));
+        // An old settings file that still names it must load, not reset.
+        let json = r#"{"aspect":"Source","volume":0.5}"#;
+        let mut s: Settings = serde_json::from_str(json).unwrap();
+        s.migrate();
+        assert_eq!(s.aspect, AspectMode::Fit);
+        assert_eq!(s.volume, 0.5, "the rest of the file survives the migration");
     }
 
     #[test]
@@ -627,7 +716,70 @@ mod tests {
         assert!(!store.flush_if_due(&s), "nothing to do when clean");
         store.mark_dirty();
         assert!(store.is_dirty());
-        // The interval has not elapsed, so nothing is written yet.
+        // The interval has not elapsed, so nothing is written yet. (Writing
+        // here would touch the user's real settings file, which is why the test
+        // stops at the decision and not at the write.)
         assert!(!store.flush_if_due(&s));
+    }
+
+    /// `--volume` and `--speed` are start-up values, not preferences.
+    ///
+    /// The bug this guards: they used to be folded straight into the document
+    /// that is written back, so one launch with `--volume 10` left the player
+    /// quiet for good — the same trap that let a one-off `--no-autoplay` turn
+    /// "double-click a video and watch it" into "double-click a video and press
+    /// play" for every later launch.
+    #[test]
+    fn launch_overrides_do_not_become_preferences() {
+        let baseline = Settings {
+            volume: 0.8,
+            speed: 1.0,
+            ..Settings::default()
+        };
+        let overrides = LaunchOverrides {
+            volume: Some(0.1),
+            speed: Some(2.0),
+        };
+        let mut live = baseline.clone();
+        live.apply_launch_overrides(&overrides);
+        assert_eq!(live.volume, 0.1, "the session must start at the given volume");
+        assert_eq!(live.speed, 2.0);
+
+        let disk = live.persisted(&overrides, &baseline);
+        assert_eq!(
+            disk.volume, baseline.volume,
+            "an untouched --volume must not be written back"
+        );
+        assert_eq!(
+            disk.speed, baseline.speed,
+            "an untouched --speed must not be written back"
+        );
+
+        // A value the user moved during the session is theirs to keep: the
+        // override explains where it started, not what it has to end at.
+        live.volume = 0.5;
+        let disk = live.persisted(&overrides, &baseline);
+        assert_eq!(disk.volume, 0.5);
+        assert_eq!(
+            disk.speed, baseline.speed,
+            "the other override is still just a start-up value"
+        );
+    }
+
+    /// A settings file written by the version that had the switch still loads.
+    ///
+    /// The preference is gone rather than honoured: it is what made a
+    /// double-clicked file wait for a play button, and the only way to ask for
+    /// a paused start is `--no-autoplay`, which lasts exactly one launch.
+    #[test]
+    fn a_retired_autoplay_preference_is_dropped() {
+        let json = r#"{"autoplay":false,"volume":0.5}"#;
+        let settings: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(settings.volume, 0.5, "the rest of the file survives");
+        let saved = serde_json::to_string(&settings).unwrap();
+        assert!(
+            !saved.contains("autoplay"),
+            "the retired key must not come back: {saved}"
+        );
     }
 }

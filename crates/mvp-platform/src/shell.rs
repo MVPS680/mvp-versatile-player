@@ -125,6 +125,48 @@ pub fn set_caption_color(hwnd: isize, bg: [u8; 3], text: [u8; 3], border: [u8; 3
     let _ = (hwnd, bg, text, border);
 }
 
+/// Hand the caption colours back to the system theme.
+///
+/// [`set_caption_color`] is a one-way door — once a colour is set, DWM keeps it
+/// until the window is recreated. Turning the player's "dark title bar" switch
+/// off therefore has to write `DWMWA_COLOR_DEFAULT` explicitly, or the title bar
+/// would stay tinted for the rest of the session.
+#[cfg(windows)]
+pub fn reset_caption_color(hwnd: isize) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_COLOR_DEFAULT,
+        DWMWA_TEXT_COLOR,
+    };
+
+    if hwnd == 0 {
+        return;
+    }
+    let window = HWND(hwnd as *mut core::ffi::c_void);
+    for attribute in [DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR, DWMWA_BORDER_COLOR] {
+        let value: u32 = DWMWA_COLOR_DEFAULT;
+        // SAFETY: `value` is a live `u32` (a `COLORREF`) and `size` matches its
+        // size, which is the contract of `DwmSetWindowAttribute`.
+        let result = unsafe {
+            DwmSetWindowAttribute(
+                window,
+                attribute,
+                &value as *const u32 as *const core::ffi::c_void,
+                std::mem::size_of::<u32>() as u32,
+            )
+        };
+        if let Err(error) = result {
+            log::debug!("DwmSetWindowAttribute({attribute:?}) failed: {error}");
+        }
+    }
+}
+
+/// Non-Windows stub: nothing was tinted in the first place.
+#[cfg(not(windows))]
+pub fn reset_caption_color(hwnd: isize) {
+    let _ = hwnd;
+}
+
 /// Pack an RGB triple into the `COLORREF` (`0x00BBGGRR`) DWM expects.
 #[cfg(windows)]
 fn colorref([r, g, b]: [u8; 3]) -> u32 {

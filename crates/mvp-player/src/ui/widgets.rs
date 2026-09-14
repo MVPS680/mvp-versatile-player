@@ -605,10 +605,55 @@ pub fn empty_hint(ui: &mut Ui, tokens: &Tokens, text: &str) {
     });
 }
 
-/// Round a `f32` to a whole number for display.
-#[allow(dead_code)]
-pub fn percent(value: f32) -> String {
-    format!("{}%", (value * 100.0).round() as i32)
+/// Convert accumulated wheel movement into whole steps.
+///
+/// A notched wheel arrives as a single large spike (egui multiplies a line by
+/// its native `line_scroll_speed`, 40 points on the desktop), while a precision
+/// touch-pad sends a stream of tiny deltas. Accumulating turns both into the
+/// *same* number of steps per notch, and returning the leftover lets a slow
+/// drag still reach the next step instead of being rounded away every frame —
+/// which is what made the wheel feel unpredictable.
+pub fn wheel_steps(accumulated: f32, points_per_step: f32) -> (i32, f32) {
+    if points_per_step <= 0.0 || !accumulated.is_finite() {
+        return (0, 0.0);
+    }
+    let steps = (accumulated / points_per_step).trunc();
+    (steps as i32, accumulated - steps * points_per_step)
+}
+
+/// Draw the dimming gradient that sits between the picture and the controls.
+///
+/// The transport bar floats over the video in fullscreen, and a bright frame
+/// behind a translucent bar swallows the icons. A gradient reads as part of the
+/// picture in a way a hard-edged band does not, which is why this is a mesh
+/// rather than a filled rectangle.
+pub fn paint_scrim(painter: &egui::Painter, rect: Rect) {
+    if rect.width() <= 0.0 || rect.height() <= 0.0 {
+        return;
+    }
+    let mut mesh = egui::Mesh::default();
+    let top = Color32::TRANSPARENT;
+    let bottom = Color32::from_black_alpha(scrim_alpha(1.0));
+    mesh.colored_vertex(rect.left_top(), top);
+    mesh.colored_vertex(rect.right_top(), top);
+    mesh.colored_vertex(rect.right_bottom(), bottom);
+    mesh.colored_vertex(rect.left_bottom(), bottom);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    painter.add(egui::Shape::mesh(mesh));
+}
+
+/// Opacity of the scrim at `fraction` of its height, fully transparent at the
+/// top and strongest at the bottom.
+///
+/// Quadratic rather than linear: most of the darkening has to be where the
+/// controls are, and a linear ramp is still visibly grey halfway up the video.
+pub fn scrim_alpha(fraction: f32) -> u8 {
+    /// Alpha at the very bottom of the band — dark enough for white icons on a
+    /// white frame, light enough to still see the picture.
+    const MAX: f32 = 150.0;
+    let t = fraction.clamp(0.0, 1.0);
+    (MAX * t * t).round() as u8
 }
 
 #[cfg(test)]
@@ -630,9 +675,40 @@ mod tests {
     }
 
     #[test]
-    fn percent_rounds_to_whole_numbers() {
-        assert_eq!(percent(0.755), "76%");
-        assert_eq!(percent(1.0), "100%");
+    fn the_scrim_gradient_is_transparent_at_the_top_and_strongest_at_the_bottom() {
+        assert_eq!(scrim_alpha(0.0), 0);
+        assert!(scrim_alpha(1.0) > scrim_alpha(0.5));
+        assert!(scrim_alpha(0.5) > scrim_alpha(0.25));
+        assert!(scrim_alpha(1.0) <= 160, "the picture must stay visible");
+        // Out of range must not wrap around.
+        assert_eq!(scrim_alpha(-1.0), 0);
+        assert_eq!(scrim_alpha(4.0), scrim_alpha(1.0));
+    }
+
+    /// One wheel notch must always be one step, whatever the device reports.
+    #[test]
+    fn wheel_notches_become_whole_steps_without_losing_the_remainder() {
+        // A notched wheel: a single 40-point spike is exactly one step.
+        assert_eq!(wheel_steps(40.0, 40.0), (1, 0.0));
+        assert_eq!(wheel_steps(-40.0, 40.0), (-1, 0.0));
+        assert_eq!(wheel_steps(120.0, 40.0), (3, 0.0), "three notches, three steps");
+
+        // A precision touch-pad: tiny deltas accumulate instead of vanishing.
+        let mut leftover = 0.0;
+        let mut stepped = 0;
+        for _ in 0..2 {
+            let (steps, left) = wheel_steps(leftover + 15.0, 40.0);
+            leftover = left;
+            stepped += steps;
+        }
+        assert_eq!(stepped, 0, "30 points is still short of a notch");
+        let (steps, leftover) = wheel_steps(leftover + 15.0, 40.0);
+        assert_eq!(steps, 1, "45 accumulated points is one full notch");
+        assert!(leftover > 0.0 && leftover < 40.0, "the rest is carried over");
+
+        // Nonsense in, nothing out.
+        assert_eq!(wheel_steps(10.0, 0.0), (0, 0.0));
+        assert_eq!(wheel_steps(f32::NAN, 40.0), (0, 0.0));
     }
 
     /// Every settings row must put its control at the same right-hand edge,

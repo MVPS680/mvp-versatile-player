@@ -103,7 +103,10 @@ fn main() -> eframe::Result<()> {
     if let Some(position) = settings.window_pos {
         viewport = viewport.with_position(position);
     }
-    if settings.start_fullscreen {
+    // `-f` is a launch flag, not a preference: it must not be written back, or
+    // one fullscreen start would make every later start fullscreen.
+    let start_fullscreen = settings.start_fullscreen || args.fullscreen;
+    if start_fullscreen {
         viewport = viewport.with_fullscreen(true);
     } else if settings.maximized {
         viewport = viewport.with_maximized(true);
@@ -124,7 +127,6 @@ fn main() -> eframe::Result<()> {
         process_start.elapsed().as_secs_f32() * 1000.0
     );
 
-    let start_fullscreen = settings.start_fullscreen;
     eframe::run_native(
         "MVP-Versatile-Player",
         options,
@@ -260,7 +262,7 @@ MVP-Versatile-Player {version}
 
 选项:
     -f, --fullscreen      以全屏方式启动
-        --no-autoplay     打开文件后不自动播放
+        --no-autoplay     本次启动打开文件后暂停，不自动播放
         --no-audio        不打开音频输出（静音播放）
         --volume <值>      初始音量，支持 0.0-2.0 或 0-200（百分比）
         --speed <值>       初始播放速度，0.25 - 4.0
@@ -367,6 +369,25 @@ mod tests {
         assert!(result.fullscreen);
         assert!(result.no_autoplay);
         assert_eq!(result.files, vec![PathBuf::from("movie.mkv")]);
+    }
+
+    /// Double-clicking a file in Explorer must play it, whatever the settings
+    /// file happens to say.
+    ///
+    /// The bug this guards: the start-up path used to consult a saved
+    /// "打开文件后自动播放" preference, which one `--no-autoplay` launch (or one
+    /// click on the switch) could leave off for good — the player then opened
+    /// every double-clicked file paused with nothing on screen to explain why.
+    /// Only the launch itself may ask for a paused start.
+    #[test]
+    fn a_file_argument_is_played_unless_this_launch_asks_otherwise() {
+        let plain = parse(&["movie.mkv"]).unwrap();
+        assert_eq!(plain.files.len(), 1);
+        assert!(plain.autoplay_command_line_files());
+
+        let paused = parse(&["--no-autoplay", "movie.mkv"]).unwrap();
+        assert!(!paused.autoplay_command_line_files());
+        assert!(!parse(&["--paused"]).unwrap().autoplay_command_line_files());
     }
 
     #[test]

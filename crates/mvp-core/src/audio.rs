@@ -79,7 +79,7 @@ struct Shared {
     chunk_frames: AtomicU64,
     /// Playback speed (f64 bits).
     speed: AtomicU64,
-    /// Linear volume (f32 bits); applied by the producer, not the callback.
+    /// Linear volume (f32 bits); applied by the output, not by the producer.
     volume: AtomicU32,
     /// Mute flag.
     muted: AtomicBool,
@@ -95,6 +95,8 @@ struct Shared {
     paused: AtomicBool,
     /// When the pause started, in nanoseconds since [`TIME_BASE`].
     paused_at_ns: AtomicU64,
+    /// The sink is being torn down: the queue will never drain again.
+    closing: AtomicBool,
 }
 
 impl Shared {
@@ -114,6 +116,20 @@ impl Shared {
             primed: AtomicBool::new(false),
             paused: AtomicBool::new(false),
             paused_at_ns: AtomicU64::new(0),
+            closing: AtomicBool::new(false),
+        }
+    }
+
+    /// Gain the output callback should apply right now.
+    ///
+    /// Two relaxed atomic loads, no locks, so it is safe to read from the
+    /// real-time thread on every buffer — which is what makes a volume change
+    /// audible within one buffer instead of after the decode-ahead drained.
+    fn gain(&self) -> f32 {
+        if self.muted.load(Ordering::Relaxed) {
+            0.0
+        } else {
+            f32::from_bits(self.volume.load(Ordering::Relaxed))
         }
     }
 }
@@ -248,6 +264,12 @@ impl AudioSink {
     {
         let mut current: Vec<f32> = Vec::new();
         let mut cursor = 0usize;
+        // Gain actually applied so far. Volume is applied *here*, as the
+        // samples are played, rather than while they were decoded seconds
+        // earlier: that is what makes the slider and the wheel feel immediate.
+        // The value is ramped towards the target across one buffer so a large
+        // change (mute, or a jump to 200 %) does not click.
+        let mut applied_gain = shared.gain();
         let mut seen_generation = shared.flush_generation.load(Ordering::Relaxed);
         let channels = channels.max(1) as usize;
 
@@ -255,6 +277,16 @@ impl AudioSink {
             .build_output_stream(
                 config,
                 move |out: &mut [T], info: &cpal::OutputCallbackInfo| {
+                    // Two relaxed atomic loads, no locks: safe on the real-time
+                    // thread, and the reason a volume change is audible within
+                    // one buffer instead of after the decode-ahead drained.
+                    let target_gain = shared.gain();
+                    let ramp = if out.is_empty() {
+                        0.0
+                    } else {
+                        (target_gain - applied_gain) / out.len() as f32
+                    };
+
                     // The producer flushed the queue (seek, track change, stop):
                     // drop the partially consumed chunk *and* everything still
                     // waiting, so no pre-seek audio can leak through.
@@ -280,11 +312,16 @@ impl AudioSink {
                         }
                         let take = (out.len() - written).min(current.len() - cursor);
                         for i in 0..take {
-                            out[written + i] = T::from_sample(current[cursor + i]);
+                            applied_gain += ramp;
+                            out[written + i] = T::from_sample(crate::dsp::apply_gain_sample(
+                                current[cursor + i],
+                                applied_gain,
+                            ));
                         }
                         written += take;
                         cursor += take;
                     }
+                    applied_gain = target_gain;
 
                     if written < out.len() {
                         // Nothing left: play silence rather than repeating the
@@ -367,6 +404,11 @@ impl AudioSink {
     /// Blocks (bounded) for up to 500 ms so that a full queue applies
     /// back-pressure to the decoder instead of dropping audio; returns `false`
     /// when the chunk had to be dropped.
+    ///
+    /// The wait is spent in short slices so that [`AudioSink::close`] can end it
+    /// immediately. Without that, closing the player while it was **paused** hung
+    /// the shutdown for the whole 500 ms: a paused stream runs no callback, so
+    /// nothing ever drained the queue the decoder was waiting on.
     pub fn push(&self, samples: Vec<f32>, pts: f64) -> bool {
         if samples.is_empty() {
             return true;
@@ -400,13 +442,35 @@ impl AudioSink {
             self.shared.anchored.store(true, Ordering::Release);
         }
 
-        match self.tx.send_timeout(samples, Duration::from_millis(500)) {
-            Ok(()) => true,
-            Err(_) => {
-                self.shared.dropped.fetch_add(1, Ordering::Relaxed);
-                false
+        let mut samples = samples;
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        loop {
+            match self.tx.send_timeout(samples, Duration::from_millis(10)) {
+                Ok(()) => return true,
+                Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
+                    self.shared.dropped.fetch_add(1, Ordering::Relaxed);
+                    return false;
+                }
+                Err(crossbeam_channel::SendTimeoutError::Timeout(returned)) => {
+                    samples = returned;
+                    if self.shared.closing.load(Ordering::Relaxed)
+                        || std::time::Instant::now() >= deadline
+                    {
+                        self.shared.dropped.fetch_add(1, Ordering::Relaxed);
+                        return false;
+                    }
+                }
             }
         }
+    }
+
+    /// Stop accepting audio: the queue will never be drained again.
+    ///
+    /// Called before the workers are joined, so a decoder sitting in
+    /// [`AudioSink::push`] gives up at once instead of waiting out its
+    /// back-pressure timeout.
+    pub fn close(&self) {
+        self.shared.closing.store(true, Ordering::Relaxed);
     }
 
     /// Throw away everything queued and re-anchor the clock at `media_pts`.
@@ -502,13 +566,9 @@ impl AudioSink {
         self.shared.muted.load(Ordering::Relaxed)
     }
 
-    /// Effective gain the producer should apply: volume, zeroed when muted.
+    /// Effective gain the output applies: volume, zeroed when muted.
     pub fn effective_gain(&self) -> f32 {
-        if self.shared.muted.load(Ordering::Relaxed) {
-            0.0
-        } else {
-            self.volume()
-        }
+        self.shared.gain()
     }
 }
 

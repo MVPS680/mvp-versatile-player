@@ -16,6 +16,14 @@ pub fn draw(app: &mut PlayerApp, ctx: &Context) {
     if app.ui.overlay != Overlay::Settings {
         return;
     }
+    // Entering a page is what invalidates the expensive caches it uses — the
+    // registry answers and the output-device list are I/O, not state, and
+    // reading them on every frame is enough to make the window stutter.
+    if app.ui.cached_settings_tab != Some(app.ui.settings_tab) {
+        app.ui.cached_settings_tab = Some(app.ui.settings_tab);
+        app.ui.assoc_cache = None;
+        app.ui.audio_device_cache = None;
+    }
     let tokens = app.theme.tokens.clone();
     let mut open = true;
     egui::Window::new(RichText::new("设置").size(font::H2).strong())
@@ -117,13 +125,6 @@ fn general_page(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
     changed |= widgets::switch_row(
         ui,
         tokens,
-        "打开文件后自动播放",
-        &mut app.settings.autoplay,
-        "关闭后，打开的文件会加载但保持暂停；双击播放列表中的项目始终直接播放",
-    );
-    changed |= widgets::switch_row(
-        ui,
-        tokens,
         "记住上次播放位置",
         &mut app.settings.remember_position,
         "重新打开同一个文件时从上次的位置继续",
@@ -204,13 +205,13 @@ fn general_page(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
 
     widgets::section(ui, tokens, "窗口");
     changed |= widgets::switch_row(ui, tokens, "深色标题栏", &mut app.settings.dark_title_bar, "");
-    changed |= widgets::switch_row(
-        ui,
-        tokens,
-        "窗口置顶",
-        &mut app.settings.always_on_top,
-        "快捷键 A",
-    );
+    let mut always_on_top = app.settings.always_on_top;
+    if widgets::switch_row(ui, tokens, "窗口置顶", &mut always_on_top, "快捷键 A") {
+        // Applied immediately: the window level is a message to the window
+        // manager, so a switch that only edits a boolean looks broken.
+        app.set_always_on_top(ui.ctx(), always_on_top);
+        changed = true;
+    }
     changed |= widgets::slider_row(
         ui,
         tokens,
@@ -249,7 +250,6 @@ fn video_page(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
             (AspectMode::Stretch, "拉伸填充"),
             (AspectMode::Ratio16x9, "16:9"),
             (AspectMode::Ratio4x3, "4:3"),
-            (AspectMode::Source, "原始比例"),
         ],
     );
     changed |= widgets::switch_row(
@@ -257,7 +257,8 @@ fn video_page(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
         tokens,
         "控制栏加暗色衬底",
         &mut app.settings.control_scrim,
-        "",
+        "在画面底部绘制渐变，让控制栏在明亮的画面上也清晰；\
+         全屏时只在控制栏出现时绘制（窗口模式下控制栏本身已是实底）",
     );
 
     widgets::section(ui, tokens, "截图");
@@ -313,9 +314,22 @@ fn video_page(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
 fn audio_page(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
     let mut changed = false;
     widgets::section(ui, tokens, "输出设备");
-    let devices = mvp_core::audio::output_device_names();
-    let default_name = mvp_core::audio::default_output_device_name()
-        .unwrap_or_else(|| "系统默认设备".to_string());
+    // Enumerating WASAPI endpoints is not free; do it once per visit.
+    if app.ui.audio_device_cache.is_none() {
+        app.ui.audio_device_cache = Some(crate::state::AudioDeviceCache {
+            devices: mvp_core::audio::output_device_names(),
+            default_name: mvp_core::audio::default_output_device_name()
+                .unwrap_or_else(|| "系统默认设备".to_string()),
+        });
+    }
+    let (devices, default_name) = {
+        let cache = app
+            .ui
+            .audio_device_cache
+            .as_ref()
+            .expect("the cache was filled just above");
+        (cache.devices.clone(), cache.default_name.clone())
+    };
 
     let current = app
         .settings
@@ -528,7 +542,22 @@ fn integration_page(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
     }
 
     ui.add_space(space::MD);
-    let status = if mvp_platform::assoc::is_registered() {
+    // The registry answers are read once per visit rather than once per frame:
+    // four registry round-trips at 60 Hz is enough I/O to stutter the window.
+    if app.ui.assoc_cache.is_none() {
+        app.ui.assoc_cache = Some(crate::state::AssocCache {
+            registered: mvp_platform::assoc::is_registered(),
+            video: mvp_platform::assoc::current_handler_for(".mp4"),
+            audio: mvp_platform::assoc::current_handler_for(".mp3"),
+            image: mvp_platform::assoc::current_handler_for(".png"),
+        });
+    }
+    let status = if app
+        .ui
+        .assoc_cache
+        .as_ref()
+        .is_some_and(|cache| cache.registered)
+    {
         ("已注册文件关联", tokens.success)
     } else {
         ("尚未注册文件关联", tokens.text_weak)
@@ -572,6 +601,8 @@ fn integration_page(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
                 }
                 Err(err) => app.error(format!("注册失败: {err}")),
             }
+            // The registry changed underneath the cache.
+            app.ui.assoc_cache = None;
         }
         if ui
             .add(egui::Button::new(
@@ -583,6 +614,7 @@ fn integration_page(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
                 Ok(()) => app.toast(Toast::info("已取消文件关联")),
                 Err(err) => app.error(format!("取消关联失败: {err}")),
             }
+            app.ui.assoc_cache = None;
         }
         if ui
             .button(RichText::new("打开 Windows 默认应用设置").size(font::SMALL))
@@ -595,13 +627,11 @@ fn integration_page(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
     });
 
     widgets::section(ui, tokens, "当前关联");
-    let video_handler = mvp_platform::assoc::current_handler_for(".mp4");
-    let audio_handler = mvp_platform::assoc::current_handler_for(".mp3");
-    let image_handler = mvp_platform::assoc::current_handler_for(".png");
+    let cache = app.ui.assoc_cache.clone().unwrap_or_default();
     for (label, handler) in [
-        ("视频 (.mp4)", video_handler),
-        ("音频 (.mp3)", audio_handler),
-        ("图片 (.png)", image_handler),
+        ("视频 (.mp4)", cache.video),
+        ("音频 (.mp3)", cache.audio),
+        ("图片 (.png)", cache.image),
     ] {
         widgets::key_value(
             ui,
@@ -653,6 +683,7 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("空格 / K", "播放 / 暂停"),
     ("← / →", "快退 / 快进 5 秒"),
     ("Shift + ← / →", "快退 / 快进 30 秒"),
+    (", / .", "上一帧 / 下一帧（暂停时逐帧查看）"),
     ("↑ / ↓", "音量 +5% / -5%"),
     ("M", "静音"),
     ("N / P", "下一项 / 上一项"),
@@ -678,7 +709,7 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("F1", "快捷键帮助"),
     ("0 / 1", "图片：适应窗口 / 100%"),
     ("+ / -", "图片：放大 / 缩小"),
-    ("鼠标滚轮", "调节音量（Ctrl 拖动为快进）"),
+    ("鼠标滚轮", "在画面上滚动：调节音量，每格 5%（Ctrl + 滚轮：快进 / 快退 5 秒）"),
     ("鼠标拖动画面", "平移图片"),
 ];
 
@@ -739,11 +770,23 @@ fn about_page(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
 
     widgets::section(ui, tokens, "运行环境");
     widgets::key_value(ui, tokens, "启动耗时", &format!("{:.0} 毫秒", app.ui.startup_ms));
+    // Read once per visit, like the audio page: enumerating devices is I/O.
+    if app.ui.audio_device_cache.is_none() {
+        app.ui.audio_device_cache = Some(crate::state::AudioDeviceCache {
+            devices: mvp_core::audio::output_device_names(),
+            default_name: mvp_core::audio::default_output_device_name()
+                .unwrap_or_else(|| "无".to_string()),
+        });
+    }
     widgets::key_value(
         ui,
         tokens,
         "音频设备",
-        &mvp_core::audio::default_output_device_name().unwrap_or_else(|| "无".to_string()),
+        app.ui
+            .audio_device_cache
+            .as_ref()
+            .map(|cache| cache.default_name.as_str())
+            .unwrap_or("无"),
     );
     widgets::key_value(
         ui,
@@ -767,4 +810,33 @@ fn about_page(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
             app.ui.open_overlay(Overlay::Shortcuts);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SHORTCUTS;
+    use std::collections::HashSet;
+
+    /// The table is the user-facing contract for the keyboard. A duplicated key
+    /// would mean two commands fighting over one press, and an empty one would
+    /// document a shortcut that does not exist.
+    #[test]
+    fn every_shortcut_is_documented_once() {
+        let mut seen: HashSet<&str> = HashSet::new();
+        for (key, action) in SHORTCUTS {
+            assert!(!key.trim().is_empty(), "a shortcut has no key: {action}");
+            assert!(!action.trim().is_empty(), "a shortcut has no description");
+            assert!(seen.insert(key), "duplicated shortcut key: {key}");
+        }
+    }
+
+    /// Frame stepping is the one command that was documented as something it
+    /// did not do; it must stay visible in the reference.
+    #[test]
+    fn frame_stepping_is_listed() {
+        assert!(
+            SHORTCUTS.iter().any(|(key, _)| key.contains(',')),
+            "the frame-step keys must be documented"
+        );
+    }
 }

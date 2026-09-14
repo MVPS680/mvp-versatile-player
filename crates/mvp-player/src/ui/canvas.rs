@@ -7,6 +7,7 @@ use crate::icons::{self, Icon};
 use crate::settings::AspectMode;
 use crate::state::{Mode, Overlay, Toast};
 use crate::theme::{font, radius, space, Tokens};
+use crate::ui::widgets;
 
 /// Draw the central area.
 pub fn draw(app: &mut PlayerApp, ctx: &Context) {
@@ -47,7 +48,6 @@ fn media_view(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
         .unwrap_or((16, 9));
 
     let rect = destination_rect(area, source, app.settings.aspect, app.settings.rotation);
-    app.last_video_rect = rect;
 
     // Ask the engine to decode at (at most) the size we actually display. A 4K
     // file shown in a 1080p window then costs a quarter of the memory and a
@@ -64,6 +64,20 @@ fn media_view(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
             app.video_target = target;
             app.engine.set_target_size(target.0, target.1);
         }
+    }
+
+    // ---- control-bar scrim ----------------------------------------------
+    // A dimming gradient at the bottom of the picture, so the controls read
+    // over bright video. In windowed mode the transport bar is docked right
+    // below it; in fullscreen the bar floats over the picture and only appears
+    // with the controls, so the scrim follows it.
+    if app.settings.control_scrim && (!app.ui.fullscreen || app.ui.controls_visible()) {
+        let height = if app.ui.fullscreen { 120.0 } else { 96.0 };
+        let band = Rect::from_min_max(
+            egui::pos2(area.left(), (area.bottom() - height).max(area.top())),
+            egui::pos2(area.right(), area.bottom()),
+        );
+        widgets::paint_scrim(ui.painter(), band);
     }
 
     match &app.texture {
@@ -147,26 +161,63 @@ fn handle_video_interaction(
     }
 
     // Scroll: volume by default, seek with Ctrl.
+    //
+    // One notch is one step, whatever the device reports: a notched wheel sends
+    // a single 40-point spike per notch while a precision touch-pad sends a
+    // stream of small deltas, so the movement is accumulated and spent in whole
+    // steps. Feeding the raw delta straight into the volume (as this used to)
+    // made a notch worth 10% and a touch-pad worth nothing at all.
+    //
+    // Only while the pointer is over the picture and no dialog is open: egui's
+    // scroll areas consume the *smoothed* delta and leave the raw one alone, so
+    // without this guard scrolling the settings list would quietly change the
+    // volume at the same time.
     let (scroll, modifiers) = ui.ctx().input(|i| (i.raw_scroll_delta.y, i.modifiers));
-    if scroll.abs() > 0.5 {
+    if scroll != 0.0 && response.hovered() && !app.ui.has_overlay() {
         if modifiers.ctrl || !app.settings.wheel_controls_volume {
-            let delta = (scroll as f64) * 0.5;
-            app.engine.seek_relative(delta);
-        } else {
-            let step = scroll / 400.0;
-            app.settings.volume = (app.settings.volume + step).clamp(0.0, 2.0);
-            if app.settings.volume > 0.0 {
-                app.settings.muted = false;
+            app.ui.wheel_volume = 0.0;
+            app.ui.wheel_seek += scroll;
+            let (steps, leftover) = widgets::wheel_steps(app.ui.wheel_seek, WHEEL_POINTS_PER_NOTCH);
+            app.ui.wheel_seek = leftover;
+            if steps != 0 {
+                app.seek_relative(steps as f64 * app.settings.seek_step);
             }
-            app.store.mark_dirty();
-            app.toast(Toast::info(format!(
-                "音量 {}%",
-                (app.settings.volume * 100.0).round() as i32
-            )));
+        } else {
+            app.ui.wheel_seek = 0.0;
+            app.ui.wheel_volume += scroll;
+            let (steps, leftover) =
+                widgets::wheel_steps(app.ui.wheel_volume, WHEEL_POINTS_PER_NOTCH);
+            app.ui.wheel_volume = leftover;
+            if steps != 0 {
+                let volume = app.settings.volume + steps as f32 * WHEEL_VOLUME_STEP;
+                let clamped = volume.clamp(0.0, 2.0);
+                // At either end the leftover must go, or the accumulator keeps
+                // banking steps the user cannot see and the next scroll in the
+                // other direction jumps.
+                if clamped != volume {
+                    app.ui.wheel_volume = 0.0;
+                }
+                app.settings.volume = clamped;
+                if clamped > 0.0 {
+                    app.settings.muted = false;
+                }
+                app.store.mark_dirty();
+                app.toast(Toast::info(format!(
+                    "音量 {}%",
+                    (clamped * 100.0).round() as i32
+                )));
+            }
         }
     }
     let _ = rect;
 }
+
+/// Wheel points that make one step, matching egui's native `line_scroll_speed`
+/// so that one physical notch is exactly one step.
+const WHEEL_POINTS_PER_NOTCH: f32 = 40.0;
+
+/// Volume change per wheel notch — the same 5 % the arrow keys use.
+const WHEEL_VOLUME_STEP: f32 = 0.05;
 
 fn draw_subtitles(app: &PlayerApp, ui: &mut Ui, rect: &Rect, tokens: &Tokens) {
     let time = app.engine.display_position() - app.settings.subtitle_delay;
@@ -644,6 +695,5 @@ fn empty_state(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
             }
         });
     });
-    let _ = radius::SM;
 }
 

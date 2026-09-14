@@ -92,14 +92,14 @@ fn seek_row(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
                 if bar.response.dragged() {
                     app.ui.seek_drag = Some(value);
                 } else {
-                    app.engine.seek(value);
+                    app.seek(value);
                     app.ui.seek_drag = None;
                 }
             }
         }
         if bar.response.drag_stopped() {
             if let Some(value) = app.ui.seek_drag.take() {
-                app.engine.seek(value);
+                app.seek(value);
             }
         }
 
@@ -139,12 +139,17 @@ fn button_row(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
         )
         .clicked()
         {
-            app.engine.seek_relative(-app.settings.seek_step);
+            app.seek_relative(-app.settings.seek_step);
         }
 
         // ---- play / pause -------------------------------------------------
+        // A finished file has nothing to resume, so the button replays it from
+        // the start; the tooltip is what tells the user that is what it does.
+        let ended = app.engine.state() == mvp_core::PlaybackState::Ended;
         let (icon, tip) = if playing {
             (Icon::Pause, "暂停 (空格)")
+        } else if ended {
+            (Icon::Play, "重播 (空格)")
         } else {
             (Icon::Play, "播放 (空格)")
         };
@@ -169,7 +174,7 @@ fn button_row(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
         }
 
         if widgets::tool_button(tokens, ui, Icon::Forward, "前进 5 秒 (→)", active).clicked() {
-            app.engine.seek_relative(app.settings.seek_step);
+            app.seek_relative(app.settings.seek_step);
         }
         if widgets::tool_button(tokens, ui, Icon::Next, "下一项 (N)", app.has_next()).clicked() {
             app.next_media(false);
@@ -210,22 +215,18 @@ fn button_row(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
             app.store.mark_dirty();
         }
         let percent = (app.settings.volume * 100.0).round() as i32;
-        if ui
-            .add_sized(
-                egui::vec2(38.0, 20.0),
-                egui::Label::new(
-                    RichText::new(format!("{percent}%"))
-                        .size(font::TINY)
-                        .color(tokens.text_weak),
-                )
-                .selectable(false),
+        // A readout, not a button: the speaker icon right next to it is the
+        // mute control, and making the number clickable silently muted the
+        // player for anyone who clicked the text to select it.
+        ui.add_sized(
+            egui::vec2(38.0, 20.0),
+            egui::Label::new(
+                RichText::new(format!("{percent}%"))
+                    .size(font::TINY)
+                    .color(tokens.text_weak),
             )
-            .on_hover_text("音量")
-            .clicked()
-        {
-            app.settings.muted = !app.settings.muted;
-            app.store.mark_dirty();
-        }
+            .selectable(false),
+        );
 
         ui.add_space(space::SM);
 
@@ -358,8 +359,7 @@ fn button_row(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
             )
             .clicked()
             {
-                app.settings.subtitles_enabled = !app.settings.subtitles_enabled;
-                app.store.mark_dirty();
+                app.set_subtitles_enabled(!app.settings.subtitles_enabled);
                 app.toast(Toast::info(if app.settings.subtitles_enabled {
                     "字幕已开启"
                 } else {

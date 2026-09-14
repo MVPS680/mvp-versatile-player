@@ -96,6 +96,7 @@ fn shell_signatures_are_stable() {
     let _: fn(&str) = shell::set_app_user_model_id;
     let _: fn(isize, bool) = shell::set_dark_titlebar;
     let _: fn(isize, [u8; 3], [u8; 3], [u8; 3]) = shell::set_caption_color;
+    let _: fn(isize) = shell::reset_caption_color;
     let _: fn(&Path) = shell::reveal_in_explorer;
     let _: fn(&Path) -> anyhow::Result<()> = shell::open_in_default_app;
     let _: fn(&str) -> anyhow::Result<()> = shell::open_url;

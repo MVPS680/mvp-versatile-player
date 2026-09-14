@@ -15,8 +15,8 @@ use mvp_platform::power::SleepBlocker;
 use mvp_platform::single_instance::{AppInstance, IpcMessage};
 use mvp_subtitle::Subtitle;
 
-use crate::settings::{Settings, SettingsStore};
-use crate::state::{InfoRow, Mode, Toast, ToastKind, UiState};
+use crate::settings::{LaunchOverrides, Settings, SettingsStore};
+use crate::state::{FrameHistory, InfoRow, Mode, ShownFrame, Toast, ToastKind, UiState};
 use crate::theme::Theme;
 
 /// Options the player was started with.
@@ -42,12 +42,34 @@ pub struct StartupArgs {
     pub show_help: bool,
 }
 
+impl StartupArgs {
+    /// Whether a file named on the command line should start playing.
+    ///
+    /// Always, unless this launch asked otherwise: a path handed to the player
+    /// — a double-click on an associated extension, Explorer's "Open with",
+    /// something typed in a shell — is an explicit request to play *that* file.
+    /// The only way to open something paused is `--no-autoplay` (`--paused`),
+    /// and that lasts exactly one launch: it is deliberately not a preference,
+    /// because the retired "打开文件后自动播放" switch could leave the player
+    /// unable to play a double-clicked file with no sign of why.
+    pub fn autoplay_command_line_files(&self) -> bool {
+        !self.no_autoplay
+    }
+}
+
 /// Everything the player is and knows.
 pub struct PlayerApp {
     /// The media engine, shared with the IPC thread.
     pub engine: Arc<Engine>,
-    /// Persisted settings.
+    /// Persisted settings, with this launch's command-line overrides folded in.
     pub settings: Settings,
+    /// Settings as they were on disk, before the command line was folded in.
+    ///
+    /// Kept so the save path can tell an untouched `--volume` from a volume the
+    /// user has since moved by hand. See [`Settings::persisted`].
+    pub baseline: Settings,
+    /// The command-line values that belong to this launch alone.
+    pub launch: LaunchOverrides,
     /// Debounced settings writer.
     pub store: SettingsStore,
     /// Visual tokens.
@@ -66,11 +88,19 @@ pub struct PlayerApp {
     pub texture: Option<TextureHandle>,
     /// Serial number of the frame currently uploaded.
     pub uploaded_serial: u64,
+    /// Presentation timestamp of the frame currently uploaded.
+    pub uploaded_pts: f64,
     /// Pixel size of the frame currently uploaded.
     pub uploaded_size: (u32, u32),
     /// The exact image currently on screen, kept so a snapshot never has to ask
     /// the engine for pixels it has already given away.
     pub displayed: Option<Arc<egui::ColorImage>>,
+    /// The frames already shown, which is the only place a backward step can
+    /// come from. See [`ShownFrame`].
+    pub frame_history: FrameHistory,
+    /// The frame a backward step moved away from, so stepping forward again
+    /// returns to it instead of skipping it.
+    pub redo_frame: Option<ShownFrame>,
 
     /// The single-instance guard, held for the lifetime of the process.
     pub instance: Option<AppInstance>,
@@ -79,15 +109,19 @@ pub struct PlayerApp {
 
     /// Native window handle, used for the dark title bar and taskbar hints.
     pub hwnd: isize,
-    /// Whether the dark title bar has been applied yet.
-    pub titlebar_applied: bool,
+    /// The dark-title-bar value that has been applied, if any. `None` until the
+    /// window exists.
+    pub titlebar_dark: Option<bool>,
     /// Keeps the display awake while playing.
     pub sleep_blocker: SleepBlocker,
 
     /// Size the video is being scaled to, so the engine can decode at that size.
     pub video_target: (u32, u32),
-    /// Pixel rect the video occupies this frame, used for aspect-correct seeking.
-    pub last_video_rect: egui::Rect,
+
+    /// Side-car subtitle found for the file being opened, held back until the
+    /// file has been probed: "external subtitles win" only applies when the file
+    /// has no embedded track worth showing.
+    pub pending_sidecar: Option<PathBuf>,
 
     /// Wall-clock instant the process started, for the startup-time readout.
     pub process_start: Instant,
@@ -111,18 +145,14 @@ impl PlayerApp {
         process_start: Instant,
     ) -> Self {
         let mut settings = Settings::load();
-        if let Some(volume) = args.volume {
-            settings.volume = volume;
-        }
-        if let Some(speed) = args.speed {
-            settings.speed = speed.clamp(0.25, 4.0);
-        }
-        if args.fullscreen {
-            settings.start_fullscreen = true;
-        }
-        if args.no_autoplay {
-            settings.autoplay = false;
-        }
+        // Snapshot the document before the command line is folded in: the values
+        // that came from `settings.json` are the ones that belong there.
+        let baseline = settings.clone();
+        let launch = LaunchOverrides {
+            volume: args.volume,
+            speed: args.speed.map(|speed| speed.clamp(0.25, 4.0)),
+        };
+        settings.apply_launch_overrides(&launch);
 
         let theme = Theme::default();
         theme.install(&cc.egui_ctx);
@@ -133,7 +163,10 @@ impl PlayerApp {
             audio_device: settings.audio_device.clone(),
             volume: settings.volume,
             speed: settings.speed,
-            autoplay: settings.autoplay,
+            // The engine is told before the first file is opened; `open_engine`
+            // sets it again for every open, which is what makes a file picked
+            // inside the player always play.
+            autoplay: args.autoplay_command_line_files(),
             ..EngineConfig::default()
         };
         let engine = Arc::new(
@@ -159,6 +192,8 @@ impl PlayerApp {
         let mut app = Self {
             engine,
             settings,
+            baseline,
+            launch,
             store: SettingsStore::default(),
             theme,
             playlist,
@@ -167,15 +202,18 @@ impl PlayerApp {
             ui: UiState::default(),
             texture: None,
             uploaded_serial: 0,
+            uploaded_pts: 0.0,
             uploaded_size: (0, 0),
             displayed: None,
+            frame_history: FrameHistory::new(),
+            redo_frame: None,
             instance,
             ipc_rx,
             hwnd,
-            titlebar_applied: false,
+            titlebar_dark: None,
             sleep_blocker: SleepBlocker::new(false),
             video_target: (0, 0),
-            last_video_rect: egui::Rect::NOTHING,
+            pending_sidecar: None,
             process_start,
             info_source: None,
             last_duration: 0.0,
@@ -202,7 +240,9 @@ impl PlayerApp {
         }
 
         if !args.files.is_empty() {
-            app.open_paths(&args.files, true, app.settings.autoplay);
+            // A file the shell hands over always plays; only `--no-autoplay`
+            // asks for a paused start, and only for this launch.
+            app.open_paths(&args.files, true, args.autoplay_command_line_files());
         } else if app.settings.restore_playlist {
             if let Some(index) = app.settings.playlist_index {
                 if index < app.playlist.len() {
@@ -223,11 +263,12 @@ impl PlayerApp {
     /// Add `paths` to the playlist (replacing it when `replace`) and open the
     /// first one.
     ///
-    /// `autoplay` is the user's "start playing when a file is opened"
-    /// preference. It only ever applies here, to a file the player was told to
-    /// open; anything the user picks *inside* the player (double-clicking a
-    /// playlist entry, next/previous, the end of a file) is an explicit "play
-    /// this" and always plays.
+    /// `autoplay` is how *this* open was requested. Files the player opens for
+    /// the user play by default — a path on the command line, a double-click in
+    /// Explorer, a drop, the file dialog, a pick in the playlist — and the only
+    /// caller that may pass `false` is the start-up path, when the launch itself
+    /// asked for a paused start with `--no-autoplay`. With it the entry is
+    /// loaded and waits rather than not opening at all.
     pub fn open_paths(&mut self, paths: &[PathBuf], replace: bool, autoplay: bool) {
         if paths.is_empty() {
             return;
@@ -269,9 +310,9 @@ impl PlayerApp {
 
     /// Play the playlist entry at `index`.
     ///
-    /// Selecting an entry is an instruction to play it, so this never consults
-    /// the autoplay preference: a user who turned that off asked for files
-    /// opened *for* them to wait, not for their own clicks to be ignored.
+    /// Selecting an entry is an instruction to play it, so this always plays:
+    /// nothing a user clicks inside the player is ever ignored because of how
+    /// the player was launched.
     pub fn play_index(&mut self, index: usize) {
         self.play_index_with(index, true);
     }
@@ -311,6 +352,8 @@ impl PlayerApp {
                     self.texture = None;
                     self.displayed = None;
                     self.uploaded_serial = 0;
+                    self.uploaded_pts = 0.0;
+                    self.forget_shown_frames();
                     self.engine.stop();
                     self.rebuild_info_rows_image();
                     let doc = self.image.doc.as_ref().map(|d| d.summary()).unwrap_or_default();
@@ -345,21 +388,69 @@ impl PlayerApp {
         self.engine.set_muted(self.settings.muted);
         self.engine.set_audio_delay(self.settings.audio_delay);
         self.engine.set_subtitle_delay(self.settings.subtitle_delay);
-        self.engine.set_subtitle_track(None);
         self.engine.set_external_subtitle(None);
         self.engine.set_ab_loop(None);
+        // "Show subtitles when the file has them" means: let the container pick
+        // its default text track. Turning them off means the decoder is not even
+        // started, and nothing is lost by that because the choice is only a
+        // display gate that the renderer already honours.
+        if self.settings.subtitles_enabled {
+            self.engine.set_subtitle_track_auto();
+        } else {
+            self.engine.set_subtitle_track(None);
+        }
         self.mode = Mode::Media;
         self.image.close();
         self.texture = None;
         self.displayed = None;
         self.uploaded_serial = 0;
+        self.uploaded_pts = 0.0;
+        self.forget_shown_frames();
         self.info_source = None;
         self.last_duration = 0.0;
         self.engine
             .set_target_size(self.video_target.0, self.video_target.1);
 
+        self.pending_sidecar = None;
         if let Some(path) = local {
-            self.load_sidecar_subtitle(&path);
+            self.attach_sidecar_subtitle(&path);
+        }
+    }
+
+    /// Attach the same-named subtitle next to `media`, honouring the user's
+    /// preference when the file also carries one.
+    ///
+    /// The engine always lets an external side-car win over an embedded track,
+    /// so the decision has to be made *here*: either load it now, or hold it
+    /// back until the probe says whether the file has a text track of its own.
+    fn attach_sidecar_subtitle(&mut self, media: &Path) {
+        if !self.settings.autoload_sidecar_subtitles || !self.settings.subtitles_enabled {
+            return;
+        }
+        let Some(sidecar) = find_sidecar_subtitle(media) else {
+            return;
+        };
+        if self.settings.prefer_external_subtitles {
+            self.load_subtitle_file(&sidecar);
+        } else {
+            self.pending_sidecar = Some(sidecar);
+        }
+    }
+
+    /// Decide what to do with a held-back side-car now that the file is probed.
+    ///
+    /// With "external subtitles preferred" off, a file that has text subtitles
+    /// of its own is shown with those; the side-car stays on disk and can still
+    /// be loaded by hand.
+    fn resolve_pending_sidecar(&mut self, info: &MediaInfo) {
+        let Some(sidecar) = self.pending_sidecar.take() else {
+            return;
+        };
+        let has_embedded = info.subtitles.iter().any(|stream| stream.is_text);
+        if has_embedded {
+            log::info!("使用内嵌字幕，忽略同名字幕文件: {}", sidecar.display());
+        } else {
+            self.load_subtitle_file(&sidecar);
         }
     }
 
@@ -372,38 +463,20 @@ impl PlayerApp {
         let Some(position) = self.settings.resume_position(&key, info.duration) else {
             return;
         };
-        self.engine.seek(position);
+        self.seek(position);
         self.toast(Toast::info(format!(
             "从 {} 继续播放",
             mvp_core::util::format_duration(position)
         )));
     }
 
-    /// Look for `name.srt` / `name.ass` / `name.vtt` next to `media`.
+    /// Look for `name.srt` / `name.ass` / `name.vtt` next to `media` and load it.
     fn load_sidecar_subtitle(&mut self, media: &Path) {
         if !self.settings.autoload_sidecar_subtitles || !self.settings.subtitles_enabled {
             return;
         }
-        let Some(stem) = media.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
-            return;
-        };
-        let Some(dir) = media.parent() else { return };
-        // Try the most specific names first so `movie.zh.srt` beats `movie.srt`.
-        let languages = ["zh", "chs", "cht", "sc", "tc", "eng", "en"];
-        let mut candidates: Vec<PathBuf> = Vec::new();
-        for lang in languages {
-            for ext in ["srt", "ass", "ssa", "vtt", "sub"] {
-                candidates.push(dir.join(format!("{stem}.{lang}.{ext}")));
-            }
-        }
-        for ext in ["srt", "ass", "ssa", "vtt"] {
-            candidates.push(dir.join(format!("{stem}.{ext}")));
-        }
-        for candidate in candidates {
-            if candidate.is_file() {
-                self.load_subtitle_file(&candidate);
-                return;
-            }
+        if let Some(candidate) = find_sidecar_subtitle(media) {
+            self.load_subtitle_file(&candidate);
         }
     }
 
@@ -499,6 +572,7 @@ impl PlayerApp {
             return;
         }
         let serial = frame.serial;
+        let pts = frame.pts;
         let dimensions = (frame.width, frame.height);
 
         // `cast_vec` reuses the allocation: `u8` and `Color32` have the same
@@ -513,6 +587,14 @@ impl PlayerApp {
         data.truncate(expected);
         let pixels: Vec<egui::Color32> = bytemuck::allocation::cast_vec(data);
 
+        // Remember what is about to be replaced, *before* it is replaced: a
+        // backward step can only ever show something that has already been on
+        // screen, and this is the moment a frame stops being the current one.
+        self.remember_shown_frame();
+        // A frame from the decoder means the playhead moved on, so a frame held
+        // over from a backward step is no longer "next".
+        self.redo_frame = None;
+
         self.upload_image(
             ctx,
             egui::ColorImage {
@@ -522,6 +604,7 @@ impl PlayerApp {
             },
         );
         self.uploaded_serial = serial;
+        self.uploaded_pts = pts;
         self.uploaded_size = dimensions;
     }
 
@@ -604,6 +687,7 @@ impl PlayerApp {
                     self.rebuild_info_rows(&info);
                     self.engine
                         .set_target_size(self.video_target.0, self.video_target.1);
+                    self.resolve_pending_sidecar(&info);
                     self.apply_resume_position(&info);
                 }
                 EngineEvent::StateChanged(_) => {}
@@ -686,13 +770,22 @@ impl PlayerApp {
 
     /// Save the session so the next launch can restore it.
     pub fn save_session(&mut self) {
-        debug_assert!(self.store.is_dirty());
         self.settings.playlist = self.playlist.items().to_vec();
         self.settings.playlist_index = self.playlist.current_index();
         self.settings.sidebar_visible = self.ui.sidebar_visible;
         self.settings.sidebar_tab = self.ui.sidebar_tab;
         self.store.mark_dirty();
-        self.store.flush(&self.settings);
+        let document = self.settings_to_persist();
+        self.store.flush(&document);
+    }
+
+    /// The settings document that belongs in `settings.json`.
+    ///
+    /// The live document carries this launch's command-line overrides so the
+    /// interface can show them; the file must not, or a single `--volume` or
+    /// `--speed` would become a permanent preference.
+    fn settings_to_persist(&self) -> Settings {
+        self.settings.persisted(&self.launch, &self.baseline)
     }
 
     /// Show an error banner and a toast.
@@ -837,12 +930,21 @@ impl PlayerApp {
         }
     }
 
-    /// Apply the native title bar tint once the window exists.
+    /// Apply the native title bar tint, now and whenever the setting changes.
+    ///
+    /// Re-applied on every change rather than once at start-up: the switch says
+    /// "dark title bar", and a switch that only takes effect after a restart is
+    /// a fake switch. Handing the colours back to the system is a separate call
+    /// because DWM remembers what it was last told.
     pub fn apply_window_chrome(&mut self) {
-        if self.titlebar_applied || self.hwnd == 0 {
+        if self.hwnd == 0 {
             return;
         }
-        if self.settings.dark_title_bar {
+        let wanted = self.settings.dark_title_bar;
+        if self.titlebar_dark == Some(wanted) {
+            return;
+        }
+        if wanted {
             mvp_platform::shell::set_dark_titlebar(self.hwnd, true);
             let t = &self.theme.tokens;
             mvp_platform::shell::set_caption_color(
@@ -851,8 +953,35 @@ impl PlayerApp {
                 [t.text.r(), t.text.g(), t.text.b()],
                 [t.border.r(), t.border.g(), t.border.b()],
             );
+        } else {
+            mvp_platform::shell::set_dark_titlebar(self.hwnd, false);
+            mvp_platform::shell::reset_caption_color(self.hwnd);
         }
-        self.titlebar_applied = true;
+        self.titlebar_dark = Some(wanted);
+    }
+
+    /// Push the whole settings document back into the running player.
+    ///
+    /// Used after "reset all settings": replacing the struct is only half the
+    /// job, because the volume, the window level, the sidebar and the engine's
+    /// playback modes all live outside it.
+    pub fn apply_settings(&mut self, ctx: &Context) {
+        self.sync_engine();
+        self.image.slideshow_interval = self.settings.slideshow_interval;
+        self.image.animation_playing = self.settings.animate_images;
+        self.ui.sidebar_visible = self.settings.sidebar_visible;
+        self.ui.sidebar_tab = self.settings.sidebar_tab;
+        self.titlebar_dark = None;
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+            if self.settings.always_on_top {
+                egui::WindowLevel::AlwaysOnTop
+            } else {
+                egui::WindowLevel::Normal
+            },
+        ));
+        self.engine
+            .set_hardware_decoding(self.settings.hardware_decoding);
+        self.store.mark_dirty();
     }
 
     /// Toggle fullscreen and remember the previous window state.
@@ -866,14 +995,24 @@ impl PlayerApp {
 
     /// Toggle always-on-top.
     pub fn toggle_always_on_top(&mut self, ctx: &Context) {
-        self.settings.always_on_top = !self.settings.always_on_top;
-        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
-            if self.settings.always_on_top {
-                egui::WindowLevel::AlwaysOnTop
-            } else {
-                egui::WindowLevel::Normal
-            },
-        ));
+        self.set_always_on_top(ctx, !self.settings.always_on_top);
+    }
+
+    /// Put the window above (or back in line with) the others.
+    ///
+    /// Toggling the setting alone is not enough: the window level is a message
+    /// to the window manager, and a switch that only edits a boolean looks
+    /// broken until the next launch.
+    pub fn set_always_on_top(&mut self, ctx: &Context, value: bool) {
+        if self.settings.always_on_top == value {
+            return;
+        }
+        self.settings.always_on_top = value;
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(if value {
+            egui::WindowLevel::AlwaysOnTop
+        } else {
+            egui::WindowLevel::Normal
+        }));
         self.store.mark_dirty();
     }
 
@@ -993,6 +1132,111 @@ impl PlayerApp {
     // Small media actions shared by the menu, the toolbar and the shortcuts
     // -----------------------------------------------------------------------
 
+    /// Jump to an absolute position.
+    ///
+    /// Every seek goes through here rather than straight to the engine: a jump
+    /// invalidates the frames remembered for single-frame stepping, and a
+    /// "previous frame" that showed something from before the jump would be
+    /// worse than one that is simply unavailable.
+    pub fn seek(&mut self, position: f64) {
+        self.forget_shown_frames();
+        self.engine.seek(position);
+    }
+
+    /// Jump forward or backward by `delta` seconds.
+    pub fn seek_relative(&mut self, delta: f64) {
+        self.forget_shown_frames();
+        self.engine.seek_relative(delta);
+    }
+
+    /// Lose every remembered frame: they describe a playhead being left behind.
+    fn forget_shown_frames(&mut self) {
+        self.frame_history.clear();
+        self.redo_frame = None;
+    }
+
+    /// Remember the frame that is on screen right now.
+    fn remember_shown_frame(&mut self) {
+        let (Some(image), true) = (&self.displayed, self.uploaded_serial > 0) else {
+            return;
+        };
+        self.frame_history.push(ShownFrame {
+            pts: self.uploaded_pts,
+            serial: self.uploaded_serial,
+            image: Arc::clone(image),
+        });
+    }
+
+    /// `true` when there is a frame to step back to.
+    pub fn can_step_back(&self) -> bool {
+        self.mode.is_media() && !self.frame_history.is_empty()
+    }
+
+    /// Show the frame before the current one.
+    ///
+    /// The picture comes from the interface's own history (see [`ShownFrame`]);
+    /// the engine is only told to move its playhead, because a container seek
+    /// would flush the decoder and lose the exact position being stepped
+    /// through.
+    pub fn step_back_frame(&mut self, ctx: &Context) {
+        if !self.mode.is_media() {
+            return;
+        }
+        let Some(previous) = self.frame_history.pop() else {
+            return;
+        };
+        // Pause first: the playhead is about to move backwards, and a running
+        // clock would immediately re-advance past the frame being shown.
+        self.engine.pause();
+        // Hold on to the frame being left so 下一帧 comes back to it.
+        if let (Some(image), true) = (&self.displayed, self.uploaded_serial > 0) {
+            self.redo_frame = Some(ShownFrame {
+                pts: self.uploaded_pts,
+                serial: self.uploaded_serial,
+                image: Arc::clone(image),
+            });
+        }
+        self.show_frame(previous, ctx);
+    }
+
+    /// Show the next frame: the one a backward step left, or the decoder's next.
+    pub fn step_forward_frame(&mut self, ctx: &Context) {
+        if !self.mode.is_media() {
+            return;
+        }
+        self.engine.pause();
+        if let Some(frame) = self.redo_frame.take() {
+            // Returning to where we were: the frame being left goes back on the
+            // ring, so stepping back again lands on it rather than skipping it.
+            self.remember_shown_frame();
+            self.show_frame(frame, ctx);
+            return;
+        }
+        // No held-over frame: the decoder's queue is the only source, and it
+        // hands the frame over through the normal upload path.
+        self.engine.step_frame(1);
+    }
+
+    /// Put a remembered frame back on screen and move the playhead to it.
+    fn show_frame(&mut self, frame: ShownFrame, ctx: &Context) {
+        let image = frame.image;
+        self.uploaded_pts = frame.pts;
+        self.uploaded_serial = frame.serial;
+        self.uploaded_size = (image.size[0] as u32, image.size[1] as u32);
+        self.engine.set_playhead(frame.pts);
+        match &mut self.texture {
+            Some(texture) => texture.set(Arc::clone(&image), TextureOptions::LINEAR),
+            None => {
+                self.texture = Some(ctx.load_texture(
+                    "mvp-frame",
+                    Arc::clone(&image),
+                    TextureOptions::LINEAR,
+                ));
+            }
+        }
+        self.displayed = Some(image);
+    }
+
     /// Arm or clear the A–B loop.
     pub fn toggle_ab_loop(&mut self) {
         let now = self.engine.display_position();
@@ -1027,6 +1271,131 @@ impl PlayerApp {
         self.toast(Toast::info(format!("旋转 {}°", self.settings.rotation)));
     }
 
+    /// Mirror the picture horizontally.
+    ///
+    /// Images keep their own view state — it is reset per file, which is what
+    /// you want when browsing a folder — while video and audio share the
+    /// persisted setting. Both routes have to be honoured, or the menu item
+    /// silently does nothing in one of the two modes.
+    pub fn set_flip_h(&mut self, value: bool) {
+        if self.mode == Mode::Image {
+            if self.image.flip_h != value {
+                self.image.toggle_flip_h();
+            }
+            return;
+        }
+        self.settings.flip_h = value;
+        self.store.mark_dirty();
+    }
+
+    /// Mirror the picture vertically. See [`PlayerApp::set_flip_h`].
+    pub fn set_flip_v(&mut self, value: bool) {
+        if self.mode == Mode::Image {
+            if self.image.flip_v != value {
+                self.image.toggle_flip_v();
+            }
+            return;
+        }
+        self.settings.flip_v = value;
+        self.store.mark_dirty();
+    }
+
+    /// The flip state the current mode is actually using.
+    pub fn flip_h(&self) -> bool {
+        if self.mode == Mode::Image {
+            self.image.flip_h
+        } else {
+            self.settings.flip_h
+        }
+    }
+
+    /// The vertical flip state the current mode is actually using.
+    pub fn flip_v(&self) -> bool {
+        if self.mode == Mode::Image {
+            self.image.flip_v
+        } else {
+            self.settings.flip_v
+        }
+    }
+
+    /// Turn subtitle display on or off.
+    ///
+    /// This is a display gate, not a track choice: turning subtitles off and on
+    /// again has to bring back the very track that was selected, so the engine's
+    /// selection is left alone (except when the decoder was never started for
+    /// this file, in which case "on" means "let the container choose").
+    pub fn set_subtitles_enabled(&mut self, on: bool) {
+        self.settings.subtitles_enabled = on;
+        if on
+            && self.engine.subtitle_track().is_none()
+            && self.engine.subtitle().is_none()
+            && self.has_embedded_text_subtitles()
+        {
+            self.engine.set_subtitle_track_auto();
+        }
+        self.store.mark_dirty();
+    }
+
+    /// `true` when the open file carries a text subtitle track.
+    fn has_embedded_text_subtitles(&self) -> bool {
+        self.engine
+            .info()
+            .is_some_and(|info| info.subtitles.iter().any(|stream| stream.is_text))
+    }
+
+    /// Show an embedded subtitle track, dropping any external file in its way.
+    ///
+    /// The engine gives an external side-car priority over embedded tracks, so
+    /// without removing it the click would appear to do nothing at all.
+    pub fn select_embedded_subtitle(&mut self, index: usize) {
+        self.engine.set_external_subtitle(None);
+        // Re-selecting the *same* index is a no-op for the demuxer, so the
+        // selection is cleared first to make it notice and republish.
+        self.engine.set_subtitle_track(None);
+        self.engine.set_subtitle_track(Some(index));
+        self.settings.subtitles_enabled = true;
+        self.store.mark_dirty();
+    }
+
+    /// Drop the external subtitle file.
+    ///
+    /// Any embedded track that was selected underneath becomes visible again,
+    /// which is what "remove the side-car" should mean.
+    pub fn remove_external_subtitle(&mut self) {
+        if self.engine.subtitle().is_none() {
+            return;
+        }
+        let embedded = self.engine.subtitle_track();
+        self.engine.set_external_subtitle(None);
+        if let Some(index) = embedded {
+            self.engine.set_subtitle_track(None);
+            self.engine.set_subtitle_track(Some(index));
+        }
+        self.toast(Toast::info("已移除外部字幕"));
+    }
+
+    /// Keep the fullscreen flag in step with the real window.
+    ///
+    /// The window manager can leave fullscreen without asking us (a system
+    /// shortcut, a remote-desktop session), and the transport button and the
+    /// auto-hiding controls both read this flag.
+    pub fn sync_fullscreen(&mut self, ctx: &Context) {
+        let reported = ctx.input(|i| i.viewport().fullscreen);
+        let Some(reported) = reported else {
+            return;
+        };
+        if self.ui.last_reported_fullscreen == Some(reported) {
+            return;
+        }
+        self.ui.last_reported_fullscreen = Some(reported);
+        if self.ui.fullscreen != reported {
+            self.ui.fullscreen = reported;
+            if reported {
+                self.ui.wake_controls(3.0);
+            }
+        }
+    }
+
     /// Zoom the image viewer, keeping the pointer anchored if it is over the
     /// canvas.
     pub fn zoom_image(&mut self, factor: f32, ctx: &Context) {
@@ -1057,6 +1426,27 @@ impl PlayerApp {
             ctx.request_repaint();
         }
     }
+}
+
+/// Find the best side-car subtitle for `media`.
+///
+/// Tries the most specific names first so `movie.zh.srt` beats a bare
+/// `movie.srt`: a folder with several subtitle languages should start on the
+/// Chinese one, which is what the language-suffix list encodes.
+fn find_sidecar_subtitle(media: &Path) -> Option<PathBuf> {
+    let stem = media.file_stem()?.to_string_lossy().into_owned();
+    let dir = media.parent()?;
+    let languages = ["zh", "chs", "cht", "sc", "tc", "eng", "en"];
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for lang in languages {
+        for ext in ["srt", "ass", "ssa", "vtt", "sub"] {
+            candidates.push(dir.join(format!("{stem}.{lang}.{ext}")));
+        }
+    }
+    for ext in ["srt", "ass", "ssa", "vtt"] {
+        candidates.push(dir.join(format!("{stem}.{ext}")));
+    }
+    candidates.into_iter().find(|candidate| candidate.is_file())
 }
 
 /// `YYYYMMDD_HHMMSS`, used to name snapshots so they sort chronologically.
@@ -1121,6 +1511,7 @@ impl eframe::App for PlayerApp {
         self.handle_ipc();
         self.handle_engine_events(ctx);
         self.apply_window_chrome();
+        self.sync_fullscreen(ctx);
         self.update_sleep_blocker();
         self.sync_engine();
         self.tick_image(ctx);
@@ -1135,10 +1526,18 @@ impl eframe::App for PlayerApp {
             log::info!("首帧渲染耗时 {:.1} ms", self.ui.startup_ms);
         }
 
-        self.store.flush_if_due(&self.settings);
+        if self.store.is_dirty() {
+            let document = self.settings_to_persist();
+            self.store.flush_if_due(&document);
+        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Deliberately small: the window is already going away, and anything
+        // expensive here is time the user spends staring at a frozen frame. The
+        // settings write is one small file (the session was already flushed
+        // within the last two seconds) and the IPC thread exits on a posted
+        // message, so this stays in the low single-digit milliseconds.
         self.remember_current_position();
         self.save_session();
         if let Some(instance) = &self.instance {

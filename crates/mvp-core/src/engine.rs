@@ -477,8 +477,24 @@ impl Engine {
     }
 
     /// Stop playback and release every worker.
+    ///
+    /// Bounded and quick on purpose: this runs when the window closes, and a
+    /// teardown that waits for the decoder backlog is exactly the "the window
+    /// hangs for a moment before it goes away" the player must not have. The
+    /// order matters —
+    ///
+    /// * the abort flag is raised first, and every worker checks it at the top
+    ///   of its loop, so the packets still in the channels are abandoned rather
+    ///   than decoded;
+    /// * the audio device is told to stop accepting chunks, so a decoder parked
+    ///   in the back-pressure wait (which a paused device never drains) returns
+    ///   immediately;
+    /// * only then are the threads joined.
     pub fn stop(&self) {
         self.shared.abort.store(true, Ordering::SeqCst);
+        if let Some(sink) = self.shared.audio.lock().as_ref() {
+            sink.close();
+        }
         let thread = self.threads.lock().pop();
         if let Some(handle) = thread {
             let _ = handle.join();
@@ -500,8 +516,22 @@ impl Engine {
     }
 
     /// Begin or resume playback.
+    ///
+    /// Pressing play on a file that has run to its end is a **replay**: the
+    /// pipeline is parked on the last frame with nothing left to decode, so
+    /// merely restarting the clock would let the position climb past the end of
+    /// the media.
     pub fn play(&self) {
         let state = self.shared.state();
+        if state == PlaybackState::Ended {
+            // A live stream has no beginning to return to; leaving it ended is
+            // the honest answer, and better than advancing a clock through a
+            // stream that is already over.
+            if self.duration() > 0.0 {
+                self.restart_after_end(0.0);
+            }
+            return;
+        }
         if !state.is_active() {
             return;
         }
@@ -546,13 +576,38 @@ impl Engine {
     /// Request a seek to an absolute position in seconds.
     ///
     /// The seek itself happens on the demuxer thread; this returns immediately.
+    /// On a file that already ended, a seek is a replay from that point (see
+    /// [`Engine::restart_after_end`]).
     pub fn seek(&self, position: f64) {
+        if self.shared.state() == PlaybackState::Ended {
+            if self.duration() > 0.0 {
+                self.restart_after_end(position);
+            }
+            return;
+        }
         let duration = *self.shared.duration.lock();
-        let target = if duration > 0.0 {
-            position.clamp(0.0, (duration - 0.05).max(0.0))
-        } else {
-            position.max(0.0)
-        };
+        *self.shared.seek_request.lock() = Some(clamp_position(position, duration));
+    }
+
+    /// Restart a finished file at `position`, resuming playback there.
+    ///
+    /// The demuxer deliberately stays alive once it reaches the end of the
+    /// stream (see `workers::handle_eof`): it parks with the clock stopped and
+    /// the decoders idle, and the seek requested below is what wakes it up. The
+    /// clock is put back in motion here because parking stopped it, and
+    /// [`Clock::seek`] flushes the sound card so no tail of the finished audio
+    /// survives into the replay.
+    ///
+    /// Without this, `play` on a finished file only restarted the clock, which
+    /// then kept climbing past the media's duration with nothing left to show.
+    fn restart_after_end(&self, position: f64) {
+        let target = clamp_position(position, *self.shared.duration.lock());
+        self.shared.clock.seek(target);
+        self.shared.clock.set_running(true);
+        if let Some(sink) = self.shared.audio.lock().as_ref() {
+            sink.set_paused(false);
+        }
+        self.shared.set_state(PlaybackState::Playing);
         *self.shared.seek_request.lock() = Some(target);
     }
 
@@ -591,6 +646,7 @@ impl Engine {
         if volume > 0.0 {
             self.set_muted(false);
         }
+        self.publish_gain();
     }
 
     /// Current linear volume.
@@ -601,6 +657,7 @@ impl Engine {
     /// Mute or unmute.
     pub fn set_muted(&self, muted: bool) {
         self.shared.muted.store(muted, Ordering::Relaxed);
+        self.publish_gain();
     }
 
     /// `true` when muted.
@@ -608,30 +665,66 @@ impl Engine {
         self.shared.muted.load(Ordering::Relaxed)
     }
 
+    /// The gain the decoder is actually applying to the samples it produces.
+    ///
+    /// Volume and mute live in two places — the engine's own state and the
+    /// output device — and this is the one that reaches the speakers. It is
+    /// what the interface should show when it wants to say "how loud is it
+    /// really", and it is what [`Engine::set_volume`] has to keep in step.
+    pub fn effective_gain(&self) -> f32 {
+        match self.shared.audio.lock().as_ref() {
+            Some(sink) => sink.effective_gain(),
+            // No device (or audio disabled): the engine's own values are what
+            // the producer would use.
+            None => {
+                if self.is_muted() {
+                    0.0
+                } else {
+                    self.volume()
+                }
+            }
+        }
+    }
+
+    /// Hand the current volume and mute state to the running output device.
+    ///
+    /// Writing the engine's atomics is not enough: the decoder worker scales
+    /// every chunk with the *sink's* gain, so a volume change that is not
+    /// forwarded moves a number on screen and nothing else.
+    fn publish_gain(&self) {
+        let audio = self.shared.audio.lock();
+        if let Some(sink) = audio.as_ref() {
+            sink.set_volume(self.shared.volume());
+            sink.set_muted(self.shared.muted.load(Ordering::Relaxed));
+        }
+    }
+
     /// Select an audio stream by container index, or `None` to disable audio.
     pub fn set_audio_track(&self, index: Option<usize>) {
         let value = match index {
             Some(i) => i as i64,
-            None => -1,
+            None => TRACK_OFF,
         };
         self.shared.audio_track.store(value, Ordering::Relaxed);
     }
 
-    /// Index of the selected audio stream.
+    /// Index of the audio stream actually in use.
+    ///
+    /// `None` means audio is off — not that the selection is still "auto", so
+    /// an interface can highlight the right row on a freshly opened file.
     pub fn audio_track(&self) -> Option<usize> {
-        let v = self.shared.audio_track.load(Ordering::Relaxed);
-        if v < 0 {
-            None
-        } else {
-            Some(v as usize)
-        }
+        let selector = self.shared.audio_track.load(Ordering::Relaxed);
+        let auto = self
+            .info()
+            .and_then(|info| info.audio.first().map(|stream| stream.index));
+        resolve_selector(selector, auto)
     }
 
     /// Select a subtitle stream by container index; `None` turns subtitles off.
     pub fn set_subtitle_track(&self, index: Option<usize>) {
         let value = match index {
             Some(i) => i as i64,
-            None => -1,
+            None => TRACK_OFF,
         };
         self.shared.subtitle_track.store(value, Ordering::Relaxed);
         // Turning embedded subtitles off must also drop the decoded cues.
@@ -644,14 +737,31 @@ impl Engine {
         }
     }
 
-    /// Index of the selected subtitle stream.
+    /// Hand subtitle selection back to the file's own default track.
+    ///
+    /// This is what "show subtitles when the file has them" means: the player
+    /// does not pick a stream, it lets the container do it.
+    pub fn set_subtitle_track_auto(&self) {
+        self.shared
+            .subtitle_track
+            .store(TRACK_AUTO, Ordering::Relaxed);
+    }
+
+    /// Index of the subtitle stream actually in use.
+    ///
+    /// Only text streams can be shown, so "auto" resolves to the file's default
+    /// text track and never to a bitmap one (PGS/VobSub), which would decode
+    /// into nothing.
     pub fn subtitle_track(&self) -> Option<usize> {
-        let v = self.shared.subtitle_track.load(Ordering::Relaxed);
-        if v < 0 {
-            None
-        } else {
-            Some(v as usize)
-        }
+        let selector = self.shared.subtitle_track.load(Ordering::Relaxed);
+        let auto = self.info().and_then(|info| {
+            info.subtitles
+                .iter()
+                .find(|stream| stream.is_default && stream.is_text)
+                .or_else(|| info.subtitles.iter().find(|stream| stream.is_text))
+                .map(|stream| stream.index)
+        });
+        resolve_selector(selector, auto)
     }
 
     /// Provide an external subtitle file (or clear it with `None`).
@@ -747,14 +857,29 @@ impl Engine {
         }
     }
 
-    /// Advance by `steps` frames while paused (negative steps are ignored,
-    /// stepping backwards is not supported by this engine).
+    /// Advance `steps` frames while paused.
+    ///
+    /// Stepping *backwards* is not something this engine can do: the decoder is
+    /// a forward-only pipeline, and the frames it hands out are moved straight
+    /// into a GPU texture by the caller, so nothing here may keep a reference to
+    /// one. The interface keeps its own history of the images it uploaded and
+    /// moves the playhead with [`Engine::set_playhead`] for a backward step.
     pub fn step_frame(&self, steps: i32) {
-        if steps <= 0 {
+        if steps <= 0 || !self.shared.state().is_active() {
             return;
         }
         self.pause();
         self.shared.stepping.fetch_add(steps as i64, Ordering::Relaxed);
+    }
+
+    /// Move the playhead without touching the container.
+    ///
+    /// Used for single-frame stepping, where the picture comes from the
+    /// interface's own frame history rather than from the decoder: seeking the
+    /// container instead would flush the queues and lose the exact position the
+    /// user is stepping through.
+    pub fn set_playhead(&self, position: f64) {
+        self.shared.clock.seek(position.max(0.0));
     }
 
     /// Total duration in seconds.
@@ -874,7 +999,30 @@ impl Drop for Engine {
         // device alive, which is enough to wedge a process during teardown.
         // `stop` is idempotent and every worker polls the abort flag, so this is
         // bounded and safe from any thread that is not itself a worker.
+        //
+        // Timed because this is the one part of "close the window" that is our
+        // own code rather than the window manager's: if it ever grows, the log
+        // says so, and the number should stay in the low tens of milliseconds.
+        let started = std::time::Instant::now();
         self.stop();
+        let millis = started.elapsed().as_secs_f64() * 1000.0;
+        if millis > 5.0 {
+            log::info!("释放播放引擎耗时 {millis:.1} ms");
+        }
+    }
+}
+
+/// Clamp a requested position into the media.
+///
+/// A hair of room is kept before the end: seeking exactly onto the last
+/// timestamp would immediately satisfy the end-of-file condition again, so a
+/// "jump to the end" would look like the seek had done nothing. A live stream
+/// (`duration == 0.0`) has no upper bound to clamp against.
+fn clamp_position(position: f64, duration: f64) -> f64 {
+    if duration > 0.0 {
+        position.clamp(0.0, (duration - 0.05).max(0.0))
+    } else {
+        position.max(0.0)
     }
 }
 
@@ -885,5 +1033,63 @@ pub(crate) fn rational_to_f64(value: ffmpeg::Rational) -> f64 {
         0.0
     } else {
         value.numerator() as f64 / denominator as f64
+    }
+}
+
+/// The stream selectors the engine understands.
+///
+/// `-2` means "whatever the file marks as default", which is what a freshly
+/// opened file uses; `-1` means "explicitly off"; anything else is a container
+/// stream index. Keeping the three apart matters for the interface: reporting
+/// "auto" as "off" is what made the track pickers claim the sound was disabled
+/// while it was playing perfectly well.
+pub(crate) const TRACK_AUTO: i64 = -2;
+/// Selector meaning "no such track".
+pub(crate) const TRACK_OFF: i64 = -1;
+
+/// Resolve a raw selector to the stream index that is actually in use.
+///
+/// `auto` is the index the file's own default resolves to, computed by the
+/// caller from the probed stream list.
+fn resolve_selector(selector: i64, auto: Option<usize>) -> Option<usize> {
+    match selector {
+        TRACK_OFF => None,
+        value if value >= 0 => Some(value as usize),
+        _ => auto,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bug this guards: "auto" used to be reported as "off", so a freshly
+    /// opened file showed "sound muted" while it was playing, and picking the
+    /// default embedded subtitle track looked like picking nothing at all.
+    #[test]
+    fn auto_resolves_to_the_files_default_track() {
+        assert_eq!(resolve_selector(TRACK_AUTO, Some(2)), Some(2));
+        assert_eq!(
+            resolve_selector(TRACK_AUTO, None),
+            None,
+            "a file with no such stream has nothing to select"
+        );
+    }
+
+    #[test]
+    fn an_explicit_index_wins_over_the_default() {
+        assert_eq!(resolve_selector(5, Some(2)), Some(5));
+        assert_eq!(resolve_selector(0, Some(2)), Some(0));
+    }
+
+    #[test]
+    fn off_is_off_whatever_the_default_is() {
+        assert_eq!(resolve_selector(TRACK_OFF, Some(2)), None);
+        assert_eq!(resolve_selector(TRACK_OFF, None), None);
+    }
+
+    #[test]
+    fn unknown_negative_selectors_fall_back_to_the_default() {
+        assert_eq!(resolve_selector(-7, Some(1)), Some(1));
     }
 }

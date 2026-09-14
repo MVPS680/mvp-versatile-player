@@ -358,6 +358,57 @@ fn embedded_text_subtitles_are_decoded_from_the_container() {
     engine.stop();
 }
 
+/// "Show subtitles when the file has them" must mean the file's own default
+/// track, not "do nothing until the user finds the track menu".
+///
+/// The interface opens a file with [`Engine::set_subtitle_track_auto`]; this is
+/// the engine side of that contract. It used to be impossible: the player set
+/// the selector to "off" on every open, and because a selector of "auto" was
+/// reported back as "off", the track pickers showed "subtitles disabled" while
+/// the file was displaying them.
+#[test]
+fn the_default_embedded_subtitle_track_needs_no_choice() {
+    let Some(path) = fixture("with_subs.mp4") else {
+        return;
+    };
+    let engine = silent_engine();
+    engine.set_subtitle_track_auto();
+    engine.open(MediaSource::Path(path)).expect("open");
+    let info = wait_for_open(&engine, Duration::from_secs(15));
+
+    let expected = info
+        .subtitles
+        .iter()
+        .find(|stream| stream.is_text)
+        .expect("the fixture carries a text subtitle track")
+        .index;
+    assert_eq!(
+        engine.subtitle_track(),
+        Some(expected),
+        "with no explicit choice the file's own default track must be reported as in use"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut decoded = false;
+    while Instant::now() < deadline {
+        while engine.poll_event().is_some() {}
+        if engine.subtitle().is_some_and(|s| !s.is_empty()) {
+            decoded = true;
+            break;
+        }
+        let _ = engine.take_frame(engine.display_position());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(decoded, "the default track's cues were never decoded");
+
+    // Turning them off is reported as "off" — the other half of keeping "auto"
+    // and "off" apart.
+    engine.set_subtitle_track(None);
+    assert_eq!(engine.subtitle_track(), None);
+    assert!(engine.subtitle().is_none(), "the cues must be dropped too");
+    engine.stop();
+}
+
 #[test]
 fn stopping_returns_the_engine_to_idle() {
     let Some(path) = fixture("tiny.mp4") else {
@@ -371,6 +422,83 @@ fn stopping_returns_the_engine_to_idle() {
     // Nothing may be handed out once the engine has been stopped.
     assert!(engine.take_frame(0.0).is_none());
     // A second stop must be harmless.
+    engine.stop();
+}
+
+/// Playing a file to its end and pressing play again must **replay** it.
+///
+/// The bug this guards: reaching the end used to tear the decode pipeline down,
+/// so `play` had nothing left to play but still restarted the clock. The
+/// position then climbed past the media's duration and the file carried on
+/// "playing" long after its last frame.
+#[test]
+fn play_after_the_end_replays_from_the_start() {
+    let Some(path) = fixture("tiny.mp4") else {
+        return;
+    };
+    let engine = silent_engine();
+    engine.set_target_size(320, 240);
+    engine.open(MediaSource::Path(path)).expect("open");
+    let info = wait_for_open(&engine, Duration::from_secs(15));
+
+    // Run the file to its end. Frames have to be taken as they become due: that
+    // is what a player does, and what keeps the decoder unblocked.
+    fn wait_for_end(engine: &Engine) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while engine.state() != PlaybackState::Ended && Instant::now() < deadline {
+            while engine.poll_event().is_some() {}
+            let _ = engine.take_frame(engine.display_position());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    wait_for_end(&engine);
+    assert_eq!(
+        engine.state(),
+        PlaybackState::Ended,
+        "the fixture must play through to its end"
+    );
+    assert!(
+        engine.position() <= info.duration + 0.5,
+        "the clock ran past the media before the end was even reported: {} > {}",
+        engine.position(),
+        info.duration
+    );
+
+    // Pressing play is a replay, not a resume of a clock that has nothing left.
+    engine.play();
+    assert_eq!(engine.state(), PlaybackState::Playing);
+    assert!(
+        engine.position() < 1.0,
+        "play after the end must start at the beginning, got {}",
+        engine.position()
+    );
+
+    // It really is playing again: frames flow, and the clock stays inside the
+    // media instead of running away past its duration.
+    let frames = collect_frames(&engine, 3, Duration::from_secs(5));
+    assert!(
+        !frames.is_empty(),
+        "a replay must decode frames again, not just restart the clock"
+    );
+    std::thread::sleep(Duration::from_millis(700));
+    assert!(
+        engine.position() < info.duration,
+        "after a replay the clock was past the media: {} >= {}",
+        engine.position(),
+        info.duration
+    );
+
+    // A second end must park the same way, or the next "play" would be the old
+    // bug all over again. Seeking near the end is the quick way back there.
+    engine.seek(info.duration - 0.4);
+    wait_for_end(&engine);
+    assert_eq!(engine.state(), PlaybackState::Ended);
+    engine.play();
+    assert!(
+        engine.position() < 1.0,
+        "the second play after the end must replay too, got {}",
+        engine.position()
+    );
     engine.stop();
 }
 

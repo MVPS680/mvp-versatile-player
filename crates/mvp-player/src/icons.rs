@@ -149,10 +149,10 @@ pub enum Icon {
     Close,
     /// Plus.
     Plus,
-    /// Left chevron.
-    ChevronLeft,
-    /// Right chevron.
-    ChevronRight,
+    /// Up chevron, "move earlier in the list".
+    ChevronUp,
+    /// Down chevron, "move later in the list".
+    ChevronDown,
     /// Circular refresh arrow.
     Refresh,
     /// Link / open URL.
@@ -428,13 +428,13 @@ pub fn draw(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             c.line(painter, (6.0, 12.0), (18.0, 12.0), stroke);
             c.line(painter, (12.0, 6.0), (12.0, 18.0), stroke);
         }
-        Icon::ChevronLeft => {
-            c.line(painter, (15.0, 5.0), (8.0, 12.0), stroke);
-            c.line(painter, (8.0, 12.0), (15.0, 19.0), stroke);
+        Icon::ChevronUp => {
+            c.line(painter, (5.0, 15.0), (12.0, 8.0), stroke);
+            c.line(painter, (12.0, 8.0), (19.0, 15.0), stroke);
         }
-        Icon::ChevronRight => {
-            c.line(painter, (9.0, 5.0), (16.0, 12.0), stroke);
-            c.line(painter, (16.0, 12.0), (9.0, 19.0), stroke);
+        Icon::ChevronDown => {
+            c.line(painter, (5.0, 9.0), (12.0, 16.0), stroke);
+            c.line(painter, (12.0, 16.0), (19.0, 9.0), stroke);
         }
         Icon::Refresh => {
             painter.arc(c.p(12.0, 12.0), c.s(7.5), 0.7..5.0, stroke);

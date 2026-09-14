@@ -190,6 +190,133 @@ pub struct InfoRow {
     pub value: String,
 }
 
+/// Registry answers the integration page needs, read once per visit.
+///
+/// Every one of these is a registry round-trip; asking for them on each frame
+/// while the settings window is open is enough I/O to make the whole interface
+/// stutter.
+#[derive(Debug, Clone, Default)]
+pub struct AssocCache {
+    /// Whether the player is advertised as a handler at all.
+    pub registered: bool,
+    /// Current handler for `.mp4`.
+    pub video: Option<String>,
+    /// Current handler for `.mp3`.
+    pub audio: Option<String>,
+    /// Current handler for `.png`.
+    pub image: Option<String>,
+}
+
+/// Output devices, enumerated once per visit to the audio settings page.
+///
+/// Enumerating WASAPI endpoints is expensive enough that doing it per frame is
+/// visible as a hitch.
+#[derive(Debug, Clone, Default)]
+pub struct AudioDeviceCache {
+    /// Every output device name the host reports.
+    pub devices: Vec<String>,
+    /// Name of the current default device.
+    pub default_name: String,
+}
+
+/// A frame the interface has already put on screen.
+///
+/// "Step back one frame" needs the frame before the current one, and the engine
+/// cannot supply it: the decoder is a forward-only pipeline, and every frame it
+/// hands out has its pixels moved straight into the GPU texture it belongs to,
+/// which is why the engine deliberately keeps no reference to any of them — a
+/// second reference would make that zero-copy hand-off impossible.
+///
+/// The interface's own uploaded images are therefore the only place a previous
+/// frame can come from, and they cost a pointer rather than a copy: this shares
+/// the very allocation the texture is displaying.
+#[derive(Debug, Clone)]
+pub struct ShownFrame {
+    /// Presentation timestamp the frame was shown at.
+    pub pts: f64,
+    /// Serial the engine gave it.
+    ///
+    /// Needed so "is this a new frame?" still tells the truth after a step back:
+    /// the engine's next frame carries a higher serial, and the remembered one
+    /// must not be mistaken for it.
+    pub serial: u64,
+    /// Pixel data, shared with the texture that displays it.
+    pub image: std::sync::Arc<egui::ColorImage>,
+}
+
+impl ShownFrame {
+    /// Pixel bytes this frame occupies.
+    pub fn byte_len(&self) -> usize {
+        self.image.pixels.len() * std::mem::size_of::<egui::Color32>()
+    }
+}
+
+/// A bounded ring of already-shown frames, newest last.
+///
+/// Bounded by both a frame count and a byte budget: a 4K frame is 33 MB, so
+/// "remember the last thirty" would reserve a gigabyte to make one keystroke
+/// work.
+#[derive(Debug, Default)]
+pub struct FrameHistory {
+    frames: std::collections::VecDeque<ShownFrame>,
+    bytes: usize,
+}
+
+impl FrameHistory {
+    /// How many frames may be remembered regardless of size.
+    pub const MAX_FRAMES: usize = 12;
+    /// How many pixel bytes the ring may hold.
+    pub const MAX_BYTES: usize = 128 * 1024 * 1024;
+
+    /// An empty ring.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// How many frames are remembered.
+    pub fn len(&self) -> usize {
+        self.frames.len()
+    }
+
+    /// `true` when there is nothing to step back to.
+    pub fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+
+    /// Pixel bytes currently held.
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Remember a frame, dropping the oldest ones to stay inside the budget.
+    pub fn push(&mut self, frame: ShownFrame) {
+        self.bytes += frame.byte_len();
+        self.frames.push_back(frame);
+        // Always keep at least one frame, however large it is: a ring that can
+        // step back once is still a working command, an empty one is not.
+        while self.frames.len() > Self::MAX_FRAMES
+            || (self.frames.len() > 1 && self.bytes > Self::MAX_BYTES)
+        {
+            if let Some(dropped) = self.frames.pop_front() {
+                self.bytes = self.bytes.saturating_sub(dropped.byte_len());
+            }
+        }
+    }
+
+    /// Take the most recent frame back off the ring.
+    pub fn pop(&mut self) -> Option<ShownFrame> {
+        let frame = self.frames.pop_back()?;
+        self.bytes = self.bytes.saturating_sub(frame.byte_len());
+        Some(frame)
+    }
+
+    /// Forget everything (a new file, or a jump to another position).
+    pub fn clear(&mut self) {
+        self.frames.clear();
+        self.bytes = 0;
+    }
+}
+
 /// Transient UI state.
 #[derive(Debug)]
 pub struct UiState {
@@ -202,13 +329,27 @@ pub struct UiState {
 
     /// Seek preview while the user drags the bar, in seconds.
     pub seek_drag: Option<f64>,
-    /// Index being renamed inline.
-    pub renaming: Option<usize>,
+    /// Wheel movement not yet turned into a volume step, in egui points.
+    pub wheel_volume: f32,
+    /// Wheel movement not yet turned into a seek step, in egui points.
+    pub wheel_seek: f32,
+    /// Row the user highlighted in the playlist.
+    ///
+    /// Deliberately *not* the playlist's "current" entry: clicking a row is a
+    /// selection, not a play command, and moving the playing marker on a single
+    /// click made the title bar announce a file that was not playing.
+    pub playlist_selection: Option<usize>,
 
     /// Currently open overlay.
     pub overlay: Overlay,
     /// Active settings page.
     pub settings_tab: SettingsTab,
+    /// Settings page the other caches were filled for.
+    pub cached_settings_tab: Option<SettingsTab>,
+    /// Cached file-association answers.
+    pub assoc_cache: Option<AssocCache>,
+    /// Cached output-device list.
+    pub audio_device_cache: Option<AudioDeviceCache>,
     /// Text in the URL prompt.
     pub url_input: String,
     /// Whether the URL prompt should auto-focus its field.
@@ -227,6 +368,12 @@ pub struct UiState {
     pub last_pointer_pos: Option<egui::Pos2>,
     /// Fullscreen state as the player believes it to be.
     pub fullscreen: bool,
+    /// The last fullscreen value the *window* reported.
+    ///
+    /// Compared against rather than written straight into `fullscreen`, so the
+    /// optimistic value set by a toggle is not undone by the window's reply
+    /// arriving a frame late.
+    pub last_reported_fullscreen: Option<bool>,
     /// The window should be closed at the end of this frame.
     pub close_requested: bool,
 
@@ -250,9 +397,14 @@ impl Default for UiState {
             sidebar_tab: SidebarTab::Playlist,
             info_rows: Vec::new(),
             seek_drag: None,
-            renaming: None,
+            wheel_volume: 0.0,
+            wheel_seek: 0.0,
+            playlist_selection: None,
             overlay: Overlay::None,
             settings_tab: SettingsTab::default(),
+            cached_settings_tab: None,
+            assoc_cache: None,
+            audio_device_cache: None,
             url_input: String::new(),
             url_focus: false,
             toast: None,
@@ -261,6 +413,7 @@ impl Default for UiState {
             last_pointer_move: now,
             last_pointer_pos: None,
             fullscreen: false,
+            last_reported_fullscreen: None,
             close_requested: false,
             startup_ms: 0.0,
             ffmpeg_version: String::new(),
@@ -345,6 +498,65 @@ pub fn repeat_label(mode: RepeatMode) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tiny stand-in for a decoded frame.
+    fn shown(pts: f64, pixels: usize) -> ShownFrame {
+        ShownFrame {
+            pts,
+            serial: pts as u64,
+            image: std::sync::Arc::new(egui::ColorImage {
+                size: [1, 1],
+                source_size: egui::vec2(1.0, 1.0),
+                pixels: vec![egui::Color32::TRANSPARENT; pixels],
+            }),
+        }
+    }
+
+    #[test]
+    fn the_frame_ring_hands_back_the_newest_frame() {
+        let mut ring = FrameHistory::new();
+        assert!(ring.is_empty());
+        for i in 0..5 {
+            ring.push(shown(i as f64, 4));
+        }
+        assert_eq!(ring.len(), 5);
+        assert_eq!(ring.pop().map(|f| f.pts), Some(4.0));
+        assert_eq!(ring.pop().map(|f| f.pts), Some(3.0));
+        assert_eq!(ring.bytes(), 3 * 4 * 4, "popped frames release their bytes");
+    }
+
+    #[test]
+    fn the_frame_ring_is_bounded_by_count_and_by_bytes() {
+        let mut ring = FrameHistory::new();
+        for i in 0..(FrameHistory::MAX_FRAMES + 10) {
+            ring.push(shown(i as f64, 4));
+        }
+        assert_eq!(ring.len(), FrameHistory::MAX_FRAMES);
+
+        // A 4K frame is 33 MB; the byte budget must win over the count.
+        let pixels = FrameHistory::MAX_BYTES / 4 / std::mem::size_of::<egui::Color32>() + 1;
+        let mut ring = FrameHistory::new();
+        for i in 0..8 {
+            ring.push(shown(i as f64, pixels));
+        }
+        assert!(ring.bytes() <= FrameHistory::MAX_BYTES);
+        assert!(
+            !ring.is_empty(),
+            "a single step back must stay possible even for huge frames"
+        );
+    }
+
+    #[test]
+    fn clearing_the_frame_ring_releases_everything() {
+        let mut ring = FrameHistory::new();
+        for i in 0..4 {
+            ring.push(shown(i as f64, 16));
+        }
+        ring.clear();
+        assert!(ring.is_empty());
+        assert_eq!(ring.bytes(), 0);
+        assert!(ring.pop().is_none());
+    }
 
     #[test]
     fn toast_fades_and_expires() {

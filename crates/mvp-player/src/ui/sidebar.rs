@@ -6,7 +6,7 @@ use crate::app::PlayerApp;
 use crate::icons::Icon;
 use crate::settings::SidebarTab;
 use crate::state::{Mode, Overlay, Toast};
-use crate::theme::{font, radius, space, Tokens};
+use crate::theme::{font, space, Tokens};
 use crate::ui::widgets;
 
 /// Draw the docked sidebar.
@@ -73,6 +73,7 @@ fn playlist_tab(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
             .clicked()
         {
             app.playlist.clear();
+            app.ui.playlist_selection = None;
             app.engine.stop();
             app.mode = Mode::Empty;
             app.store.mark_dirty();
@@ -88,6 +89,7 @@ fn playlist_tab(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
             .clicked()
             {
                 let removed = app.playlist.prune_missing();
+                app.ui.playlist_selection = None;
                 app.toast(Toast::info(format!("已移除 {removed} 个无效条目")));
                 app.store.mark_dirty();
             }
@@ -121,6 +123,7 @@ fn playlist_tab(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
 
     // ---- entries ---------------------------------------------------------
     let current = app.playlist.current_index();
+    let selection = app.ui.playlist_selection;
     let mut action: Option<PlaylistAction> = None;
     let items: Vec<(usize, String, bool, Option<f64>)> = app
         .playlist
@@ -132,20 +135,25 @@ fn playlist_tab(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
 
     let row_height = 34.0;
     for (index, title, is_url, duration) in items {
-        let selected = current == Some(index);
-        let (rect, response, painter) = widgets::list_row(ui, tokens, selected, row_height);
+        // "Playing" and "selected" are two different things: a single click
+        // moves the highlight, and only a double click (or the context menu)
+        // starts the file. Conflating them made the window title announce a
+        // file that was not the one playing.
+        let playing = current == Some(index);
+        let highlighted = selection.map_or(playing, |selected| selected == index);
+        let (rect, response, painter) = widgets::list_row(ui, tokens, highlighted, row_height);
 
         // Playing indicator or index.
         let icon_rect = egui::Rect::from_center_size(
             egui::pos2(rect.left() + 16.0, rect.center().y),
             egui::Vec2::splat(14.0),
         );
-        if selected {
+        if playing {
             crate::icons::draw(
                 &painter,
                 icon_rect,
                 if app.engine.is_playing() {
-                    Icon::VolumeHigh
+                    Icon::Play
                 } else {
                     Icon::Pause
                 },
@@ -167,7 +175,7 @@ fn playlist_tab(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
             egui::Align2::LEFT_CENTER,
             truncate(&title, 40),
             egui::FontId::proportional(font::BODY),
-            if selected { tokens.text } else { tokens.text_weak },
+            if highlighted { tokens.text } else { tokens.text_weak },
         );
 
         // Secondary line: kind icon + kind + duration.
@@ -236,7 +244,7 @@ fn playlist_tab(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
                     egui::pos2(x, rect.center().y),
                     egui::Vec2::splat(24.0),
                 );
-                crate::icons::draw(&painter, up.shrink(6.0), Icon::ChevronLeft, tokens.text_weak);
+                crate::icons::draw(&painter, up.shrink(6.0), Icon::ChevronUp, tokens.text_weak);
                 let click = ui.interact(
                     up,
                     egui::Id::new(("mvp_pl_left", index)),
@@ -250,7 +258,7 @@ fn playlist_tab(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
                     egui::pos2(x, rect.center().y),
                     egui::Vec2::splat(24.0),
                 );
-                crate::icons::draw(&painter, down.shrink(6.0), Icon::ChevronRight, tokens.text_weak);
+                crate::icons::draw(&painter, down.shrink(6.0), Icon::ChevronDown, tokens.text_weak);
                 let click = ui.interact(
                     down,
                     egui::Id::new(("mvp_pl_right", index)),
@@ -295,20 +303,26 @@ fn playlist_tab(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
 
     match action {
         Some(PlaylistAction::Play(index)) => app.play_index(index),
+        // Selection only: moving the playlist's "current" entry here would make
+        // the player claim it is playing a file it never opened.
         Some(PlaylistAction::Select(index)) => {
-            app.playlist.set_current(Some(index));
-            app.store.mark_dirty();
+            app.ui.playlist_selection = Some(index);
         }
         Some(PlaylistAction::Remove(index)) => {
             app.playlist.remove(index);
+            app.ui.playlist_selection = None;
             app.store.mark_dirty();
         }
         Some(PlaylistAction::Move(from, to)) => {
             app.playlist.move_item(from, to);
+            // The indices shifted, so the highlight no longer means the row the
+            // user picked.
+            app.ui.playlist_selection = None;
             app.store.mark_dirty();
         }
         Some(PlaylistAction::Clear) => {
             app.playlist.clear();
+            app.ui.playlist_selection = None;
             app.store.mark_dirty();
         }
         None => {}
@@ -345,10 +359,12 @@ fn tracks_tab(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
     if info.video.is_empty() {
         widgets::empty_hint(ui, tokens, "没有视频轨道");
     } else {
+        // Informational only: the engine decodes the first video stream and has
+        // no way to switch, so the rows must not look like a picker.
         for (i, video) in info.video.iter().enumerate() {
-            let selected = i == 0;
+            let primary = i == 0;
             ui.horizontal(|ui| {
-                widgets::chip(ui, if selected { "正在使用" } else { "备用" }, tokens.accent);
+                widgets::chip(ui, if primary { "正在使用" } else { "未使用" }, tokens.accent);
                 ui.label(
                     RichText::new(format!(
                         "{} · {}x{} · {}",
@@ -361,6 +377,13 @@ fn tracks_tab(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
                     .color(tokens.text),
                 );
             });
+        }
+        if info.video.len() > 1 {
+            ui.label(
+                RichText::new("暂不支持切换视频轨道，播放时始终使用第一条视频流")
+                    .size(font::TINY)
+                    .color(tokens.text_muted),
+            );
         }
     }
 
@@ -406,7 +429,9 @@ fn tracks_tab(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
         let current = app.engine.subtitle_track();
         let mut chosen: Option<Option<usize>> = None;
         for subtitle in &info.subtitles {
-            let selected = current == Some(subtitle.index);
+            // Display can be off while a track stays selected, so the row has to
+            // be highlighted only when it is both chosen *and* shown.
+            let selected = app.settings.subtitles_enabled && current == Some(subtitle.index);
             let suffix = if subtitle.is_text {
                 ""
             } else {
@@ -430,13 +455,20 @@ fn tracks_tab(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
             }
         }
         if ui
-            .selectable_label(current.is_none(), RichText::new("关闭字幕").size(font::SMALL))
+            .selectable_label(
+                !app.settings.subtitles_enabled || current.is_none(),
+                RichText::new("关闭字幕").size(font::SMALL),
+            )
             .clicked()
         {
             chosen = Some(None);
         }
-        if let Some(index) = chosen {
-            app.engine.set_subtitle_track(index);
+        match chosen {
+            // Picking an embedded track has to push any external file out of the
+            // way, otherwise the click would change nothing at all.
+            Some(Some(index)) => app.select_embedded_subtitle(index),
+            Some(None) => app.set_subtitles_enabled(false),
+            None => {}
         }
     }
 
@@ -444,7 +476,7 @@ fn tracks_tab(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
         ui.add_space(space::SM);
         widgets::key_value(ui, tokens, "外部字幕", "已加载");
         if ui.button("移除外部字幕").clicked() {
-            app.engine.set_external_subtitle(None);
+            app.remove_external_subtitle();
         }
     }
 }
@@ -486,7 +518,7 @@ fn chapters_tab(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
         }
     }
     if let Some(time) = seek_to {
-        app.engine.seek(time);
+        app.seek(time);
     }
 }
 
@@ -534,6 +566,29 @@ fn info_tab(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
             ("音频欠载", snapshot.underruns.to_string()),
             ("丢弃音频块", snapshot.dropped_audio.to_string()),
             (
+                // What the sound card is actually being fed: the interface's
+                // own volume can differ from it while muted, and showing only
+                // the slider's value is how a volume control that reached
+                // nothing stayed "working" for so long.
+                "输出增益",
+                format!(
+                    "{:.0}%{}",
+                    app.engine.effective_gain() * 100.0,
+                    if app.settings.muted { "（静音）" } else { "" }
+                ),
+            ),
+            (
+                // How far back single-frame stepping can go, and what that
+                // history costs in memory — it is a byte-budgeted ring, so the
+                // number is not always 12.
+                "可回退帧",
+                format!(
+                    "{} 帧 · {:.0} MB",
+                    app.frame_history.len(),
+                    app.frame_history.bytes() as f64 / (1024.0 * 1024.0)
+                ),
+            ),
+            (
                 "启动耗时",
                 format!("{:.0} 毫秒", app.ui.startup_ms),
             ),
@@ -552,15 +607,3 @@ fn truncate(text: &str, max: usize) -> String {
     out.push('…');
     out
 }
-
-/// A small scrollbar styling hook used by the sidebar's list areas.
-#[allow(dead_code)]
-fn list_scroll_area() -> egui::ScrollArea {
-    egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
-        .id_salt("mvp_list_scroll")
-}
-
-#[allow(dead_code)]
-const SIDEBAR_RADIUS: f32 = radius::SM;
-

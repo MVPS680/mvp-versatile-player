@@ -8,7 +8,6 @@ use egui::containers::menu::{MenuBar, MenuButton};
 use egui::{Align, Context, Layout, RichText, Ui};
 
 use crate::app::PlayerApp;
-use crate::icons::Icon;
 use crate::settings::{AspectMode, EndAction, Settings, SidebarTab};
 use crate::state::{Overlay, Toast};
 use crate::theme::{font, space, Tokens};
@@ -140,7 +139,18 @@ fn playback_menu(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
     MenuButton::new("播放").ui(ui, |ui| {
         let playing = app.engine.is_playing();
         let active = app.mode.is_media();
-        if item(ui, tokens, if playing { "暂停" } else { "播放" }, "空格", active) {
+        // At the end of a file "play" means "replay", and saying so is the whole
+        // difference between a user expecting playback to continue and one who
+        // knows it starts over.
+        let ended = app.engine.state() == mvp_core::PlaybackState::Ended;
+        let label = if playing {
+            "暂停"
+        } else if ended {
+            "重播"
+        } else {
+            "播放"
+        };
+        if item(ui, tokens, label, "空格", active) {
             app.engine.toggle_pause();
         }
         if item(ui, tokens, "停止", "", active) {
@@ -156,20 +166,23 @@ fn playback_menu(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
         }
         separator(ui, tokens);
         if item(ui, tokens, "快退 5 秒", "←", active) {
-            app.engine.seek_relative(-app.settings.seek_step);
+            app.seek_relative(-app.settings.seek_step);
         }
         if item(ui, tokens, "快进 5 秒", "→", active) {
-            app.engine.seek_relative(app.settings.seek_step);
+            app.seek_relative(app.settings.seek_step);
         }
         if item(ui, tokens, "快退 30 秒", "Shift+←", active) {
-            app.engine.seek_relative(-app.settings.seek_step_large);
+            app.seek_relative(-app.settings.seek_step_large);
         }
         if item(ui, tokens, "快进 30 秒", "Shift+→", active) {
-            app.engine.seek_relative(app.settings.seek_step_large);
+            app.seek_relative(app.settings.seek_step_large);
         }
         separator(ui, tokens);
-        if item(ui, tokens, "上一帧", "", active) {
-            app.engine.step_frame(1);
+        if item(ui, tokens, "上一帧", ",", app.can_step_back()) {
+            app.step_back_frame(ui.ctx());
+        }
+        if item(ui, tokens, "下一帧", ".", active) {
+            app.step_forward_frame(ui.ctx());
         }
         separator(ui, tokens);
         // Speed submenu.
@@ -217,8 +230,6 @@ fn playback_menu(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
             app.settings.shuffle = shuffle;
             app.store.mark_dirty();
         }
-        let looping = app.settings.repeat == mvp_core::playlist::RepeatMode::One;
-        let _ = looping;
         separator(ui, tokens);
         let ab = app.engine.ab_loop();
         let label = match ab {
@@ -235,7 +246,7 @@ fn playback_menu(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
         }
         if ab.is_some() && item(ui, tokens, "跳转到 A 点", "", active) {
             if let Some((a, _)) = ab {
-                app.engine.seek(a);
+                app.seek(a);
             }
         }
     });
@@ -262,21 +273,19 @@ fn video_menu(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
         if item(ui, tokens, "顺时针旋转 90°", "R", active) {
             app.rotate_media();
         }
-        let mut flip_h = app.settings.flip_h;
+        let mut flip_h = app.flip_h();
         if ui
             .checkbox(&mut flip_h, RichText::new("水平翻转").size(font::SMALL))
             .changed()
         {
-            app.settings.flip_h = flip_h;
-            app.store.mark_dirty();
+            app.set_flip_h(flip_h);
         }
-        let mut flip_v = app.settings.flip_v;
+        let mut flip_v = app.flip_v();
         if ui
             .checkbox(&mut flip_v, RichText::new("垂直翻转").size(font::SMALL))
             .changed()
         {
-            app.settings.flip_v = flip_v;
-            app.store.mark_dirty();
+            app.set_flip_v(flip_v);
         }
         separator(ui, tokens);
         if item(ui, tokens, "适应窗口", "0", app.mode.is_image()) {
@@ -316,15 +325,14 @@ fn video_menu(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
         }
         separator(ui, tokens);
         if item(ui, tokens, "全屏", "F", true) {
-            app.ui.fullscreen = !app.ui.fullscreen;
+            app.toggle_fullscreen(ui.ctx());
         }
         let mut top = app.settings.always_on_top;
         if ui
             .checkbox(&mut top, RichText::new("窗口置顶").size(font::SMALL))
             .changed()
         {
-            app.settings.always_on_top = top;
-            app.store.mark_dirty();
+            app.set_always_on_top(ui.ctx(), top);
         }
     });
 }
@@ -442,9 +450,7 @@ fn subtitle_menu(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
             )
             .clicked()
         {
-            app.settings.subtitles_enabled = false;
-            app.engine.set_subtitle_track(None);
-            app.store.mark_dirty();
+            app.set_subtitles_enabled(false);
             ui.close();
         }
         if !tracks.is_empty() {
@@ -455,9 +461,7 @@ fn subtitle_menu(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
                     .selectable_label(selected, RichText::new(label).size(font::SMALL))
                     .clicked()
                 {
-                    app.settings.subtitles_enabled = true;
-                    app.store.mark_dirty();
-                    app.engine.set_subtitle_track(Some(*index));
+                    app.select_embedded_subtitle(*index);
                     ui.close();
                 }
             }
@@ -472,8 +476,7 @@ fn subtitle_menu(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
             app.request_open_subtitle();
         }
         if item(ui, tokens, "移除外部字幕", "", external) {
-            app.engine.set_external_subtitle(None);
-            app.toast(Toast::info("已移除外部字幕"));
+            app.remove_external_subtitle();
         }
         separator(ui, tokens);
         MenuButton::new("字幕延迟").ui(ui, |ui| {
@@ -564,7 +567,10 @@ fn tools_menu(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
         });
         if item(ui, tokens, "重置所有设置…", "", true) {
             app.settings = Settings::reset();
-            app.store.mark_dirty();
+            // Replacing the document is only half of it: the values that reach
+            // the engine, the window and the sidebar have to be re-applied too,
+            // or the reset would only show up after a restart.
+            app.apply_settings(ui.ctx());
             app.toast(Toast::info("设置已重置为默认值"));
         }
     });
@@ -657,11 +663,6 @@ fn truncate(text: &str, max: usize) -> String {
     out.push('…');
     out
 }
-
-/// Unused icon reference kept so the compiler does not drop the import when the
-/// menu is trimmed during development.
-#[allow(dead_code)]
-const MENU_ICON_HINT: Icon = Icon::Playlist;
 
 #[cfg(test)]
 mod tests {

@@ -419,3 +419,226 @@ fn the_video_target_size_converges_to_something_usable() {    let path = testdat
     assert_eq!(second, target, "the target size must be a fixed point");
     engine.stop();
 }
+
+/// `set_playhead` moves the clock without throwing the decoder away.
+///
+/// Stepping one frame backwards shows a picture the interface already holds and
+/// only needs the clock moved to match it. A container seek would flush both
+/// queues and decode again from a keyframe, which is the difference between
+/// stepping back one frame and jumping to the previous keyframe — and it is why
+/// the engine exposes this instead of reusing `seek`.
+#[test]
+fn moving_the_playhead_keeps_the_decoded_frames() {
+    let path = testdata("scene.mp4");
+    if !path.exists() {
+        eprintln!("skipping: {} is missing", path.display());
+        return;
+    }
+
+    let engine = player_engine();
+    engine.set_subtitle_track(None);
+    engine.open(MediaSource::Path(path)).expect("open");
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if let Some(EngineEvent::Opened(_)) = engine.poll_event() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    engine.set_target_size(640, 360);
+
+    let mut shown = 0usize;
+    let until = Instant::now() + Duration::from_secs(10);
+    let mut position = 0.0f64;
+    while Instant::now() < until && shown < 4 {
+        if engine.take_frame(engine.display_position()).is_some() {
+            shown += 1;
+            position = engine.display_position();
+        }
+        std::thread::sleep(Duration::from_millis(8));
+    }
+    engine.pause();
+    assert!(shown >= 2, "not enough frames were shown: {shown}");
+
+    // The backward step: the picture is already in the interface's hands, so
+    // only the clock has to follow it.
+    let back = (position - 0.2).max(0.0);
+    engine.set_playhead(back);
+    assert!(
+        (engine.position() - back).abs() < 1e-9,
+        "the clock must follow the playhead: {} != {back}",
+        engine.position()
+    );
+
+    // Crucially the decoder must not have been restarted: the frames it has
+    // queued are still there, so moving the playhead past them hands one over
+    // immediately instead of waiting for a fresh decode from a keyframe.
+    engine.set_playhead(position + 5.0);
+    let frame = engine.take_frame(engine.display_position());
+    assert!(
+        frame.is_some(),
+        "moving the playhead must not discard the frames already decoded"
+    );
+    engine.stop();
+}
+
+/// Moving the volume slider has to reach the sound card.
+///
+/// The gain is applied while the audio worker produces its chunks, so it lives
+/// in the output device, not in the engine: writing the engine's own volume is
+/// not enough. It was not forwarded, which made the slider, the volume keys and
+/// the mute button all cosmetic — the number moved and the sound did not.
+#[test]
+fn volume_and_mute_reach_the_audio_device() {
+    if mvp_core::audio::default_output_device_name().is_none() {
+        eprintln!("skipping: no audio output device");
+        return;
+    }
+    let path = testdata("scene.mp4");
+    if !path.exists() {
+        eprintln!("skipping: {} is missing", path.display());
+        return;
+    }
+
+    // `player_engine` starts silent, so the gain can be asserted without making
+    // a sound.
+    let engine = player_engine();
+    engine.set_subtitle_track(None);
+    engine
+        .open(MediaSource::Path(path.clone()))
+        .expect("open");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if let Some(EngineEvent::Opened(_)) = engine.poll_event() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    // Wait for the device to actually be fed: until chunks are queued in front
+    // of it there is no sink to forward anything to.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if engine.snapshot_state().audio_queue_seconds > 0.0 {
+            break;
+        }
+        let _ = engine.take_frame(engine.display_position());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        engine.effective_gain(),
+        0.0,
+        "a file opened after the volume was turned down must open quiet"
+    );
+
+    engine.set_volume(0.4);
+    assert!(
+        (engine.effective_gain() - 0.4).abs() < 1e-6,
+        "the volume slider moved a number the device never saw: gain is {:.3}",
+        engine.effective_gain()
+    );
+
+    engine.set_muted(true);
+    assert_eq!(engine.effective_gain(), 0.0, "muting must silence the output");
+
+    // Raising the volume unmutes, and that has to travel the same way.
+    engine.set_volume(0.7);
+    assert!(!engine.is_muted());
+    assert!(
+        (engine.effective_gain() - 0.7).abs() < 1e-6,
+        "unmuting by raising the volume did not reach the device: gain is {:.3}",
+        engine.effective_gain()
+    );
+
+    // And a file opened afterwards keeps the current volume rather than the one
+    // the engine was constructed with.
+    engine.set_volume(0.25);
+    engine
+        .open(MediaSource::Path(path))
+        .expect("reopen the same file");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if engine.snapshot_state().audio_queue_seconds > 0.0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        (engine.effective_gain() - 0.25).abs() < 1e-6,
+        "the new device kept a stale volume: gain is {:.3}",
+        engine.effective_gain()
+    );
+    engine.stop();
+}
+
+/// Closing the player must not wait for the decoder backlog.
+///
+/// Two separate faults used to make the window hang for a moment on the way out:
+///
+/// * a worker only looked at the abort flag once its packet channel went quiet,
+///   so the `Stop` message the demuxer sends sat *behind* a full queue of
+///   packets that were then decoded, converted and thrown away — 167 ms of it on
+///   the video worker and 70 ms on the audio worker, measured on real hardware;
+/// * a **paused** device runs no output callback, so the audio decoder parked in
+///   the sink's 500 ms back-pressure wait was joined only once that wait had
+///   expired.
+///
+/// The bound is deliberately loose. The point is not the exact number but that
+/// `stop` is bounded by a poll slice, not by a queue or a timeout — the failures
+/// it guards against are 500 ms and up.
+#[test]
+fn stopping_releases_the_workers_promptly() {
+    if mvp_core::audio::default_output_device_name().is_none() {
+        eprintln!("skipping: no audio output device");
+        return;
+    }
+    let path = testdata("scene.mp4");
+    if !path.exists() {
+        eprintln!("skipping: {} is missing", path.display());
+        return;
+    }
+
+    fn open_and_wait(engine: &Engine) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            if let Some(EngineEvent::Opened(_)) = engine.poll_event() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    // ---- paused: the device has stopped draining the queue -----------------
+    let engine = player_engine();
+    engine
+        .open(MediaSource::Path(path.clone()))
+        .expect("open");
+    open_and_wait(&engine);
+    engine.pause();
+    // Long enough for the audio decoder to fill the device queue and park on it.
+    std::thread::sleep(Duration::from_millis(800));
+    let started = Instant::now();
+    engine.stop();
+    let when_paused = started.elapsed();
+
+    // ---- playing: the demuxer has a backlog of packets queued --------------
+    let engine = player_engine();
+    engine.open(MediaSource::Path(path)).expect("open");
+    open_and_wait(&engine);
+    std::thread::sleep(Duration::from_secs(2));
+    let started = Instant::now();
+    engine.stop();
+    let when_playing = started.elapsed();
+
+    assert!(
+        when_paused < Duration::from_millis(300),
+        "stopping while paused took {when_paused:?}: a paused device never drains \
+         the queue, so the decoder's back-pressure wait must end at shutdown"
+    );
+    assert!(
+        when_playing < Duration::from_millis(300),
+        "stopping while playing took {when_playing:?}: the queued packets must be \
+         abandoned, not decoded"
+    );
+}

@@ -312,18 +312,38 @@ pub fn apply_gain(samples: &mut [f32], gain: f32) {
         }
         return;
     }
+    for s in samples.iter_mut() {
+        *s = apply_gain_sample(*s, gain);
+    }
+}
+
+/// The same gain, applied to a single sample.
+///
+/// The volume is applied where the samples are *played*, not where they are
+/// decoded — the decoder runs seconds ahead of the playhead, so a gain applied
+/// there would not reach the speakers until the buffer drained. That path
+/// writes one sample at a time into the device buffer, so it needs the scalar
+/// form of the soft knee rather than the slice form above.
+#[inline]
+pub fn apply_gain_sample(sample: f32, gain: f32) -> f32 {
+    if !gain.is_finite() || gain < 0.0 || gain == 1.0 {
+        return sample;
+    }
+    if gain == 0.0 {
+        return 0.0;
+    }
+    if gain < 1.0 {
+        return sample * gain;
+    }
     // Above unity, drive the signal into a soft knee only when it would clip.
     const KNEE: f32 = 0.85;
-    for s in samples.iter_mut() {
-        let v = *s * gain;
-        *s = if v.abs() <= KNEE {
-            v
-        } else {
-            let sign = if v < 0.0 { -1.0 } else { 1.0 };
-            let over = (v.abs() - KNEE) / (1.0 - KNEE);
-            sign * (KNEE + (1.0 - KNEE) * over.tanh())
-        };
+    let v = sample * gain;
+    if v.abs() <= KNEE {
+        return v;
     }
+    let sign = if v < 0.0 { -1.0 } else { 1.0 };
+    let over = (v.abs() - KNEE) / (1.0 - KNEE);
+    sign * (KNEE + (1.0 - KNEE) * over.tanh())
 }
 
 #[cfg(test)]
@@ -432,5 +452,29 @@ mod tests {
         let mut untouched = vec![0.3f32; 4];
         apply_gain(&mut untouched, 1.0);
         assert_eq!(untouched, vec![0.3f32; 4]);
+    }
+
+    /// The output callback applies the gain one sample at a time; the slice
+    /// version is what the offline path uses. They have to agree, or the same
+    /// volume would drive two different signals.
+    #[test]
+    fn the_scalar_gain_matches_the_slice_gain() {
+        for gain in [0.0f32, 0.25, 1.0, 1.5, 2.0, 4.0] {
+            let source = [-1.7f32, -0.9, -0.4, 0.0, 0.3, 0.86, 0.95, 1.4];
+            let mut slice = source;
+            apply_gain(&mut slice, gain);
+            for (index, original) in source.iter().enumerate() {
+                let scalar = apply_gain_sample(*original, gain);
+                assert!(
+                    (scalar - slice[index]).abs() < 1e-6,
+                    "gain {gain} on {original}: scalar {scalar} != slice {}",
+                    slice[index]
+                );
+            }
+        }
+
+        // Nonsense gain is ignored rather than poisoning the output with NaNs.
+        assert_eq!(apply_gain_sample(0.5, f32::NAN), 0.5);
+        assert_eq!(apply_gain_sample(0.5, -1.0), 0.5);
     }
 }

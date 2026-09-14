@@ -51,7 +51,7 @@ pub fn draw(app: &mut PlayerApp, ctx: &Context) {
         transport::draw_overlay(app, ctx);
     }
 
-    app.ui.error_banner = error_banner(app, ctx).or_else(|| app.ui.error_banner.take());
+    app.ui.error_banner = error_banner(app, ctx);
 
     settings_window::draw(app, ctx);
     dialogs::draw(app, ctx);
@@ -69,9 +69,8 @@ pub fn draw(app: &mut PlayerApp, ctx: &Context) {
 
 /// Ask for another frame at the right moment instead of spinning at 60 fps.
 fn schedule_repaint(app: &PlayerApp, ctx: &Context) {
-    if app.ui.has_overlay() {
-        return;
-    }
+    // An open dialog must not stop the clock: playback continues behind the
+    // settings window, and the end of a file still has to advance the playlist.
     match app.mode {
         Mode::Media => {
             if app.engine.is_playing() {
@@ -131,12 +130,11 @@ fn handle_pointer_idle(app: &mut PlayerApp, ctx: &Context) {
 /// Keyboard shortcuts.
 ///
 /// Text fields win: if any widget wants keyboard input, the global shortcuts step
-/// aside so typing a URL or renaming a playlist entry works normally.
+/// aside so typing a URL works normally.
 fn handle_keyboard(app: &mut PlayerApp, ctx: &Context) {
     if ctx.wants_keyboard_input() {
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
             app.ui.close_overlay();
-            app.ui.renaming = None;
         }
         return;
     }
@@ -189,17 +187,13 @@ fn handle_keyboard(app: &mut PlayerApp, ctx: &Context) {
             }
             (Key::F, false, _) => app.toggle_fullscreen(ctx),
             (Key::Enter, false, _) if modifiers.alt => app.toggle_fullscreen(ctx),
-            (Key::ArrowLeft, false, false) => {
-                app.engine.seek_relative(-app.settings.seek_step)
-            }
-            (Key::ArrowRight, false, false) => {
-                app.engine.seek_relative(app.settings.seek_step)
-            }
+            (Key::ArrowLeft, false, false) => app.seek_relative(-app.settings.seek_step),
+            (Key::ArrowRight, false, false) => app.seek_relative(app.settings.seek_step),
             (Key::ArrowLeft, false, true) => {
-                app.engine.seek_relative(-app.settings.seek_step_large)
+                app.seek_relative(-app.settings.seek_step_large)
             }
             (Key::ArrowRight, false, true) => {
-                app.engine.seek_relative(app.settings.seek_step_large)
+                app.seek_relative(app.settings.seek_step_large)
             }
             (Key::ArrowUp, false, _) => {
                 app.settings.volume = (app.settings.volume + 0.05).min(2.0);
@@ -272,10 +266,12 @@ fn handle_keyboard(app: &mut PlayerApp, ctx: &Context) {
                     app.settings.aspect.label()
                 )));
             }
+            (Key::Comma, false, _) => app.step_back_frame(ctx),
+            (Key::Period, false, _) => app.step_forward_frame(ctx),
             (Key::V, false, _) => {
-                app.settings.subtitles_enabled = !app.settings.subtitles_enabled;
-                app.store.mark_dirty();
-                app.toast(crate::state::Toast::info(if app.settings.subtitles_enabled {
+                let on = !app.settings.subtitles_enabled;
+                app.set_subtitles_enabled(on);
+                app.toast(crate::state::Toast::info(if on {
                     "字幕已开启"
                 } else {
                     "字幕已关闭"

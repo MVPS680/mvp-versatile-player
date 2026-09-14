@@ -7,3 +7,5 @@
 *.exp
 .DS_Store
 Thumbs.db
+# heroui-agents-md
+.heroui-docs/
