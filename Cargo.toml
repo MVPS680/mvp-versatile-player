@@ -41,11 +41,13 @@ cpal = "0.16"
 image = "0.25"
 
 # GUI
-eframe = { version = "0.32", default-features = false, features = [
-    "default_fonts",
-    "glow",
-] }
-egui = "0.32"
+# `default_fonts` is off on purpose, in both places: egui's own `default`
+# feature re-enables it, so turning it off only on `eframe` would silently do
+# nothing. The player installs the Windows system stack itself (see
+# `theme::install_fonts`); shipping Ubuntu-Light/Hack as well would both bloat
+# the binary and sit in front of the CJK font as a mismatched fallback.
+eframe = { version = "0.32", default-features = false, features = ["glow"] }
+egui = { version = "0.32", default-features = false }
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
 
 # --- Release profile tuned for start-up latency and small, fast binaries -------

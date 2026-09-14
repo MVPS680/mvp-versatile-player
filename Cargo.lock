@@ -1034,18 +1034,11 @@ dependencies = [
  "bytemuck",
  "ecolor",
  "emath",
- "epaint_default_fonts",
  "log",
  "nohash-hasher",
  "parking_lot",
  "profiling",
 ]
-
-[[package]]
-name = "epaint_default_fonts"
-version = "0.32.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1537accc50c9cab5a272c39300bdd0dd5dca210f6e5e8d70be048df9596e7ca2"
 
 [[package]]
 name = "equator"
