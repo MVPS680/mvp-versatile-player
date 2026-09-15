@@ -15,7 +15,7 @@ pub fn draw(app: &mut PlayerApp, ctx: &Context) {
     let frame = egui::Frame::new()
         .fill(tokens.panel)
         .inner_margin(egui::Margin::symmetric(space::MD as i8, space::SM as i8))
-        .stroke(egui::Stroke::new(1.0, tokens.border));
+        .stroke(egui::Stroke::new(1.0_f32, tokens.border));
 
     egui::TopBottomPanel::bottom("mvp_transport")
         .frame(frame)
@@ -41,7 +41,7 @@ pub fn draw_overlay(app: &mut PlayerApp, ctx: &Context) {
                 .fill(tokens.elevated.gamma_multiply(0.94))
                 .corner_radius(egui::CornerRadius::same(12))
                 .inner_margin(egui::Margin::symmetric(space::LG as i8, space::SM as i8))
-                .stroke(egui::Stroke::new(1.0, tokens.border_strong))
+                .stroke(egui::Stroke::new(1.0_f32, tokens.border_strong))
                 .show(ui, |ui| {
                     ui.set_width(width);
                     seek_row(app, ui, &tokens);

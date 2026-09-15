@@ -1,4 +1,4 @@
-# Assembles a self-contained distribution folder.
+﻿# Assembles a self-contained distribution folder.
 #
 # The player links FFmpeg's shared libraries, so a runnable release is
 # "executable + its seven DLLs" — no installer, no registry setup, no runtime

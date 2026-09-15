@@ -153,6 +153,8 @@ pub enum EngineEvent {
 pub struct EngineConfig {
     /// Try a hardware decoder before falling back to software.
     pub hardware_decoding: bool,
+    /// Bring HDR (PQ / HLG) frames into the range an SDR display can show.
+    pub hdr_tone_map: bool,
     /// Open the audio device and play sound.
     pub audio_enabled: bool,
     /// Output device name; `None` means the system default.
@@ -175,6 +177,7 @@ impl Default for EngineConfig {
     fn default() -> Self {
         Self {
             hardware_decoding: true,
+            hdr_tone_map: true,
             audio_enabled: true,
             audio_device: None,
             volume: 1.0,
@@ -266,6 +269,8 @@ pub(crate) struct Shared {
     pub muted: AtomicBool,
     pub looping: AtomicBool,
     pub hw_decoding: AtomicBool,
+    /// Bring HDR frames into SDR range on the way to the screen.
+    pub hdr_tone_map: AtomicBool,
     pub audio_delay_bits: AtomicU64,
     pub subtitle_delay_bits: AtomicU64,
     pub ab_loop: Mutex<Option<(f64, f64)>>,
@@ -329,6 +334,7 @@ impl Shared {
             muted: AtomicBool::new(false),
             looping: AtomicBool::new(false),
             hw_decoding: AtomicBool::new(config.hardware_decoding),
+            hdr_tone_map: AtomicBool::new(config.hdr_tone_map),
             audio_delay_bits: AtomicU64::new(0.0f64.to_bits()),
             subtitle_delay_bits: AtomicU64::new(0.0f64.to_bits()),
             ab_loop: Mutex::new(None),
@@ -497,10 +503,10 @@ impl Engine {
         }
         let thread = self.threads.lock().pop();
         if let Some(handle) = thread {
-            let _ = handle.join();
+            join_bounded(handle);
         }
         for handle in self.shared.workers.lock().drain(..) {
-            let _ = handle.join();
+            join_bounded(handle);
         }
         self.shared.video_queue.lock().clear();
         self.shared.pool.clear();
@@ -844,6 +850,20 @@ impl Engine {
         self.shared.hw_decoding.load(Ordering::Relaxed)
     }
 
+    /// Bring HDR (PQ / HLG) frames into the range an SDR display can show.
+    ///
+    /// Takes effect on the next frame: the decoder re-reads the flag for each
+    /// frame it converts, so flipping the switch does not need the file to be
+    /// reopened.
+    pub fn set_hdr_tone_map(&self, enabled: bool) {
+        self.shared.hdr_tone_map.store(enabled, Ordering::Relaxed);
+    }
+
+    /// `true` when HDR frames are being tone mapped for display.
+    pub fn hdr_tone_map(&self) -> bool {
+        self.shared.hdr_tone_map.load(Ordering::Relaxed)
+    }
+
     /// Tell the engine the size the video is displayed at, so frames can be
     /// scaled during conversion instead of by the GPU.
     ///
@@ -1010,6 +1030,33 @@ impl Drop for Engine {
             log::info!("释放播放引擎耗时 {millis:.1} ms");
         }
     }
+}
+
+/// How long [`Engine::stop`] gives a worker to notice the abort flag.
+const STOP_JOIN_TIMEOUT_MS: u64 = 400;
+
+/// Join a worker thread, but never block the caller forever.
+///
+/// Workers poll the abort flag every 25–50 ms, so a healthy pipeline is inside
+/// this bound by a wide margin. The bound is for the unhealthy case: a demuxer
+/// parked inside a long FFmpeg call — a seek across a damaged file, a stalled
+/// network read — must not be able to hold the window open, which is the one
+/// thing "closing is instant" promises.
+///
+/// Detaching is safe: every worker holds its own `Arc` to the shared state, so
+/// the thread that is left behind has nothing borrowed from the caller.
+fn join_bounded(handle: std::thread::JoinHandle<()>) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(STOP_JOIN_TIMEOUT_MS);
+    while !handle.is_finished() {
+        if std::time::Instant::now() >= deadline {
+            log::warn!(
+                "工作线程未在 {STOP_JOIN_TIMEOUT_MS} ms 内退出，已放弃等待并分离该线程"
+            );
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    let _ = handle.join();
 }
 
 /// Clamp a requested position into the media.

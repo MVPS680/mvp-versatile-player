@@ -166,6 +166,9 @@ pub struct Settings {
     // ---- video -----------------------------------------------------------
     /// Try hardware decoding.
     pub hardware_decoding: bool,
+    /// Bring HDR (PQ / HLG) and Dolby Vision frames into the range an SDR
+    /// display can show.
+    pub hdr_tone_map: bool,
     /// How the frame is fitted to the window.
     pub aspect: AspectMode,
     /// Extra rotation in degrees (0/90/180/270).
@@ -283,6 +286,7 @@ impl Default for Settings {
             end_action: EndAction::Playlist,
 
             hardware_decoding: true,
+            hdr_tone_map: true,
             aspect: AspectMode::Fit,
             rotation: 0,
             flip_h: false,

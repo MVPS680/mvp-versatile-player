@@ -15,7 +15,7 @@ pub fn draw(app: &mut PlayerApp, ctx: &Context) {
     let frame = egui::Frame::new()
         .fill(tokens.panel)
         .inner_margin(egui::Margin::symmetric(space::SM as i8, space::SM as i8))
-        .stroke(egui::Stroke::new(1.0, tokens.border));
+        .stroke(egui::Stroke::new(1.0_f32, tokens.border));
 
     // The sidebar is a third of the interface on a wide screen and a nuisance
     // on a narrow one: a fixed 460 pt ceiling would leave a 720 pt window with

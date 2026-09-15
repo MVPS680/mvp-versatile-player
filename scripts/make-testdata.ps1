@@ -1,4 +1,4 @@
-# Regenerates the media fixtures used by the end-to-end playback tests.
+﻿# Regenerates the media fixtures used by the end-to-end playback tests.
 #
 # The files are deliberately tiny (a few hundred kilobytes in total) and are
 # checked in, so `cargo test` works on a fresh clone without needing an FFmpeg
@@ -60,6 +60,17 @@ Invoke-Ffmpeg @(
     '-f', 'lavfi', '-i', 'sine=frequency=880:duration=2',
     '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
     '-c:a', 'aac', '-shortest', (Join-Path $out 'with_subs.mp4')
+)
+
+Write-Host '生成 offset.ts (时间轴从 4200s 开始的 MPEG-TS)…' -ForegroundColor Cyan
+# A container whose timeline does not start at zero, like a Blu-ray transport
+# stream. Seeking has to translate playback time into container time, *and* it
+# has to survive a demuxer whose seek reads packets: mpegts seeks by binary
+# search, and every read calls the interrupt callback back into the seek path.
+Invoke-Ffmpeg @(
+    '-f', 'lavfi', '-i', 'testsrc2=size=320x240:rate=25:duration=4',
+    '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', '-g', '25',
+    '-output_ts_offset', '4200', '-f', 'mpegts', (Join-Path $out 'offset.ts')
 )
 
 Get-ChildItem $out | Select-Object Name, @{n = 'KB'; e = { [math]::Round($_.Length / 1KB, 1) } } |

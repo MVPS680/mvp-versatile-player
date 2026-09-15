@@ -170,6 +170,7 @@ impl PlayerApp {
 
         let engine_config = EngineConfig {
             hardware_decoding: settings.hardware_decoding,
+            hdr_tone_map: settings.hdr_tone_map,
             audio_enabled: !args.no_audio,
             audio_device: settings.audio_device.clone(),
             volume: settings.volume,
@@ -190,6 +191,7 @@ impl PlayerApp {
         engine.set_audio_delay(settings.audio_delay);
         engine.set_subtitle_delay(settings.subtitle_delay);
         engine.set_hardware_decoding(settings.hardware_decoding);
+        engine.set_hdr_tone_map(settings.hdr_tone_map);
 
         let mut playlist = Playlist::new();
         if settings.restore_playlist && !settings.playlist.is_empty() {
@@ -707,6 +709,7 @@ impl PlayerApp {
                         .set_target_size(self.video_target.0, self.video_target.1);
                     self.resolve_pending_sidecar(&info);
                     self.apply_resume_position(&info);
+                    self.announce_dynamic_range(&info);
                 }
                 EngineEvent::StateChanged(_) => {}
                 EngineEvent::SubtitleChanged(_) => {}
@@ -782,6 +785,7 @@ impl PlayerApp {
         self.engine.set_subtitle_delay(self.settings.subtitle_delay);
         self.engine
             .set_looping(self.settings.repeat == playlist::RepeatMode::One);
+        self.engine.set_hdr_tone_map(self.settings.hdr_tone_map);
         self.playlist.set_repeat(self.settings.repeat);
         self.playlist.set_shuffle(self.settings.shuffle);
     }
@@ -887,6 +891,31 @@ impl PlayerApp {
     // -----------------------------------------------------------------------
     // Information panel
     // -----------------------------------------------------------------------
+
+    /// Say what the file's dynamic range is, once, when it opens.
+    ///
+    /// A Dolby Vision or HDR10 file shown without a word of explanation looks
+    /// like a washed-out transfer. Saying what it is — and whether the player is
+    /// tone mapping it — is the difference between "this player is broken" and
+    /// "this player is doing what it can".
+    fn announce_dynamic_range(&mut self, info: &MediaInfo) {
+        let Some(video) = info.primary_video() else {
+            return;
+        };
+        if !video.hdr.kind.is_hdr() && video.hdr.dovi.is_none() {
+            return;
+        }
+        let label = video.hdr.label();
+        if video.hdr.needs_dolby_renderer() {
+            self.toast(Toast::warning(format!(
+                "{label}：基底层为 IPT 编码，需要杜比视界渲染器才能正确还原，颜色可能不正确"
+            )));
+        } else if video.hdr.needs_tone_map() && self.settings.hdr_tone_map {
+            self.toast(Toast::info(format!("{label} · 已做 HDR→SDR 色调映射")));
+        } else {
+            self.toast(Toast::info(label));
+        }
+    }
 
     fn rebuild_info_rows(&mut self, info: &MediaInfo) {
         self.info_source = Some(info.path.to_string_lossy().into_owned());

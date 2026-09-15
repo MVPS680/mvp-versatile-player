@@ -1,4 +1,4 @@
-# Downloads the FFmpeg development kit this project links against and writes the
+﻿# Downloads the FFmpeg development kit this project links against and writes the
 # matching `.cargo/config.toml`.
 #
 # A *shared* build is required: the player links the import libraries and copies
@@ -54,12 +54,30 @@ if ($libCount -lt 5) {
 }
 
 # libclang is required by ffmpeg-sys-next's bindgen step.
+#
+# Three sources are tried, in this order: whatever the environment already
+# points at, `pip install libclang` (which may land in either the normal user
+# site-packages or the packaged-app cache used by the Microsoft Store build of
+# Python), and a full LLVM installation.
 $libclang = $env:LIBCLANG_PATH
 if (-not $libclang) {
-    $candidates = @(
+    $candidates = @()
+
+    # `pip install libclang` — ask Python itself, so virtual environments and
+    # Store-installed interpreters are covered without hard-coding a user name.
+    $python = Get-Command python -ErrorAction SilentlyContinue
+    if ($python) {
+        $probe = & $python.Source -c "import clang, os; print(os.path.join(os.path.dirname(clang.__file__), 'native'))" 2>$null
+        if ($probe) { $candidates += $probe.Trim() }
+    }
+
+    $candidates += @(
         (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python312\Lib\site-packages\clang\native'),
-        'C:\Program Files\LLVM\bin'
+        (Join-Path $env:APPDATA 'Python\Python312\site-packages\clang\native'),
+        'C:\Program Files\LLVM\bin',
+        'C:\Program Files (x86)\LLVM\bin'
     )
+
     foreach ($candidate in $candidates) {
         if (Test-Path (Join-Path $candidate 'libclang.dll')) { $libclang = $candidate; break }
     }

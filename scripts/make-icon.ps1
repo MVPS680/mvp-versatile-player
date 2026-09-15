@@ -1,4 +1,4 @@
-# Generates assets/icon.ico — the icon Explorer shows for the player and for the
+﻿# Generates assets/icon.ico — the icon Explorer shows for the player and for the
 # file types it is associated with.
 #
 # The logo is drawn with GDI+ rather than committed as a binary blob so it can be

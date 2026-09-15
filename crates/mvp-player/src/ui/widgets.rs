@@ -32,7 +32,7 @@ pub fn section(ui: &mut Ui, tokens: &Tokens, title: &str) {
             egui::pos2(rect.left(), y),
             egui::pos2(rect.right(), y),
         ],
-        Stroke::new(1.0, tokens.border),
+        Stroke::new(1.0_f32, tokens.border),
     );
     ui.add_space(space::MD);
 }
@@ -438,7 +438,7 @@ pub fn seek_bar(
     ui.painter().circle_stroke(
         egui::pos2(handle_x, track.center().y),
         handle_radius,
-        Stroke::new(2.0, tokens.accent),
+        Stroke::new(2.0_f32, tokens.accent),
     );
 
     let mut output = SeekBarOutput {
@@ -558,7 +558,7 @@ pub fn draw_toast(app: &PlayerApp, ctx: &Context, toast: &Toast) {
     painter.rect_stroke(
         rect,
         CornerRadius::same(radius::LG as u8),
-        Stroke::new(1.0, color.gamma_multiply(opacity * 0.6)),
+        Stroke::new(1.0_f32, color.gamma_multiply(opacity * 0.6)),
         StrokeKind::Inside,
     );
     if let Some(icon) = toast.icon {

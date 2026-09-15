@@ -20,6 +20,7 @@ pub mod audio;
 pub mod dsp;
 pub mod engine;
 pub mod error;
+pub mod hdr;
 pub mod image_view;
 pub mod info;
 pub mod playlist;
@@ -30,6 +31,7 @@ pub use engine::{
     Clock, Engine, EngineConfig, EngineEvent, EngineSnapshot, MediaSource, PlaybackState,
 };
 pub use error::{MediaError, Result};
+pub use hdr::{DoviConfig, HdrInfo, HdrKind, ToneMapper};
 pub use image_view::{FitMode, ImageDoc, ImageFrame, ImageView};
 pub use info::{AudioStreamInfo, ChapterInfo, MediaInfo, SubtitleStreamInfo, VideoStreamInfo};
 pub use playlist::{Playlist, PlaylistItem, RepeatMode};

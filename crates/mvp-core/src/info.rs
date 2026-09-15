@@ -13,6 +13,7 @@ use ffmpeg_next as ffmpeg;
 use ffmpeg::format::stream::Disposition;
 
 use crate::error::{MediaError, Result};
+use crate::hdr::HdrInfo;
 use crate::util::{self, MediaKind};
 
 /// One video stream.
@@ -42,6 +43,9 @@ pub struct VideoStreamInfo {
     pub frames: i64,
     /// Display rotation in degrees taken from stream metadata (`rotate` tag).
     pub rotation: i32,
+    /// Dynamic range: transfer function, primaries and the Dolby Vision
+    /// configuration record when the container declares one.
+    pub hdr: HdrInfo,
 }
 
 /// One audio stream.
@@ -278,8 +282,25 @@ pub fn probe(path: &Path) -> Result<MediaInfo> {
 /// Like [`probe`], but with the [`MediaKind`] supplied by the caller (used when
 /// the extension is unknown but the content has already been sniffed).
 pub fn probe_with_kind(path: &Path, kind: MediaKind) -> Result<MediaInfo> {
+    reject_disc_image(path)?;
     let ictx = ffmpeg::format::input(&path)?;
     Ok(describe(&ictx, path, kind))
+}
+
+/// Refuse a disc image with an explanation instead of handing it to FFmpeg.
+///
+/// An ISO/UDF image is a filesystem, not a container: the demuxers cannot make
+/// sense of it, and what they do instead is emit decoder errors forever while no
+/// picture ever arrives.
+fn reject_disc_image(path: &Path) -> Result<()> {
+    if util::is_disc_image_extension(path) || util::looks_like_disc_image(path) {
+        return Err(MediaError::other(format!(
+            "这是一个光盘镜像，不是媒体文件: {}。\n\
+             请右键选择「装载」挂载后再打开里面的视频，或先解压出其中的 .m2ts / .mkv / .mp4。",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Describe an already-open container.
@@ -352,6 +373,9 @@ pub fn describe(ictx: &ffmpeg::format::context::Input, path: &Path, kind: MediaK
                     level: raw.level,
                     frames: stream.frames(),
                     rotation,
+                    // SAFETY: `params` belongs to the live stream and the call
+                    // only reads plain fields and FFmpeg-owned side data.
+                    hdr: unsafe { HdrInfo::from_codec_parameters(params.as_ptr()) },
                 });
             }
             ffmpeg::media::Type::Audio => {
@@ -591,6 +615,17 @@ pub fn info_rows(info: &MediaInfo) -> Vec<(String, String)> {
             rows.push((format!("{prefix}比特率"), util::format_bitrate(v.bit_rate)));
         }
         rows.push((format!("{prefix}像素格式"), v.pixel_format.clone()));
+        if v.hdr.kind.is_hdr() || v.hdr.dovi.is_some() {
+            rows.push((format!("{prefix}动态范围"), v.hdr.label()));
+        }
+        if v.hdr.needs_dolby_renderer() {
+            rows.push((
+                format!("{prefix}提示"),
+                "杜比视界 Profile 5 使用 IPT 编码的基底层，本播放器无法还原杜比视界的映射，\
+                 颜色可能不正确"
+                    .to_string(),
+            ));
+        }
         if v.frames > 0 {
             rows.push((format!("{prefix}总帧数"), v.frames.to_string()));
         }
@@ -652,6 +687,7 @@ pub fn validate_input(path: &Path) -> Result<()> {
             path.display()
         )));
     }
+    reject_disc_image(path)?;
     Ok(())
 }
 

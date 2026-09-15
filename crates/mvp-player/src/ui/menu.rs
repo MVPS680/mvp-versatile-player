@@ -18,7 +18,7 @@ pub fn draw(app: &mut PlayerApp, ctx: &Context) {
     let frame = egui::Frame::new()
         .fill(tokens.panel)
         .inner_margin(egui::Margin::symmetric(space::SM as i8, 2))
-        .stroke(egui::Stroke::new(1.0, tokens.border));
+        .stroke(egui::Stroke::new(1.0_f32, tokens.border));
 
     egui::TopBottomPanel::top("mvp_menu_bar")
         .frame(frame)
@@ -671,7 +671,7 @@ fn separator(ui: &mut Ui, tokens: &Tokens) {
     let width = ui.available_width().max(190.0);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 1.0), egui::Sense::hover());
     ui.painter()
-        .line_segment([rect.left_top(), rect.right_top()], egui::Stroke::new(1.0, tokens.border));
+        .line_segment([rect.left_top(), rect.right_top()], egui::Stroke::new(1.0_f32, tokens.border));
     ui.add_space(space::XS);
 }
 

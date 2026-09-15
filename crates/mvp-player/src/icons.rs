@@ -553,7 +553,7 @@ pub fn primary_transport_button(
     // Ring on hover keeps the target readable on busy video frames.
     if response.hovered() {
         ui.painter()
-            .circle_stroke(rect.center(), radius, Stroke::new(1.0, bg_hover.gamma_multiply(0.6)));
+            .circle_stroke(rect.center(), radius, Stroke::new(1.0_f32, bg_hover.gamma_multiply(0.6)));
     }
 
     let glyph = Rect::from_center_size(rect.center(), Vec2::splat(diameter * 0.58));

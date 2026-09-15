@@ -283,8 +283,17 @@ fn the_position_tracks_the_wall_clock_during_steady_playback() {
     }
     engine.set_target_size(640, 360);
 
-    // Let the pipeline prime, then measure over a known window.
-    std::thread::sleep(Duration::from_millis(1500));
+    // Let the pipeline prime, then measure over a known window. The priming
+    // consumes frames exactly like the interface does — a consumer that is
+    // asleep is a *different* experiment (that is a minimised window, and its
+    // skipped packets are deliberate), and counting those against steady
+    // playback is what made this test fail on machines whose pipeline filled
+    // faster than the author's.
+    let prime_until = Instant::now() + Duration::from_millis(1500);
+    while Instant::now() < prime_until {
+        let _ = engine.take_frame(engine.display_position());
+        std::thread::sleep(Duration::from_millis(5));
+    }
     let baseline = engine.display_position();
     let baseline_at = Instant::now();
 

@@ -12,6 +12,7 @@ use ffmpeg::ffi;
 use parking_lot::Mutex;
 
 use crate::error::{MediaError, Result};
+use crate::hdr::{HdrInfo, ToneMapper};
 
 /// One decoded, display-ready video frame.
 #[derive(Debug, Clone)]
@@ -146,6 +147,10 @@ pub struct RgbaConverter {
     dst_height: i32,
     colorspace: i32,
     src_range: i32,
+    /// Bring HDR frames into SDR range (the interface's preference).
+    tone_map: bool,
+    /// Mapper built for the dynamic range of the frames currently arriving.
+    mapper: Option<(HdrInfo, ToneMapper)>,
 }
 
 // SAFETY: the converter is created on, moved to and only ever used from the
@@ -164,7 +169,26 @@ impl RgbaConverter {
             dst_height: 0,
             colorspace: 0,
             src_range: -1,
+            tone_map: true,
+            mapper: None,
         }
+    }
+
+    /// Turn HDR → SDR tone mapping on or off.
+    ///
+    /// The interface owns this preference, so the flag arrives as a setter
+    /// rather than at construction: the engine is built before the settings
+    /// window can be opened, and the decoder may already be running.
+    pub fn set_tone_map(&mut self, enabled: bool) {
+        if self.tone_map != enabled {
+            self.tone_map = enabled;
+            self.mapper = None;
+        }
+    }
+
+    /// `true` when HDR frames are being brought into SDR range.
+    pub fn tone_map(&self) -> bool {
+        self.tone_map
     }
 
     /// Convert `src` into RGBA at `dst_width x dst_height`.
@@ -180,11 +204,34 @@ impl RgbaConverter {
     ) -> Result<Vec<u8>> {
         let width = src.width() as i32;
         let height = src.height() as i32;
-        if width <= 0 || height <= 0 {
-            return Err(MediaError::other("解码帧尺寸无效"));
+        // A damaged or mis-detected stream can hand over a frame with a bogus
+        // geometry; scaling it would be reading and writing past the end of
+        // something. Cheap to check, impossible to survive without.
+        const MAX_DIMENSION: i32 = 32_768;
+        if width <= 0 || height <= 0 || width > MAX_DIMENSION || height > MAX_DIMENSION {
+            return Err(MediaError::other(format!(
+                "解码帧尺寸无效: {width}x{height}"
+            )));
+        }
+        // Read the plane pointer straight out of the AVFrame: the `data()`
+        // accessor builds a slice from it, and building a slice out of a null
+        // pointer is exactly the thing this check exists to prevent.
+        // SAFETY: the frame is alive for the duration of the call and the two
+        // arrays are plain inline fields of it.
+        let has_pixels = unsafe {
+            let raw = src.as_ptr();
+            !(*raw).data[0].is_null() && (*raw).linesize[0] != 0
+        };
+        if !has_pixels {
+            return Err(MediaError::other("解码帧没有像素数据"));
         }
         let dst_width = dst_width.max(1) as i32;
         let dst_height = dst_height.max(1) as i32;
+        if dst_width > MAX_DIMENSION || dst_height > MAX_DIMENSION {
+            return Err(MediaError::other(format!(
+                "目标尺寸无效: {dst_width}x{dst_height}"
+            )));
+        }
         let src_format: ffi::AVPixelFormat = src.format().into();
         if src_format == ffi::AVPixelFormat::AV_PIX_FMT_NONE {
             return Err(MediaError::other("解码帧像素格式未知"));
@@ -243,6 +290,24 @@ impl RgbaConverter {
 
         if written <= 0 {
             return Err(MediaError::other("视频帧色彩转换失败"));
+        }
+
+        // HDR → SDR, when the frame needs it and the user allows it.
+        //
+        // It happens here, on the buffer the screen is about to show, rather
+        // than in the decoder: this buffer is already scaled to the window, so
+        // the cost follows the display rather than the source. The mapper is
+        // rebuilt only when a frame arrives with a different dynamic range.
+        if self.tone_map {
+            let info = HdrInfo::from_frame(src);
+            if info.needs_tone_map() {
+                if self.mapper.as_ref().map(|(built, _)| *built) != Some(info) {
+                    self.mapper = Some((info, ToneMapper::new(info)));
+                }
+                if let Some((_, mapper)) = &self.mapper {
+                    mapper.apply(&mut out);
+                }
+            }
         }
         Ok(out)
     }

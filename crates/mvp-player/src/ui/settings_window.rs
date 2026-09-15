@@ -242,6 +242,15 @@ fn video_page(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
         "使用显卡（D3D11VA / DXVA2）解码，可显著降低 CPU 占用；\
          若出现花屏或绿屏请关闭。更改将在重新打开文件后生效。",
     );
+    changed |= widgets::switch_row(
+        ui,
+        tokens,
+        "HDR 色调映射",
+        &mut app.settings.hdr_tone_map,
+        "把 HDR10 / 杜比视界的 PQ、HLG 画面压到 SDR 显示范围：\
+         203 尼特以下原样保留，高光柔和收敛，避免整幅画面发灰。\
+         若显示器本身支持 HDR，建议关闭。",
+    );
 
     widgets::section(ui, tokens, "画面");
     changed |= widgets::combo_row(

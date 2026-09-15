@@ -154,7 +154,7 @@ impl Theme {
         visuals.extreme_bg_color = t.sunken;
         visuals.faint_bg_color = t.hover;
         visuals.code_bg_color = t.sunken;
-        visuals.window_stroke = Stroke::new(1.0, t.border_strong);
+        visuals.window_stroke = Stroke::new(1.0_f32, t.border_strong);
         visuals.window_corner_radius = CornerRadius::same(radius::XL as u8);
         visuals.menu_corner_radius = CornerRadius::same(radius::MD as u8);
         visuals.window_shadow = egui::epaint::Shadow {
@@ -172,38 +172,38 @@ impl Theme {
         visuals.override_text_color = Some(t.text);
         visuals.hyperlink_color = t.accent;
         visuals.selection.bg_fill = t.accent.gamma_multiply(0.55);
-        visuals.selection.stroke = Stroke::new(1.0, t.accent_hover);
+        visuals.selection.stroke = Stroke::new(1.0_f32, t.accent_hover);
         visuals.slider_trailing_fill = true;
 
         let w = &mut visuals.widgets;
         w.noninteractive.bg_fill = t.panel;
         w.noninteractive.weak_bg_fill = t.panel;
-        w.noninteractive.bg_stroke = Stroke::new(1.0, t.border);
-        w.noninteractive.fg_stroke = Stroke::new(1.0, t.text_weak);
+        w.noninteractive.bg_stroke = Stroke::new(1.0_f32, t.border);
+        w.noninteractive.fg_stroke = Stroke::new(1.0_f32, t.text_weak);
         w.noninteractive.corner_radius = CornerRadius::same(radius::MD as u8);
 
         w.inactive.bg_fill = t.hover;
         w.inactive.weak_bg_fill = Color32::TRANSPARENT;
-        w.inactive.bg_stroke = Stroke::new(1.0, t.border);
-        w.inactive.fg_stroke = Stroke::new(1.0, t.text);
+        w.inactive.bg_stroke = Stroke::new(1.0_f32, t.border);
+        w.inactive.fg_stroke = Stroke::new(1.0_f32, t.text);
         w.inactive.corner_radius = CornerRadius::same(radius::MD as u8);
 
         w.hovered.bg_fill = t.active;
         w.hovered.weak_bg_fill = t.active;
-        w.hovered.bg_stroke = Stroke::new(1.0, t.border_strong);
-        w.hovered.fg_stroke = Stroke::new(1.0, t.text);
+        w.hovered.bg_stroke = Stroke::new(1.0_f32, t.border_strong);
+        w.hovered.fg_stroke = Stroke::new(1.0_f32, t.text);
         w.hovered.corner_radius = CornerRadius::same(radius::MD as u8);
 
         w.active.bg_fill = t.accent.gamma_multiply(0.85);
         w.active.weak_bg_fill = t.accent.gamma_multiply(0.85);
-        w.active.bg_stroke = Stroke::new(1.0, t.accent_hover);
-        w.active.fg_stroke = Stroke::new(1.0, t.on_accent);
+        w.active.bg_stroke = Stroke::new(1.0_f32, t.accent_hover);
+        w.active.fg_stroke = Stroke::new(1.0_f32, t.on_accent);
         w.active.corner_radius = CornerRadius::same(radius::MD as u8);
 
         w.open.bg_fill = t.active;
         w.open.weak_bg_fill = t.active;
-        w.open.bg_stroke = Stroke::new(1.0, t.border_strong);
-        w.open.fg_stroke = Stroke::new(1.0, t.text);
+        w.open.bg_stroke = Stroke::new(1.0_f32, t.border_strong);
+        w.open.fg_stroke = Stroke::new(1.0_f32, t.text);
         w.open.corner_radius = CornerRadius::same(radius::MD as u8);
 
         // egui keeps a separate `Style` for each theme and resolves
@@ -511,7 +511,7 @@ mod tests {
             system_theme: Some(egui::Theme::Light),
             ..Default::default()
         };
-        ctx.run(input, |ctx| {
+        let _ = ctx.run(input, |ctx| {
             assert_eq!(
                 ctx.theme(),
                 egui::Theme::Dark,

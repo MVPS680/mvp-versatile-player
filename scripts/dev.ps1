@@ -1,4 +1,4 @@
-# Runs any cargo command with the FFmpeg runtime on PATH.
+﻿# Runs any cargo command with the FFmpeg runtime on PATH.
 #
 # The player links FFmpeg's shared libraries, so anything that *runs* a binary
 # (`cargo run`, `cargo test`) needs `<ffmpeg>/bin` on PATH — the import libraries
@@ -35,7 +35,12 @@ if (-not (Test-Path $binDir)) {
     $env:PATH = "$binDir;$env:PATH"
 }
 
-$env:FFMPEG_DIR = $ffmpegDir
+# Forward slashes, exactly as `scripts/setup-ffmpeg.ps1` writes it into
+# `.cargo/config.toml`. `ffmpeg-sys-next` declares
+# `cargo:rerun-if-env-changed=FFMPEG_DIR`, so a value that differs only in its
+# separators would make every switch between `cargo run` and this script look
+# like a configuration change and re-run bindgen (a multi-minute rebuild).
+$env:FFMPEG_DIR = $ffmpegDir -replace '\\', '/'
 Push-Location $root
 try {
     & cargo @CargoArgs

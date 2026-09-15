@@ -358,7 +358,7 @@ fn error_banner(app: &mut PlayerApp, ctx: &Context) -> Option<String> {
                 .fill(app.theme.tokens.danger.gamma_multiply(0.18))
                 .inner_margin(egui::Margin::symmetric(12, 6))
                 .stroke(egui::Stroke::new(
-                    1.0,
+                    1.0_f32,
                     app.theme.tokens.danger.gamma_multiply(0.5),
                 )),
         )

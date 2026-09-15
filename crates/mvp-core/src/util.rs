@@ -49,6 +49,49 @@ pub const PLAYLIST_EXTENSIONS: &[&str] = &["m3u", "m3u8", "pls", "xspf", "wpl"];
 /// Extensions treated as subtitle side-cars.
 pub const SUBTITLE_EXTENSIONS: &[&str] = &["srt", "ass", "ssa", "vtt", "sub", "idx", "smi"];
 
+/// Extensions of optical-disc images.
+///
+/// These are *filesystems*, not media containers: an ISO or a BDMV image has to
+/// be mounted (or its contents extracted) before FFmpeg has anything to read.
+/// Handing one to the demuxers anyway is what produces an endless storm of
+/// decoder errors instead of a picture.
+pub const DISC_IMAGE_EXTENSIONS: &[&str] = &["iso", "img", "udf", "nrg", "mdf", "mds", "ccd"];
+
+/// `true` when the path looks like a disc image, by extension.
+pub fn is_disc_image_extension(path: &Path) -> bool {
+    applies_to(path, DISC_IMAGE_EXTENSIONS)
+}
+
+/// `true` when the first volume descriptors say "ISO9660 / UDF image".
+///
+/// A disc image carries the string `CD001` (ISO9660) or `BEA01` / `NSR02` /
+/// `NSR03` (UDF) at byte offset 0x8001. Checking the content as well as the
+/// extension catches images that were renamed on the way here.
+pub fn looks_like_disc_image(path: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    const VOLUME_DESCRIPTOR_OFFSET: u64 = 0x8001;
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    if file.seek(SeekFrom::Start(VOLUME_DESCRIPTOR_OFFSET)).is_err() {
+        return false;
+    }
+    let mut magic = [0u8; 5];
+    if file.read_exact(&mut magic).is_err() {
+        return false;
+    }
+    matches!(&magic, b"CD001" | b"BEA01" | b"NSR02" | b"NSR03")
+}
+
+/// `true` when `path`'s extension is one of `list`.
+fn applies_to(path: &Path, list: &[&str]) -> bool {
+    match extension_of(path) {
+        Some(ext) => list.contains(&ext.as_str()),
+        None => false,
+    }
+}
+
 /// Audio-only extensions, used to pick a nicer default window shape and to
 /// decide whether a "video" area is expected at all.
 pub const AUDIO_EXTENSIONS: &[&str] = &[

@@ -235,6 +235,70 @@ fn seeking_lands_near_the_requested_position() {
     engine.stop();
 }
 
+/// A container whose timeline does not start at zero — a Blu-ray style transport
+/// stream starts at 4200 seconds — must still seek where the user asked.
+///
+/// The bug this guards: playback time was handed to the demuxer as if it were
+/// container time, so the seek landed *before* the point that was asked for,
+/// every frame that then came out was still behind the target, and the picture
+/// never came back. The fixture is a four-second transport stream with an
+/// `-output_ts_offset` of 4200s, which is exactly that shape.
+#[test]
+fn seeking_works_when_the_container_timeline_starts_late() {
+    let Some(path) = fixture("offset.ts") else {
+        return;
+    };
+    // The engine explains a failed seek through `log`; without a logger the test
+    // only sees "no frame arrived".
+    let _ = env_logger::builder()
+        .filter_level(log::LevelFilter::Info)
+        .try_init();
+    let engine = silent_engine();
+    engine.open(MediaSource::Path(path)).expect("open");
+    let info = wait_for_open(&engine, Duration::from_secs(15));
+    assert!(info.duration > 3.0, "got duration {}", info.duration);
+    assert!(
+        info.start_time > 3600.0,
+        "the fixture must start late, got {}",
+        info.start_time
+    );
+
+    assert!(
+        !collect_frames(&engine, 2, Duration::from_secs(10)).is_empty(),
+        "playback must start before the seek"
+    );
+
+    engine.seek(2.0);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut after: Vec<Arc<mvp_core::VideoFrame>> = Vec::new();
+    while Instant::now() < deadline && after.is_empty() {
+        if let Some(frame) = engine.take_frame(engine.display_position()) {
+            after.push(frame);
+        } else {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    let Some(frame) = after.first() else {
+        let snapshot = engine.snapshot_state();
+        panic!(
+            "no frame arrived after seeking to 2.0s in a container that starts at {}s \
+             (state {:?}, position {:.2}s, queued {}, decoded {}, dropped {})",
+            info.start_time,
+            snapshot.state,
+            snapshot.position,
+            snapshot.queued_frames,
+            snapshot.decoded_frames,
+            snapshot.dropped_frames
+        );
+    };
+    assert!(
+        (1.0..=2.8).contains(&frame.pts),
+        "the seek landed at {}s, expected close to 2.0s",
+        frame.pts
+    );
+    engine.stop();
+}
+
 #[test]
 fn pause_freezes_the_clock_and_play_resumes_it() {
     let Some(path) = fixture("tiny.mp4") else {

@@ -15,7 +15,7 @@
 # FFmpeg 9.0 release branch — matches the `ffmpeg-next 9.0.0` bindings.
 # (`master` builds expose enum variants newer than the crate knows about.)
 FFMPEG_DIR = { value = "C:/ffmpeg-dev/ffmpeg-n9.0-latest-win64-gpl-shared-9.0", force = false }
-LIBCLANG_PATH = { value = "C:/Users/Administrator/AppData/Local/Programs/Python/Python312/Lib/site-packages/clang/native", force = false }
+LIBCLANG_PATH = { value = "C:/Users/m/AppData/Local/Packages/PythonSoftwareFoundation.Python.3.12_qbz5n2kfra8p0/LocalCache/local-packages/Python312/site-packages/clang/native", force = false }
 # ffmpeg-sys-next's hwcontext shim predates a couple of CUDA handle types that
 # FFmpeg 9's `hwcontext_cuda.h` now exposes.  Supplying them as opaque clang
 # macros lets bindgen finish; we never touch CUDA ourselves.

@@ -7,7 +7,7 @@
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 use ffmpeg_next as ffmpeg;
@@ -47,6 +47,27 @@ const WORKER_POLL: Duration = Duration::from_millis(25);
 /// enough to absorb a slow repaint or a disk hiccup, and small enough that a
 /// seek or a rate change takes effect at once.
 const VIDEO_LEAD: f64 = 0.5;
+
+/// How long the decoder may be fed without producing a frame before the engine
+/// declares the file unplayable.
+///
+/// Long enough for the first keyframe of a slow 4K stream, short enough that a
+/// mis-detected container does not spin for minutes.
+const DECODE_STALL: Duration = Duration::from_secs(12);
+
+/// Packets that must have gone into the decoder before a lack of frames counts
+/// as a stall rather than as "still starting up".
+const STALL_MIN_PACKETS: u64 = 24;
+
+/// How far the picture waiting to be shown may fall behind the clock before the
+/// demuxer starts skipping packets instead of waiting for room.
+///
+/// The demuxer is the only source of *both* streams, so while it waits for room
+/// in the video channel it is not sending audio either. That wait is therefore
+/// bounded by how long the sound card's buffer can cover: a quarter of a second
+/// of lag is already enough to say the picture has fallen behind, and skipping
+/// is what gets the demuxer moving again.
+const RESYNC_LAG: f64 = 0.25;
 
 /// Slack added to a resampler output frame, in device-rate frames.
 ///
@@ -155,6 +176,15 @@ fn send_video(tx: &Sender<VideoMsg>, msg: VideoMsg, shared: &Shared) -> bool {
                     return false;
                 }
                 if video_is_behind(shared) {
+                    log::debug!(
+                        "demuxer: dropping a video packet — the queue is {:.2}s behind the clock",
+                        shared
+                            .video_queue
+                            .lock()
+                            .front_pts()
+                            .map(|pts| shared.clock.now() - pts)
+                            .unwrap_or(0.0)
+                    );
                     shared.dropped_frames.fetch_add(1, Ordering::Relaxed);
                     return false;
                 }
@@ -163,15 +193,22 @@ fn send_video(tx: &Sender<VideoMsg>, msg: VideoMsg, shared: &Shared) -> bool {
     }
 }
 
-/// `true` when the video still waiting to be shown is already late.
+/// `true` when the picture waiting to be shown is already late.
+///
+/// The demuxer is the only source of *both* streams, so it may not sit blocked
+/// on a full video channel: while it waits, no audio packet is sent either, and
+/// a sound card with nothing in front of it runs dry. Once the queue's *front*
+/// is behind the clock there is nothing left to lose by skipping — those frames
+/// are in the past, and showing them would only push the picture later still.
 ///
 /// A queue that is empty is never "behind": nothing has been decoded yet, so
-/// dropping the packet that would produce the next frame can only hurt.
+/// dropping the packet that would produce the next frame can only hurt. That is
+/// what makes this safe at the start of a file and right after a seek.
 fn video_is_behind(shared: &Shared) -> bool {
     let now = shared.clock.now();
     let queue = shared.video_queue.lock();
     match queue.front_pts() {
-        Some(front) => front < now - 0.25,
+        Some(front) => front < now - RESYNC_LAG,
         None => false,
     }
 }
@@ -198,6 +235,14 @@ fn demuxer_main(
     source: &MediaSource,
     config: &EngineConfig,
 ) -> crate::error::Result<()> {
+    // Refuse what cannot possibly be played before handing anything to FFmpeg.
+    // Opening stays asynchronous — the failure arrives as an `Error` event, just
+    // like a file FFmpeg itself rejects — but a disc image gets a sentence
+    // instead of a demuxer that reads garbage until the cows come home.
+    if let MediaSource::Path(path) = source {
+        crate::info::validate_input(path)?;
+    }
+
     let path_string = source.as_str();
     let kind = match source {
         MediaSource::Path(p) => crate::util::classify(p),
@@ -356,7 +401,21 @@ fn demuxer_main(
         }
 
         // -- seek ------------------------------------------------------------
-        if let Some(target) = shared.seek_request.lock().take() {
+        //
+        // The request is taken out of its slot in a *scoped block*. Reading
+        // naturally as `if let Some(target) = shared.seek_request.lock().take()`
+        // is an instant self-deadlock: an `if let` keeps the temporary guard for
+        // the whole body, and `seek_container` calls into FFmpeg, whose
+        // interrupt callback — installed on this very context — locks the same
+        // field. A container with an index never noticed, because its seek is an
+        // index lookup that reads nothing; an MPEG-TS seeks by binary search, so
+        // every packet it read called back into the demuxer thread that was
+        // holding the lock, and the picture froze for good.
+        let pending_seek = {
+            let mut request = shared.seek_request.lock();
+            request.take()
+        };
+        if let Some(target) = pending_seek {
             generation = shared.generation.fetch_add(1, Ordering::SeqCst) + 1;
             shared.video_queue.lock().clear();
             shared.clock.seek(target);
@@ -623,11 +682,34 @@ fn stream_start_offset<'a>(stream: &ffmpeg::Stream<'a>, time_base: f64) -> f64 {
 }
 
 /// Seek by time in seconds, letting FFmpeg snap back to the previous keyframe.
+///
+/// `seconds` is *playback* time, which starts at zero even when the container
+/// does not. Handing that offset-less number straight to the demuxer points it at
+/// a place in the file that does not correspond to the requested position, and
+/// because every frame it then produces is still before the seek target, the
+/// picture never comes back — a seek that kills playback for good.
 fn seek_container(
     ictx: &mut ffmpeg::format::context::Input,
     seconds: f64,
 ) -> crate::error::Result<()> {
-    let timestamp = (seconds.max(0.0) * f64::from(ffmpeg::ffi::AV_TIME_BASE)) as i64;
+    // `seconds` counts from the start of *playback*; the container's timeline may
+    // begin much later (a Blu-ray style transport stream starts at 4200s), so the
+    // demuxer has to be given the absolute timestamp.
+    // SAFETY: `ictx` owns a live AVFormatContext and `start_time` is a plain
+    // field of it, expressed in AV_TIME_BASE units.
+    let container_start = unsafe { (*ictx.as_ptr()).start_time };
+    let offset = if container_start > 0 && container_start != i64::MIN {
+        container_start as f64 / f64::from(ffmpeg::ffi::AV_TIME_BASE)
+    } else {
+        0.0
+    };
+
+    let timestamp = ((seconds.max(0.0) + offset) * f64::from(ffmpeg::ffi::AV_TIME_BASE)) as i64;
+    log::debug!(
+        "seek: playback {seconds:.3}s + container start {offset:.3}s -> ts {timestamp} \
+         ({:.3}s in the container)",
+        timestamp as f64 / f64::from(ffmpeg::ffi::AV_TIME_BASE)
+    );
     ictx.seek(timestamp, ..timestamp)?;
     // SAFETY: `ictx` owns a live AVFormatContext; avformat_flush only discards
     // the demuxer's internal read-ahead buffer.
@@ -686,6 +768,14 @@ fn run_video_decoder(
     let mut seek_target: Option<f64> = None;
     let mut last_pts = 0.0f64;
     let mut serial = 0u64;
+    // A stream that keeps feeding the decoder without ever producing a frame is
+    // not playing, it is spinning. A mis-detected container does exactly that —
+    // a disc image handed to the MPEG demuxer, say — and it does it forever
+    // while the log fills with decoder errors. Watch the counters rather than
+    // trusting the file to be what its extension claims.
+    let mut packets_fed = 0u64;
+    let mut watched_generation = generation;
+    let mut last_progress = Instant::now();
     let nominal_fps = shared
         .info
         .lock()
@@ -753,6 +843,16 @@ fn run_video_decoder(
             );
         }
 
+        // A flush moves the decoder to another part of the file: the frames for
+        // *that* part have not been decoded yet, so the stall clock starts over
+        // instead of counting the seek as a failure.
+        if generation != watched_generation {
+            watched_generation = generation;
+            packets_fed = 0;
+            last_progress = Instant::now();
+        }
+
+        let frames_before = shared.decoded_frames.load(Ordering::Relaxed);
         match msg {
             VideoMsg::Stop => {
                 break;
@@ -777,12 +877,20 @@ fn run_video_decoder(
             }
             VideoMsg::Packet(msg) => {
                 if msg.generation != generation {
+                    log::debug!(
+                        "video worker: skipping a packet from generation {} (at {})",
+                        msg.generation,
+                        generation
+                    );
                     continue;
                 }
+                log::debug!("video worker: packet at {:?}", msg.timestamp);
                 if decoder.send_packet(&msg.packet).is_err() {
                     // A corrupted packet is normal in the wild; keep going.
+                    log::debug!("video worker: the decoder refused a packet");
                     continue;
                 }
+                packets_fed += 1;
                 drain_video(
                     &shared,
                     &mut decoder,
@@ -799,6 +907,19 @@ fn run_video_decoder(
                     start_offset,
                 );
             }
+        }
+
+        if shared.decoded_frames.load(Ordering::Relaxed) > frames_before {
+            last_progress = Instant::now();
+        } else if packets_fed >= STALL_MIN_PACKETS && last_progress.elapsed() >= DECODE_STALL {
+            // Packets keep going in and nothing comes out: say so and stop,
+            // rather than spinning until the user gives up on the window.
+            report_error(
+                &shared,
+                "解码无输出：文件可能已损坏，或不是受支持的媒体格式".to_string(),
+            );
+            shared.abort.store(true, Ordering::SeqCst);
+            break;
         }
     }
     shared.pool.clear();
@@ -821,6 +942,11 @@ fn reset_video_session(
     *generation = request.generation;
     *seek_target = Some(request.target);
     *last_pts = request.target;
+    log::debug!(
+        "video worker: flush to {:.3}s (generation {})",
+        request.target,
+        request.generation
+    );
     decoder.flush();
     shared.video_queue.lock().clear();
 }
@@ -870,6 +996,10 @@ fn drain_video(
         };
         let pts = if pts.is_finite() { pts } else { *last_pts + fallback_step };
         *last_pts = pts;
+        log::debug!(
+            "video frame at {pts:.3}s (raw {:?}, time_base {time_base:.6}, offset {start_offset:.3}s)",
+            source.pts()
+        );
 
         let now = shared.clock.now();
         let paused = !shared.state().is_playing();
@@ -878,6 +1008,7 @@ fn drain_video(
         // on, not to the position the user asked for.
         if let Some(target) = *seek_target {
             if pts + 0.02 < target {
+                log::debug!("video frame at {pts:.3}s dropped: before the seek target {target:.3}s");
                 continue;
             }
         }
@@ -898,6 +1029,9 @@ fn drain_video(
             None => (source.width(), source.height()),
         };
 
+        // The preference can change while a file plays, so it is re-read for
+        // every frame; the converter only rebuilds its tables when it flips.
+        converter.set_tone_map(shared.hdr_tone_map.load(Ordering::Relaxed));
         let data = match converter.convert(source, width, height, &shared.pool) {
             Ok(data) => data,
             Err(err) => {
