@@ -5,33 +5,56 @@
 //! an icon, and it documents the keyboard shortcut next to each action.
 
 use egui::containers::menu::{MenuBar, MenuButton};
-use egui::{Align, Context, Layout, RichText, Ui};
+use egui::{Align, Context, Layout, Pos2, Rect, RichText, Ui};
 
 use crate::app::PlayerApp;
 use crate::settings::{AspectMode, EndAction, Settings, SidebarTab};
 use crate::state::{Overlay, Toast};
 use crate::theme::{font, space, Tokens};
+use crate::ui::glass;
 
 /// Render the menu bar.
 pub fn draw(app: &mut PlayerApp, ctx: &Context) {
     let tokens = app.theme.tokens.clone();
-    let frame = egui::Frame::new()
-        .fill(tokens.panel)
-        .inner_margin(egui::Margin::symmetric(space::SM as i8, 2))
-        .stroke(egui::Stroke::new(1.0_f32, tokens.border));
+    // Liquid Glass, cut on the bottom edge: the menu bar is flush with the window
+    // frame, so only the edge that faces the picture catches the light.
+    let margin = egui::Margin::symmetric(space::SM as i8, 2);
+    let material = glass::Glass::chrome(glass::Rim::BOTTOM);
+    let frame = glass::chrome_shell(margin);
 
     egui::TopBottomPanel::top("mvp_menu_bar")
         .frame(frame)
         .exact_height(32.0)
         .show(ctx, |ui| {
+            glass::paint_ui(ui, &tokens, glass::surface_rect(ui, margin), material);
+            // Reserved *before* the titles are drawn, so that filling it in
+            // afterwards puts the highlight behind them: a shape slot can be
+            // replaced later, and shapes keep the order they were added in.
+            let pill = ui.painter().add(egui::Shape::Noop);
+            let bar = ui.max_rect();
+            let mut titles: Vec<Rect> = Vec::new();
+
             MenuBar::new().ui(ui, |ui| {
-                file_menu(app, ui, &tokens);
-                playback_menu(app, ui, &tokens);
-                video_menu(app, ui, &tokens);
-                audio_menu(app, ui, &tokens);
-                subtitle_menu(app, ui, &tokens);
-                tools_menu(app, ui, &tokens);
-                help_menu(app, ui, &tokens);
+                // Each title's span, for the pill to aim at. Measuring the cursor
+                // before and after one title is what lets the seven menu
+                // functions stay exactly as they are.
+                let mut slot = |ui: &mut Ui, add: &mut dyn FnMut(&mut Ui)| {
+                    let before = ui.cursor().min.x;
+                    add(ui);
+                    let width =
+                        (ui.cursor().min.x - before - ui.spacing().item_spacing.x).max(0.0);
+                    titles.push(Rect::from_min_size(
+                        egui::pos2(before, bar.top()),
+                        egui::vec2(width, bar.height()),
+                    ));
+                };
+                slot(ui, &mut |ui| file_menu(app, ui, &tokens));
+                slot(ui, &mut |ui| playback_menu(app, ui, &tokens));
+                slot(ui, &mut |ui| video_menu(app, ui, &tokens));
+                slot(ui, &mut |ui| audio_menu(app, ui, &tokens));
+                slot(ui, &mut |ui| subtitle_menu(app, ui, &tokens));
+                slot(ui, &mut |ui| tools_menu(app, ui, &tokens));
+                slot(ui, &mut |ui| help_menu(app, ui, &tokens));
 
                 // Right-aligned status: the current file and playback state.
                 //
@@ -66,7 +89,141 @@ pub fn draw(app: &mut PlayerApp, ctx: &Context) {
                     });
                 }
             });
+
+            paint_highlight(ui, &tokens, pill, &titles);
         });
+}
+
+/// What the menu highlight remembers between frames.
+///
+/// Kept in `egui`'s own per-id temporary store rather than in the player's state:
+/// it is presentation, it belongs to the menu bar, and the player's state is for
+/// things that outlive a frame — and a restart.
+#[derive(Debug, Clone, Copy, Default)]
+struct Highlight {
+    /// The title the pill is heading for, and the shape it settles into.
+    target: Option<Rect>,
+    /// The animated left edge as of the previous frame, for measuring speed.
+    x: f32,
+    /// When that measurement was taken.
+    time: f64,
+    /// Which title's menu is open, if any.
+    open: Option<usize>,
+}
+
+/// One pill of glass that slides between the menu titles.
+///
+/// Three details are what make a highlight feel alive rather than merely animated:
+///
+/// * it is a **single** object, so a change of selection reads as one pill moving
+///   along the bar instead of two labels fading on and off — the same idea as the
+///   segmented control, travelling in a straight line;
+/// * it is **stretched along the direction of travel** while it moves and settles
+///   back on arrival, the way a drop of liquid bulges when it is pushed;
+/// * it **stays lit on the title whose menu is open**, even once the pointer has
+///   travelled down into that menu — what a macOS title bar does, and the reason
+///   the open title is tracked here instead of being read back out of a button.
+fn paint_highlight(ui: &Ui, tokens: &Tokens, at: egui::layers::ShapeIdx, titles: &[Rect]) {
+    if titles.is_empty() {
+        return;
+    }
+    let id = ui.id().with("mvp_menu_highlight");
+    let now = ui.input(|i| i.time);
+    let pointer = ui.ctx().pointer_hover_pos();
+    let hovered = pointer.and_then(|pos| titles.iter().position(|rect| rect.contains(pos)));
+
+    let mut state = ui.ctx().data_mut(|d| *d.get_temp_mut_or_default::<Highlight>(id));
+    let dt = (now - state.time).clamp(1.0 / 240.0, 0.1) as f32;
+    state.time = now;
+
+    // Which menu is open, tracked from the click: a bar needs to know this to keep
+    // the pill lit while the pointer is inside the menu, and no single button can
+    // answer it.
+    if ui.input(|i| i.pointer.primary_clicked()) {
+        state.open = match (state.open, hovered) {
+            // Clicking the open title closes it again…
+            (Some(open), Some(index)) if open == index => None,
+            // …clicking another title switches to it…
+            (_, Some(index)) => Some(index),
+            // …and a click anywhere else — inside a menu, or on the picture —
+            // dismisses whatever was open.
+            (_, None) => None,
+        };
+    }
+    if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        state.open = None;
+    }
+
+    // The pointer leads, the open menu holds: on the bar the pointer previews the
+    // title under it, and once it leaves, the pill returns to the menu still open.
+    let selected = highlight_target(hovered, state.open);
+    if let Some(rect) = selected.and_then(|index| titles.get(index)).copied() {
+        state.target = Some(rect);
+    }
+    let Some(target) = state.target else {
+        ui.ctx().data_mut(|d| d.insert_temp(id, state));
+        return;
+    };
+
+    let left = ui
+        .ctx()
+        .animate_value_with_time(id.with("left"), target.left(), 0.18);
+    let right = ui
+        .ctx()
+        .animate_value_with_time(id.with("right"), target.right(), 0.18);
+    let lit = ui.ctx().animate_bool_with_time_and_easing(
+        id.with("lit"),
+        selected.is_some(),
+        0.15,
+        egui::emath::easing::cubic_out,
+    );
+    // How fast the pill is travelling, in points per second: the stretch is what a
+    // liquid does when it is pushed sideways, and the squeeze across the direction
+    // of travel is what keeps its area looking constant.
+    let velocity = (left - state.x) / dt;
+    state.x = left;
+    ui.ctx().data_mut(|d| d.insert_temp(id, state));
+    if lit <= 0.01 {
+        return;
+    }
+
+    let (stretch, squeeze) = deformation_of(velocity);
+    /// Air between the pill and the edges of the bar.
+    const INSET: f32 = 3.0;
+    let pill = Rect::from_min_max(
+        Pos2::new(left - stretch, target.top() + INSET + squeeze),
+        Pos2::new(right + stretch, target.bottom() - INSET - squeeze),
+    );
+    // Held down: the material compresses a little further, as if pressed.
+    let press = ui.input(|i| i.pointer.primary_down());
+    let opacity = (lit * if press { 1.25 } else { 1.0 }).min(1.0);
+    glass::paint_behind(
+        ui,
+        at,
+        tokens,
+        pill,
+        glass::Glass::capsule(pill.height()),
+        None,
+        true,
+        opacity,
+    );
+}
+
+/// Which title the highlight belongs to: the one under the pointer, or else the
+/// one whose menu is open.
+fn highlight_target(hovered: Option<usize>, open: Option<usize>) -> Option<usize> {
+    hovered.or(open)
+}
+
+/// How much a moving pill stretches along its travel, and how much it is squeezed
+/// across it.
+///
+/// `(stretch, squeeze)`, both in points. Kept as a function of speed alone so the
+/// deformation can be reasoned about — and tested — without a painter. The stretch
+/// saturates: a fast flick of the pointer must not turn the pill into a rod.
+fn deformation_of(velocity: f32) -> (f32, f32) {
+    let stretch = (velocity.abs() * 0.010).min(6.0);
+    (stretch, (stretch * 0.14).min(1.2))
 }
 
 fn file_menu(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
@@ -705,5 +862,47 @@ mod tests {
     fn truncate_counts_characters_not_bytes() {
         let text = truncate("中文文件名测试", 4);
         assert_eq!(text.chars().count(), 4);
+    }
+
+    /// Standing still, the pill is exactly its title's box: it keeps the air the
+    /// bar reserves around every title and nothing else. A highlight that breathes
+    /// on its own is a highlight that looks misaligned.
+    #[test]
+    fn a_still_pill_is_not_deformed() {
+        let (stretch, squeeze) = deformation_of(0.0);
+        assert!(stretch.abs() < f32::EPSILON);
+        assert!(squeeze.abs() < f32::EPSILON);
+    }
+
+    /// A moving pill is stretched along its travel and squeezed across it — that is
+    /// the whole "liquid" part — and both saturate, so a fast flick of the pointer
+    /// cannot turn the highlight into a rod.
+    #[test]
+    fn a_moving_pill_stretches_along_its_travel_and_squeezes_across_it() {
+        let (slow, slow_squeeze) = deformation_of(60.0);
+        let (fast, fast_squeeze) = deformation_of(600.0);
+        assert!(slow > 0.0, "a moving pill must deform at all");
+        assert!(fast > slow, "a faster pill stretches further");
+        assert!(
+            slow_squeeze < slow,
+            "the squeeze across the travel stays smaller than the stretch"
+        );
+        assert!(deformation_of(100_000.0).0 <= 6.0, "the stretch is capped");
+        assert!(deformation_of(100_000.0).1 <= 1.2, "so is the squeeze");
+        // Symmetrical: travelling left deforms exactly as travelling right does.
+        let (left, left_squeeze) = deformation_of(-600.0);
+        assert!((left - fast).abs() < f32::EPSILON);
+        assert!((left_squeeze - fast_squeeze).abs() < f32::EPSILON);
+    }
+
+    /// The pointer leads and the open menu holds: the pill previews whatever the
+    /// pointer is on, and falls back to the menu that is still open once the
+    /// pointer has travelled down into it.
+    #[test]
+    fn the_pointer_leads_and_the_open_menu_holds() {
+        assert_eq!(highlight_target(Some(3), Some(1)), Some(3));
+        assert_eq!(highlight_target(None, Some(1)), Some(1));
+        assert_eq!(highlight_target(Some(0), None), Some(0));
+        assert_eq!(highlight_target(None, None), None);
     }
 }

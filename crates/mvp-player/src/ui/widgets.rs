@@ -17,24 +17,28 @@ use crate::state::Toast;
 use crate::theme::{self, font, radius, space, Tokens};
 
 /// A block-level heading with a hairline underneath.
+///
+/// The heading uses the bold cut of the system font and the hairline uses the
+/// *separator* colour rather than the border colour: the heading and the rows it
+/// introduces live on one surface, and a surface border there would read as the
+/// edge of a panel that is not there.
 pub fn section(ui: &mut Ui, tokens: &Tokens, title: &str) {
-    ui.add_space(space::LG);
+    ui.add_space(space::XL);
     ui.label(
         RichText::new(title)
-            .size(font::H3)
-            .strong()
+            .font(crate::theme::strong_font(font::H3))
             .color(tokens.text),
     );
+    ui.add_space(space::XS);
     let rect = ui.available_rect_before_wrap();
-    let y = rect.top() + 3.0;
     ui.painter().line_segment(
         [
-            egui::pos2(rect.left(), y),
-            egui::pos2(rect.right(), y),
+            egui::pos2(rect.left(), rect.top()),
+            egui::pos2(rect.right(), rect.top()),
         ],
-        Stroke::new(1.0_f32, tokens.border),
+        Stroke::new(1.0_f32, tokens.separator),
     );
-    ui.add_space(space::MD);
+    ui.add_space(space::SM);
 }
 
 /// One settings row: a label on the left, a control pinned to the right edge,
@@ -105,7 +109,7 @@ pub fn row(
         .inner;
 
     if !hint.is_empty() {
-        ui.add_space(2.0);
+        ui.add_space(space::XXS);
         ui.label(
             RichText::new(hint)
                 .size(font::TINY)
@@ -150,51 +154,148 @@ pub fn key_value(ui: &mut Ui, tokens: &Tokens, label: &str, value: &str) {
     });
 }
 
-/// A horizontal tab strip with an animated underline.
+/// A segmented control: the macOS way to choose one of a few options.
+///
+/// Apple draws exactly one of these — a row of labels inside a rounded trough
+/// with the current one on a raised pill — so the tab strip below is this
+/// control under a name that says what it is used *for*.
+///
+/// Returns the index that was clicked. `id_source` keys the animation, so two
+/// controls on one page never share a pill.
+pub fn segmented(
+    ui: &mut Ui,
+    tokens: &Tokens,
+    id_source: &str,
+    items: &[&str],
+    active: usize,
+) -> Option<usize> {
+    /// Height of the trough. 26 pt keeps a 12 pt label clear of the edges at
+    /// every scaling factor the player supports.
+    const HEIGHT: f32 = 26.0;
+    /// Space between the trough and the pill sliding inside it.
+    const INSET: f32 = 2.0;
+    /// Padding on each side of a label.
+    const PAD: f32 = space::LG;
+
+    if items.is_empty() {
+        return None;
+    }
+
+    let galleys: Vec<_> = items
+        .iter()
+        .map(|label| {
+            ui.painter().layout_no_wrap(
+                (*label).to_owned(),
+                FontId::proportional(font::SMALL),
+                tokens.text,
+            )
+        })
+        .collect();
+    // Every segment is as wide as its own label plus the same padding, so the
+    // pill does not change shape as the selection moves along the row.
+    let natural: Vec<f32> = galleys.iter().map(|g| g.size().x + PAD).collect();
+    let total: f32 = natural.iter().sum();
+
+    // Narrow sidebars are the normal case, not the exception: rather than let the
+    // control hang off the edge of the panel, the segments give way together.
+    let available = (ui.available_width() - INSET * 2.0).max(0.0);
+    let scale = if total > available && total > 0.0 {
+        available / total
+    } else {
+        1.0
+    };
+    let widths: Vec<f32> = natural.iter().map(|w| w * scale).collect();
+    let width: f32 = widths.iter().sum();
+
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(width + INSET * 2.0, HEIGHT), Sense::click());
+    let track = rect.shrink(INSET);
+    ui.painter()
+        .rect_filled(rect, CornerRadius::same(radius::MD as u8), tokens.sunken);
+
+    let mut clicked = None;
+    let mut x = track.left();
+    for (index, galley) in galleys.iter().enumerate() {
+        let segment = Rect::from_min_size(
+            egui::pos2(x, track.top()),
+            Vec2::new(widths[index], track.height()),
+        );
+        let selected = index == active;
+        let hovered = response
+            .hover_pos()
+            .is_some_and(|pointer| segment.contains(pointer));
+        let settle = ui.ctx().animate_bool_with_time(
+            ui.id().with((id_source, index, "segment")),
+            selected,
+            SETTLE,
+        );
+        if settle > 0.0 {
+            // The pill fades in on the segment that was chosen and out on the one
+            // that was left, so the selection reads as one object moving.
+            ui.painter().rect_filled(
+                segment,
+                CornerRadius::same(radius::SM as u8),
+                tokens.active.gamma_multiply(settle),
+            );
+            ui.painter().rect_stroke(
+                segment,
+                CornerRadius::same(radius::SM as u8),
+                Stroke::new(
+                    1.0_f32,
+                    tokens.border_strong.gamma_multiply(settle),
+                ),
+                StrokeKind::Inside,
+            );
+        } else if hovered {
+            ui.painter().rect_filled(
+                segment,
+                CornerRadius::same(radius::SM as u8),
+                tokens.hover,
+            );
+        }
+        ui.painter().galley(
+            egui::pos2(
+                segment.center().x - galley.size().x / 2.0,
+                segment.center().y - galley.size().y / 2.0,
+            ),
+            galley.clone(),
+            if selected || hovered {
+                tokens.text
+            } else {
+                tokens.text_weak
+            },
+        );
+        if hovered {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            if response.clicked() {
+                clicked = Some(index);
+            }
+        }
+        x += widths[index];
+    }
+
+    // Announced as the current choice rather than as a row of unrelated labels.
+    let current = items.get(active).copied().unwrap_or_default();
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, current)
+    });
+    clicked
+}
+
+/// A row of tabs, drawn as a segmented control.
+///
+/// Kept as a name of its own so a call site can say what the tabs are for; the
+/// control itself is `segmented`. Returns the index that was clicked.
 pub fn tab_strip(
     ui: &mut Ui,
     tokens: &Tokens,
     tabs: &[&str],
     active: usize,
 ) -> Option<usize> {
-    let mut clicked = None;
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = space::XS;
-        for (index, label) in tabs.iter().enumerate() {
-            let selected = index == active;
-            let galley = ui.painter().layout_no_wrap(
-                (*label).to_owned(),
-                FontId::proportional(font::BODY),
-                if selected { tokens.text } else { tokens.text_weak },
-            );
-            let size = Vec2::new(galley.size().x + space::MD * 2.0, 30.0);
-            let (rect, response) = ui.allocate_exact_size(size, Sense::click());
-            if response.hovered() && !selected {
-                ui.painter()
-                    .rect_filled(rect, CornerRadius::same(radius::SM as u8), tokens.hover);
-            }
-            ui.painter().galley(
-                rect.center() - galley.size() / 2.0,
-                galley,
-                if selected { tokens.text } else { tokens.text_weak },
-            );
-            if selected {
-                let underline = Rect::from_min_max(
-                    egui::pos2(rect.left() + space::SM, rect.bottom() - 2.0),
-                    egui::pos2(rect.right() - space::SM, rect.bottom()),
-                );
-                ui.painter()
-                    .rect_filled(underline, CornerRadius::same(1), tokens.accent);
-            }
-            if response.clicked() {
-                clicked = Some(index);
-            }
-            if response.hovered() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            }
-        }
-    });
-    clicked
+    // Keyed by the first label: stable for the life of the control, and
+    // different for every group of tabs in the window.
+    let key = tabs.first().copied().unwrap_or("tabs");
+    segmented(ui, tokens, key, tabs, active)
 }
 
 /// An icon button styled for toolbars.
@@ -266,36 +367,155 @@ pub fn switch_row(ui: &mut Ui, tokens: &Tokens, label: &str, value: &mut bool, h
 }
 
 /// A pill-shaped on/off switch.
+///
+/// The knob is white and it *travels*: the position is what carries the state,
+/// so a switch that jumped would throw away the only thing it has to say.
 pub fn switch(ui: &mut Ui, tokens: &Tokens, value: &mut bool) -> Response {
-    let size = Vec2::new(38.0, 20.0);
-    let (rect, mut response) = ui.allocate_exact_size(size, Sense::click());
-    if response.clicked() {
+    /// Track size. Apple's control is 51x31 at its largest; this is the compact
+    /// one, which is what fits a 26 pt settings row.
+    const TRACK: Vec2 = Vec2::new(38.0, 22.0);
+    /// Knob diameter.
+    const KNOB: f32 = 18.0;
+    /// Gap between the knob and the edge of the track.
+    const INSET: f32 = 2.0;
+
+    let (rect, mut response) = ui.allocate_exact_size(TRACK, Sense::click());
+    // Keyboard: Space and Enter toggle, like every other checkbox in the system.
+    let keyboard = response.has_focus()
+        && ui.input(|i| i.key_pressed(egui::Key::Space) || i.key_pressed(egui::Key::Enter));
+    if response.clicked() || keyboard {
         *value = !*value;
         response.mark_changed();
     }
-    let radius = size.y / 2.0;
-    let on = *value;
-    let track = if on {
-        tokens.accent
-    } else {
-        tokens.track
-    };
-    ui.painter()
-        .rect_filled(rect, CornerRadius::same(radius as u8), track);
-    let knob_x = if on {
-        rect.right() - radius
-    } else {
-        rect.left() + radius
-    };
-    ui.painter().circle_filled(
-        egui::pos2(knob_x, rect.center().y),
-        radius - 2.0,
-        if on { tokens.on_accent } else { tokens.text_weak },
+
+    let settle = ui
+        .ctx()
+        .animate_bool_with_time(ui.id().with("switch"), *value, SETTLE);
+    ui.painter().rect_filled(
+        rect,
+        CornerRadius::same((TRACK.y / 2.0) as u8),
+        blend(tokens.track, tokens.accent, settle),
     );
+
+    // The travel of the knob is the animated value, not the new one — that is
+    // the whole difference between a switch and a checkbox.
+    let center = egui::pos2(
+        egui::lerp(
+            (rect.left() + KNOB / 2.0 + INSET)..=(rect.right() - KNOB / 2.0 - INSET),
+            settle,
+        ),
+        rect.center().y,
+    );
+    ui.painter().circle_filled(center, KNOB / 2.0, tokens.on_accent);
+    ui.painter().circle_stroke(
+        center,
+        KNOB / 2.0,
+        Stroke::new(1.0_f32, tokens.border_strong),
+    );
+
+    paint_focus(ui, &response, rect, tokens);
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
+    let selected = *value;
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, selected, "")
+    });
     response
+}
+
+/// A slider drawn the way the system draws one: a thin track that thickens under
+/// the pointer, a small white knob, and no numbers on the track itself.
+///
+/// Returns `Some(value)` only while the value is being changed, so a caller can
+/// tell a real edit from a redraw — the contract `egui::Slider` used to provide.
+/// Keyboard: with focus, the arrow keys nudge by one percent of the range.
+pub fn slider(
+    ui: &mut Ui,
+    tokens: &Tokens,
+    id_source: &str,
+    value: f32,
+    range: std::ops::RangeInclusive<f32>,
+    width: f32,
+) -> Option<f32> {
+    /// Interaction height — far taller than the track, because a 3 pt line is
+    /// not something anyone can hit.
+    const HEIGHT: f32 = 24.0;
+    /// Track thickness at rest, and under the pointer.
+    const TRACK: f32 = 3.0;
+    const TRACK_ACTIVE: f32 = 5.0;
+    /// Knob radius at rest, and under the pointer.
+    const KNOB: f32 = 6.0;
+    const KNOB_ACTIVE: f32 = 8.0;
+
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(width, HEIGHT), Sense::click_and_drag());
+    let (start, end) = (*range.start(), *range.end());
+    let span = (end - start).max(f32::MIN_POSITIVE);
+
+    // The track stops one knob-radius short of each end, so the knob at 0 % and
+    // at 100 % still sits *inside* the control rather than half outside it.
+    let track = Rect::from_min_max(
+        egui::pos2(rect.left() + KNOB_ACTIVE, rect.center().y),
+        egui::pos2(rect.right() - KNOB_ACTIVE, rect.center().y),
+    );
+
+    let current = value;
+    let mut next = value;
+    if response.dragged() || response.clicked() {
+        if let Some(pointer) = response.interact_pointer_pos() {
+            let fraction = pointer_fraction(&track, pointer) as f32;
+            next = start + fraction * span;
+        }
+    } else if response.has_focus() {
+        let step = ui.input(|i| {
+            let up = i.key_pressed(egui::Key::ArrowRight) || i.key_pressed(egui::Key::ArrowUp);
+            let down = i.key_pressed(egui::Key::ArrowLeft) || i.key_pressed(egui::Key::ArrowDown);
+            (up as i32 - down as i32) as f32
+        });
+        if step != 0.0 {
+            next = (next + step * span * 0.01).clamp(start, end);
+        }
+    }
+    let next = next.clamp(start, end);
+
+    let grow = ui.ctx().animate_bool_with_time(
+        ui.id().with((id_source, "slider")),
+        response.hovered() || response.dragged(),
+        SETTLE,
+    );
+    let thickness = TRACK + (TRACK_ACTIVE - TRACK) * grow;
+    let knob = KNOB + (KNOB_ACTIVE - KNOB) * grow;
+    let radius = CornerRadius::same((thickness / 2.0) as u8);
+    let bar = Rect::from_center_size(track.center(), Vec2::new(track.width(), thickness));
+    let fraction = ((next - start) / span).clamp(0.0, 1.0);
+
+    ui.painter().rect_filled(bar, radius, tokens.track);
+    if fraction > 0.0 {
+        ui.painter().rect_filled(
+            Rect::from_min_size(bar.min, Vec2::new(bar.width() * fraction, thickness)),
+            radius,
+            tokens.accent,
+        );
+    }
+    let knob_center = egui::pos2(bar.left() + bar.width() * fraction, bar.center().y);
+    ui.painter().circle_filled(knob_center, knob, tokens.on_accent);
+    ui.painter()
+        .circle_stroke(knob_center, knob, Stroke::new(1.0_f32, tokens.border_strong));
+    paint_focus(ui, &response, rect, tokens);
+
+    if response.hovered() || response.dragged() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response.widget_info(|| egui::WidgetInfo::slider(true, f64::from(next), ""));
+
+    // Reported only when the value actually moved: a caller that persists on
+    // every frame would otherwise write the settings file sixty times a second.
+    if (next - current).abs() > f32::EPSILON {
+        Some(next)
+    } else {
+        None
+    }
 }
 
 /// A slider row for the settings window, with a value readout.
@@ -330,9 +550,13 @@ pub fn slider_row(
                 );
             },
         );
-        ui.spacing_mut().slider_width = SLIDER;
-        ui.add(egui::Slider::new(value, range).show_value(false))
-            .changed()
+        match slider(ui, tokens, label, *value, range, SLIDER) {
+            Some(new) => {
+                *value = new;
+                true
+            }
+            None => false,
+        }
     })
 }
 
@@ -482,41 +706,16 @@ pub struct SeekBarOutput {
     pub response: Response,
 }
 
-/// A compact volume slider that reads as part of the transport bar.
+/// The transport bar's volume slider: the same control, at toolbar size.
+///
+/// Shares the implementation rather than imitating it — a volume slider that
+/// behaved differently from the sliders in the settings sheet is exactly the
+/// kind of detail that makes one window feel like two products.
 pub fn volume_slider(ui: &mut Ui, tokens: &Tokens, value: f32) -> Option<f32> {
-    let width = 90.0;
-    let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(width, 22.0), Sense::click_and_drag());
-    let track = Rect::from_center_size(rect.center(), Vec2::new(width, 4.0));
-    let radius = CornerRadius::same(2);
-    ui.painter().rect_filled(track, radius, tokens.track);
-    let fraction = (value / 2.0).clamp(0.0, 1.0);
-    let filled = Rect::from_min_size(
-        track.min,
-        Vec2::new(track.width() * fraction, track.height()),
-    );
-    ui.painter().rect_filled(filled, radius, tokens.accent);
-
-    let x = track.left() + track.width() * fraction;
-    let knob = if response.hovered() || response.dragged() {
-        6.0
-    } else {
-        4.5
-    };
-    ui.painter()
-        .circle_filled(egui::pos2(x, track.center().y), knob, tokens.on_accent);
-
-    let mut result = None;
-    if response.dragged() || response.clicked() {
-        if let Some(pointer) = response.interact_pointer_pos() {
-            let f = ((pointer.x - track.left()) / track.width()).clamp(0.0, 1.0);
-            result = Some(f * 2.0);
-        }
-    }
-    if response.hovered() || response.dragged() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    result
+    /// Width of the control in the transport bar.
+    const WIDTH: f32 = 90.0;
+    // The setting runs 0–200 %, which is what the audio path accepts.
+    slider(ui, tokens, "volume", value, 0.0..=2.0, WIDTH)
 }
 
 /// Draw the transient message near the top of the window.
@@ -543,23 +742,29 @@ pub fn draw_toast(app: &PlayerApp, ctx: &Context, toast: &Toast) {
         size,
     );
 
-    let painter = ctx.layer_painter(egui::LayerId::new(
+    let mut painter = ctx.layer_painter(egui::LayerId::new(
         egui::Order::Foreground,
         egui::Id::new("mvp_toast"),
     ));
+    // The HUD is a capsule of glass over the picture. It fades as a whole — the
+    // material is translucent already, so scaling its opacity is enough to keep
+    // the frame behind it visible while the message leaves.
+    painter.multiply_opacity(opacity);
+    let radius = size.y / 2.0;
+    crate::ui::glass::paint(
+        &painter,
+        tokens,
+        rect,
+        crate::ui::glass::Glass::float(radius),
+        ctx.pointer_hover_pos(),
+        true,
+    );
+    // The state colour stays a wash *on* the glass, so a warning still reads as a
+    // warning without turning the capsule into a coloured slab.
     painter.rect_filled(
         rect,
-        CornerRadius::same(radius::LG as u8),
-        tokens
-            .elevated
-            .gamma_multiply(opacity)
-            .linear_multiply(1.0),
-    );
-    painter.rect_stroke(
-        rect,
-        CornerRadius::same(radius::LG as u8),
-        Stroke::new(1.0_f32, color.gamma_multiply(opacity * 0.6)),
-        StrokeKind::Inside,
+        CornerRadius::same(radius as u8),
+        color.gamma_multiply(0.22),
     );
     if let Some(icon) = toast.icon {
         let icon_rect = Rect::from_center_size(
@@ -610,6 +815,237 @@ pub fn empty_hint(ui: &mut Ui, tokens: &Tokens, text: &str) {
                 .color(tokens.text_muted),
         );
     });
+}
+
+// ---------------------------------------------------------------------------
+// Controls in the system style
+// ---------------------------------------------------------------------------
+//
+// Everything below is painted rather than configured, for one reason: a system
+// control is defined by its *states* — rest, hover, pressed, focused, disabled —
+// and `egui`'s stock widgets only expose a subset of them. Painting the five
+// states in one place is what keeps a button, a switch and a slider feeling like
+// they came out of the same box.
+
+/// How long a control takes to settle from one state to the next.
+const SETTLE: f32 = 0.14;
+
+/// Mix two colours, `t` of the way from `a` to `b`.
+///
+/// `Color32` stores *premultiplied* channels, so they are mixed as they are: taking
+/// the alpha out first would reintroduce colour the alpha has already taken away,
+/// and the blend of two translucent colours would come out brighter than either of
+/// them.
+fn blend(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Color32::from_rgba_premultiplied(
+        mix(a.r(), b.r()),
+        mix(a.g(), b.g()),
+        mix(a.b(), b.b()),
+        mix(a.a(), b.a()),
+    )
+}
+
+/// Draw the keyboard-focus ring around `rect`, when `response` holds focus.
+///
+/// A ring rather than a colour change: a control that is already accent-filled
+/// has no colour left to spend on "you are here".
+fn paint_focus(ui: &Ui, response: &Response, rect: Rect, tokens: &Tokens) {
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            rect.expand(2.0),
+            CornerRadius::same(radius::MD as u8 + 2),
+            Stroke::new(1.0_f32, tokens.focus_ring),
+            StrokeKind::Outside,
+        );
+    }
+}
+
+/// Which of the two button roles a control is playing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ButtonKind {
+    /// The accent-filled button: the one action a screen is *for*.
+    Primary,
+    /// Everything else: grey, translucent, quiet.
+    Secondary,
+}
+
+/// A button with the five system states, returning `true` when activated.
+///
+/// Returns a `bool` rather than an `egui::Response` because the interesting
+/// question at every call site is "was this pressed" — and because activation by
+/// keyboard (Enter or Space, like every other control in the interface) has to be
+/// folded into the same answer, which a copied `Response` cannot express.
+pub fn pill_button(
+    ui: &mut Ui,
+    tokens: &Tokens,
+    id_source: &str,
+    label: &str,
+    kind: ButtonKind,
+    min_width: f32,
+    enabled: bool,
+) -> bool {
+    /// Height of a regular button. 30 pt clears the 26 pt interaction minimum
+    /// with room for a 13 pt label inside it.
+    const HEIGHT: f32 = 30.0;
+
+    let galley = ui.painter().layout_no_wrap(
+        label.to_owned(),
+        FontId::proportional(font::BODY),
+        tokens.text,
+    );
+    let width = (galley.size().x + space::LG * 2.0).max(min_width);
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, HEIGHT), Sense::click());
+
+    let id = ui.id().with((id_source, "pill"));
+    let hover = ui
+        .ctx()
+        .animate_bool_with_time(id, response.hovered() && enabled, SETTLE);
+    let press = ui.ctx().animate_bool_with_time(
+        id.with("press"),
+        response.is_pointer_button_down_on() && enabled,
+        0.05,
+    );
+    // Liquid feedback: the material compresses under the finger. It is the one
+    // piece of motion Liquid Glass adds to a control, and it is what makes a press
+    // feel like touching a surface rather than toggling a boolean.
+    let rect = rect.shrink(press * 1.5);
+
+    let (fill, text, glassy) = match kind {
+        ButtonKind::Primary => (
+            blend(
+                blend(tokens.accent, tokens.accent_hover, hover),
+                tokens.accent_pressed,
+                press,
+            ),
+            tokens.on_accent,
+            false,
+        ),
+        ButtonKind::Secondary => (
+            blend(tokens.hover, tokens.active, hover.max(press)),
+            tokens.text,
+            true,
+        ),
+    };
+    let fill = if enabled {
+        fill
+    } else {
+        fill.gamma_multiply(0.5)
+    };
+    let text = if enabled { text } else { tokens.text_muted };
+
+    let painter = ui.painter();
+    if glassy {
+        // The quiet button is a capsule of *glass*, not a grey rectangle: the
+        // material is the shape, and the tint under the pointer is that material
+        // catching light.
+        crate::ui::glass::paint(
+            painter,
+            tokens,
+            rect,
+            crate::ui::glass::Glass::capsule(rect.height()).interactive(false),
+            None,
+            true,
+        );
+        if enabled && hover.max(press) > 0.0 {
+            painter.rect_filled(
+                rect,
+                CornerRadius::same((rect.height() / 2.0) as u8),
+                blend(Color32::TRANSPARENT, tokens.active, hover.max(press)),
+            );
+        }
+    } else {
+        painter.rect_filled(rect, CornerRadius::same(radius::MD as u8), fill);
+    }
+    painter.galley(rect.center() - galley.size() / 2.0, galley, text);
+
+    paint_focus(ui, &response, rect, tokens);
+    if enabled {
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, true, label)
+        });
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+    }
+
+    enabled
+        && (response.clicked()
+            || (response.has_focus()
+                && ui.input(|i| i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::Space))))
+}
+
+/// The accent-filled button. One per screen, at most.
+pub fn primary_button(ui: &mut Ui, tokens: &Tokens, label: &str, min_width: f32) -> bool {
+    pill_button(ui, tokens, label, label, ButtonKind::Primary, min_width, true)
+}
+
+/// The quiet button: cancels, "open folder…", anything secondary.
+pub fn secondary_button(ui: &mut Ui, tokens: &Tokens, label: &str, min_width: f32) -> bool {
+    pill_button(
+        ui,
+        tokens,
+        label,
+        label,
+        ButtonKind::Secondary,
+        min_width,
+        true,
+    )
+}
+
+/// A ring spinner, for work that has no progress to report.
+///
+/// `phase` is the time in seconds since start-up (`ui.input(|i| i.time)`): the
+/// gap in the ring is what makes the motion readable, and a spinner that does not
+/// move is indistinguishable from a hang.
+pub fn spinner(ui: &Ui, tokens: &Tokens, center: egui::Pos2, diameter: f32, phase: f64) {
+    /// How much of the circle the moving arc covers.
+    const SWEEP: f32 = std::f32::consts::FRAC_PI_2;
+
+    let radius = (diameter / 2.0).max(2.0);
+    ui.painter()
+        .circle_stroke(center, radius, Stroke::new(2.0_f32, tokens.track));
+
+    const SEGMENTS: usize = 24;
+    let start = (phase * 2.5) as f32 % std::f32::consts::TAU;
+    let points: Vec<egui::Pos2> = (0..=SEGMENTS)
+        .map(|step| {
+            let t = step as f32 / SEGMENTS as f32;
+            let angle = start + t * SWEEP;
+            egui::pos2(
+                center.x + angle.cos() * radius,
+                center.y + angle.sin() * radius,
+            )
+        })
+        .collect();
+    ui.painter()
+        .add(egui::Shape::line(points, Stroke::new(2.5_f32, tokens.accent)));
+    ui.ctx().request_repaint();
+}
+
+/// A placeholder row: a rounded bar with a band of light travelling along it.
+///
+/// The alternative — a line of text saying "loading" — tells the reader that
+/// something is happening but not *what* is about to appear; a skeleton row has
+/// the shape of the answer.
+pub fn skeleton_row(ui: &mut Ui, tokens: &Tokens, width: f32, height: f32, phase: f64) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
+    let radius = CornerRadius::same(radius::SM as u8);
+    ui.painter().rect_filled(rect, radius, tokens.skeleton);
+
+    // Clipped to the bar, so the highlight reads as light passing over content
+    // rather than as a second object sliding behind it.
+    let band = (height * 3.0).max(48.0);
+    let travel = ((phase * 0.5) as f32 % 1.0) * (rect.width() + band) - band;
+    let highlight = Rect::from_min_size(
+        egui::pos2(rect.left() + travel, rect.top()),
+        Vec2::new(band, height),
+    );
+    ui.painter()
+        .with_clip_rect(rect)
+        .rect_filled(highlight, radius, tokens.skeleton_highlight);
+    ui.ctx().request_repaint();
 }
 
 /// Convert accumulated wheel movement into whole steps.

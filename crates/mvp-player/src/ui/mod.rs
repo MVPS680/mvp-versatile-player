@@ -17,6 +17,7 @@
 
 mod canvas;
 mod dialogs;
+mod glass;
 mod menu;
 mod settings_window;
 mod sidebar;
@@ -349,17 +350,25 @@ fn handle_keyboard(app: &mut PlayerApp, ctx: &Context) {
 }
 
 /// The dismissible error strip under the menu bar.
+///
+/// A banner rather than a dialog: the message is worth reading but not worth
+/// interrupting playback for, so it sits in the flow of the window and can be
+/// dismissed with one click — or with Enter, because the close button is a real
+/// button.
 fn error_banner(app: &mut PlayerApp, ctx: &Context) -> Option<String> {
     let message = app.ui.error_banner.clone()?;
     let mut dismissed = false;
     egui::TopBottomPanel::top("mvp_error_banner")
         .frame(
             egui::Frame::new()
-                .fill(app.theme.tokens.danger.gamma_multiply(0.18))
-                .inner_margin(egui::Margin::symmetric(12, 6))
+                .fill(app.theme.tokens.danger_soft)
+                .inner_margin(egui::Margin::symmetric(
+                    crate::theme::space::LG as i8,
+                    crate::theme::space::SM as i8,
+                ))
                 .stroke(egui::Stroke::new(
                     1.0_f32,
-                    app.theme.tokens.danger.gamma_multiply(0.5),
+                    app.theme.tokens.danger.gamma_multiply(0.35),
                 )),
         )
         .show(ctx, |ui| {
@@ -380,10 +389,7 @@ fn error_banner(app: &mut PlayerApp, ctx: &Context) -> Option<String> {
                         .size(crate::theme::font::SMALL),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add(egui::Button::new("关闭").frame(false))
-                        .clicked()
-                    {
+                    if widgets::secondary_button(ui, &app.theme.tokens, "关闭", 64.0) {
                         dismissed = true;
                     }
                 });

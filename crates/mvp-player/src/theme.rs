@@ -1,18 +1,43 @@
 //! Visual design tokens and the `egui` style the whole player is built from.
 //!
-//! The palette is a deliberately desaturated dark scheme: a media player is
-//! watched next to its own picture, so the chrome must never compete with the
-//! video. Surfaces step up in lightness (`bg` → `panel` → `elevated`) and a
-//! single violet accent carries every interactive highlight, which keeps the
-//! interface legible without a rainbow of status colours.
+//! The palette follows Apple's dark system appearance: a ramp of layered greys
+//! (`bg` → `panel` → `elevated` → `sunken`), one blue accent that carries every
+//! interactive highlight, and a small set of semantic colours (success, warning,
+//! danger) that are only ever used for state. A media player is watched next to
+//! its own picture, so the chrome stays quiet and the *picture* stays the
+//! brightest thing on screen.
+//!
+//! Three rules taken from the Human Interface Guidelines hold the whole file
+//! together:
+//!
+//! 1. **Hierarchy comes from colour, not from lines.** Surfaces are separated by
+//!    a translucent white hairline ([`Tokens::separator`]) rather than a grey
+//!    stroke, so a separator is correct on any surface it is drawn on.
+//! 2. **Everything is measured on a 4 pt grid** ([`space`]) with Apple's corner
+//!    radii ([`radius`]), so unrelated panels still line up with each other.
+//! 3. **The accent means "this is interactive, or this is current."** It is never
+//!    decoration. Selection fills use [`Tokens::accent_soft`] so text on top of
+//!    them keeps its contrast.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use egui::{Color32, Context, CornerRadius, FontFamily, FontId, Stroke, TextStyle, Visuals};
+use egui::{
+    Color32, Context, CornerRadius, FontFamily, FontId, Stroke, TextStyle, Visuals,
+};
 
 /// A colour with an alpha channel, built from a hex literal at compile time.
+/// A colour without an alpha channel, built from a hex literal at compile time.
 const fn rgb(r: u8, g: u8, b: u8) -> Color32 {
     Color32::from_rgb(r, g, b)
+}
+
+/// A colour with an alpha channel, built from a hex literal.
+///
+/// Not `const`: `Color32::from_rgba_unmultiplied` is not a const fn, so the
+/// translucent part of the palette is built when the tokens are.
+fn rgba(r: u8, g: u8, b: u8, a: u8) -> Color32 {
+    Color32::from_rgba_unmultiplied(r, g, b, a)
 }
 
 /// Every colour the interface uses.
@@ -58,37 +83,67 @@ pub struct Tokens {
     pub danger: Color32,
     /// The video letterbox area — pure black, like a cinema.
     pub letterbox: Color32,
+    /// Hairline between rows of a grouped list.
+    ///
+    /// A translucent white rather than a grey: the same value then reads as a
+    /// separator on the panel, on a card and on a popup.
+    pub separator: Color32,
+    /// The accent at list-selection strength, for selected rows and pills.
+    ///
+    /// Kept as a translucent fill instead of a solid colour so text drawn over
+    /// it keeps its own contrast.
+    pub accent_soft: Color32,
+    /// The accent under the pointer's finger — one step darker than [`Tokens::accent`].
+    pub accent_pressed: Color32,
+    /// Keyboard-focus ring, drawn around the focused control.
+    pub focus_ring: Color32,
+    /// Placeholder fill of a skeleton row, while its content loads.
+    pub skeleton: Color32,
+    /// The brighter band that travels across a skeleton row.
+    pub skeleton_highlight: Color32,
+    /// Error, at banner strength.
+    pub danger_soft: Color32,
 }
 
 impl Default for Tokens {
     fn default() -> Self {
         Self {
-            bg: rgb(0x0E, 0x10, 0x14),
-            panel: rgb(0x14, 0x17, 0x1D),
-            elevated: rgb(0x1A, 0x1E, 0x26),
-            sunken: rgb(0x10, 0x13, 0x1A),
-            hover: Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, 0x14),
-            active: Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, 0x24),
-            border: Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, 0x14),
-            border_strong: Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, 0x28),
-            text: rgb(0xE7, 0xEA, 0xF0),
-            text_weak: rgb(0x9B, 0xA4, 0xB4),
-            text_muted: rgb(0x5C, 0x64, 0x72),
-            accent: rgb(0x7C, 0x5C, 0xFF),
-            accent_hover: rgb(0x8F, 0x74, 0xFF),
+            bg: rgb(0x0D, 0x0E, 0x11),
+            panel: rgb(0x16, 0x18, 0x1C),
+            elevated: rgb(0x1E, 0x21, 0x26),
+            sunken: rgb(0x0A, 0x0B, 0x0D),
+            hover: rgba(0xFF, 0xFF, 0xFF, 0x14),
+            active: rgba(0xFF, 0xFF, 0xFF, 0x24),
+            border: rgba(0xFF, 0xFF, 0xFF, 0x14),
+            border_strong: rgba(0xFF, 0xFF, 0xFF, 0x2E),
+            text: rgb(0xF5, 0xF5, 0xF7),
+            text_weak: rgb(0xA1, 0xA7, 0xB3),
+            text_muted: rgb(0x70, 0x75, 0x7F),
+            accent: rgb(0x0A, 0x84, 0xFF),
+            accent_hover: rgb(0x3D, 0x9B, 0xFF),
             on_accent: rgb(0xFF, 0xFF, 0xFF),
-            progress: rgb(0x7C, 0x5C, 0xFF),
-            track: Color32::from_rgba_unmultiplied(0xFF, 0xFF, 0xFF, 0x1E),
-            success: rgb(0x35, 0xC4, 0x6B),
-            warning: rgb(0xF0, 0xA9, 0x3B),
-            danger: rgb(0xF0, 0x50, 0x6E),
+            progress: rgb(0x0A, 0x84, 0xFF),
+            track: rgba(0xFF, 0xFF, 0xFF, 0x1F),
+            success: rgb(0x32, 0xD7, 0x4B),
+            warning: rgb(0xFF, 0x9F, 0x0A),
+            danger: rgb(0xFF, 0x45, 0x3A),
             letterbox: rgb(0x00, 0x00, 0x00),
+            separator: rgba(0xFF, 0xFF, 0xFF, 0x17),
+            accent_soft: rgba(0x0A, 0x84, 0xFF, 0x3D),
+            accent_pressed: rgb(0x06, 0x70, 0xE0),
+            focus_ring: rgba(0x0A, 0x84, 0xFF, 0x8C),
+            skeleton: rgba(0xFF, 0xFF, 0xFF, 0x0F),
+            skeleton_highlight: rgba(0xFF, 0xFF, 0xFF, 0x26),
+            danger_soft: rgba(0xFF, 0x45, 0x3A, 0x33),
         }
     }
 }
 
-/// Spacing scale, in points. Everything is a multiple of four.
+/// Spacing scale, in points. Everything is a multiple of four, apart from the
+/// half-step used *inside* a control.
 pub mod space {
+    /// 2 pt — the gap between a glyph and its label, inside a control.
+    pub const XXS: f32 = 2.0;
     /// 4 pt — hairline gaps.
     pub const XS: f32 = 4.0;
     /// 8 pt — the default gap between related controls.
@@ -99,21 +154,31 @@ pub mod space {
     pub const LG: f32 = 16.0;
     /// 24 pt — section separation.
     pub const XL: f32 = 24.0;
+    /// 32 pt — the space between one page block and the next.
+    pub const XXL: f32 = 32.0;
 }
 
-/// Corner radii, in points.
+/// Corner radii, in points, following Apple's scale.
+///
+/// The steps matter more than the values: a chip, a control, a card and a sheet
+/// must each look *deliberately* rounded relative to one another, because a
+/// nearly-round corner next to a rounder one reads as a mistake.
 pub mod radius {
-    /// 4 pt — checkboxes, small chips.
-    pub const SM: f32 = 4.0;
-    /// 6 pt — buttons and text fields.
-    pub const MD: f32 = 6.0;
-    /// 10 pt — cards and popups.
-    pub const LG: f32 = 10.0;
-    /// 14 pt — the settings window.
-    pub const XL: f32 = 14.0;
+    /// 5 pt — checkboxes, chips, list rows.
+    pub const SM: f32 = 5.0;
+    /// 8 pt — buttons, text fields, icon buttons.
+    pub const MD: f32 = 8.0;
+    /// 12 pt — cards, popovers, grouped lists.
+    pub const LG: f32 = 12.0;
+    /// 16 pt — the settings sheet and other floating windows.
+    pub const XL: f32 = 16.0;
 }
 
 /// Font sizes, in points.
+///
+/// `epaint` has no variable-weight faces, so the type hierarchy is carried by
+/// size and colour; the one exception is headings, which use the bold cut of the
+/// system font through [`strong_font`].
 pub mod font {
     /// 11 pt — timestamps on the seek bar.
     pub const TINY: f32 = 11.0;
@@ -121,12 +186,12 @@ pub mod font {
     pub const SMALL: f32 = 12.0;
     /// 13 pt — the default UI size.
     pub const BODY: f32 = 13.0;
-    /// 15 pt — section headings.
+    /// 15 pt — the heading of a group of settings.
     pub const H3: f32 = 15.0;
-    /// 18 pt — window headings.
-    pub const H2: f32 = 18.0;
-    /// 24 pt — the empty-state title.
-    pub const H1: f32 = 24.0;
+    /// 20 pt — window and sheet titles.
+    pub const H2: f32 = 20.0;
+    /// 26 pt — the empty-state title.
+    pub const H1: f32 = 26.0;
 }
 
 /// The player's complete style.
@@ -157,22 +222,12 @@ impl Theme {
         visuals.window_stroke = Stroke::new(1.0_f32, t.border_strong);
         visuals.window_corner_radius = CornerRadius::same(radius::XL as u8);
         visuals.menu_corner_radius = CornerRadius::same(radius::MD as u8);
-        visuals.window_shadow = egui::epaint::Shadow {
-            offset: [0, 8],
-            blur: 24,
-            spread: 0,
-            color: Color32::from_black_alpha(140),
-        };
-        visuals.popup_shadow = egui::epaint::Shadow {
-            offset: [0, 4],
-            blur: 12,
-            spread: 0,
-            color: Color32::from_black_alpha(120),
-        };
+        visuals.window_shadow = shadow::window();
+        visuals.popup_shadow = shadow::popup();
         visuals.override_text_color = Some(t.text);
         visuals.hyperlink_color = t.accent;
-        visuals.selection.bg_fill = t.accent.gamma_multiply(0.55);
-        visuals.selection.stroke = Stroke::new(1.0_f32, t.accent_hover);
+        visuals.selection.bg_fill = t.accent_soft;
+        visuals.selection.stroke = Stroke::new(1.0_f32, t.text);
         visuals.slider_trailing_fill = true;
 
         let w = &mut visuals.widgets;
@@ -184,27 +239,36 @@ impl Theme {
 
         w.inactive.bg_fill = t.hover;
         w.inactive.weak_bg_fill = Color32::TRANSPARENT;
-        w.inactive.bg_stroke = Stroke::new(1.0_f32, t.border);
+        w.inactive.bg_stroke = Stroke::NONE;
         w.inactive.fg_stroke = Stroke::new(1.0_f32, t.text);
         w.inactive.corner_radius = CornerRadius::same(radius::MD as u8);
 
         w.hovered.bg_fill = t.active;
-        w.hovered.weak_bg_fill = t.active;
-        w.hovered.bg_stroke = Stroke::new(1.0_f32, t.border_strong);
+        w.hovered.weak_bg_fill = t.hover;
+        w.hovered.bg_stroke = Stroke::NONE;
         w.hovered.fg_stroke = Stroke::new(1.0_f32, t.text);
         w.hovered.corner_radius = CornerRadius::same(radius::MD as u8);
 
-        w.active.bg_fill = t.accent.gamma_multiply(0.85);
-        w.active.weak_bg_fill = t.accent.gamma_multiply(0.85);
-        w.active.bg_stroke = Stroke::new(1.0_f32, t.accent_hover);
+        // Pressed: the accent, like a filled macOS button. `bg_fill` is what a
+        // slider handle and a checkbox tick are drawn with, so this is also the
+        // "engaged" colour of every control in the player.
+        w.active.bg_fill = t.accent_pressed;
+        w.active.weak_bg_fill = t.accent_pressed;
+        w.active.bg_stroke = Stroke::NONE;
         w.active.fg_stroke = Stroke::new(1.0_f32, t.on_accent);
         w.active.corner_radius = CornerRadius::same(radius::MD as u8);
 
         w.open.bg_fill = t.active;
-        w.open.weak_bg_fill = t.active;
-        w.open.bg_stroke = Stroke::new(1.0_f32, t.border_strong);
+        w.open.weak_bg_fill = t.hover;
+        w.open.bg_stroke = Stroke::NONE;
         w.open.fg_stroke = Stroke::new(1.0_f32, t.text);
         w.open.corner_radius = CornerRadius::same(radius::MD as u8);
+
+        // The caret and the focus ring are the accent too: in a system where one
+        // colour means "interactive", a grey caret would be the only thing on
+        // screen not speaking the same language.
+        visuals.text_cursor.stroke = Stroke::new(1.5_f32, t.accent);
+        visuals.text_cursor.preview = false;
 
         // egui keeps a separate `Style` for each theme and resolves
         // `ThemePreference::System` afresh on every frame, swapping which one is
@@ -226,13 +290,19 @@ impl Theme {
 
             style.spacing.item_spacing = egui::vec2(space::SM, space::SM);
             style.spacing.button_padding = egui::vec2(space::MD, space::XS + 2.0);
-            style.spacing.menu_margin = egui::Margin::same(space::XS as i8);
+            style.spacing.menu_margin = egui::Margin::same(6);
             style.spacing.indent = space::LG;
             style.spacing.slider_width = 120.0;
             style.spacing.interact_size = egui::vec2(0.0, 26.0);
-            style.spacing.scroll.bar_width = 8.0;
+            style.spacing.scroll.bar_width = 9.0;
             style.spacing.scroll.floating = true;
+            style.spacing.scroll.floating_width = 4.0;
+            style.spacing.scroll.bar_inner_margin = 4.0;
             style.visuals.striped = true;
+
+            // Motion: long enough to be seen, short enough that a click feels
+            // instant. Apple's own controls settle in about a seventh of a second.
+            style.animation_time = 0.14;
 
             style.text_styles = [
                 (TextStyle::Heading, FontId::new(font::H2, FontFamily::Proportional)),
@@ -243,6 +313,56 @@ impl Theme {
             ]
             .into();
         });
+    }
+}
+
+/// Elevation. Apple ships a handful of shadow steps rather than an arbitrary
+/// blur per component, so the same three are reused everywhere: a popover lifts
+/// off the page, a sheet lifts off the popover, and the floating HUD only just
+/// clears the picture.
+pub mod shadow {
+    use egui::epaint::Shadow;
+    use egui::Color32;
+
+    /// Menus, tooltips and popovers.
+    pub fn popup() -> Shadow {
+        Shadow {
+            offset: [0, 6],
+            blur: 20,
+            spread: 0,
+            color: Color32::from_black_alpha(120),
+        }
+    }
+
+    /// Floating windows such as the settings sheet.
+    pub fn window() -> Shadow {
+        Shadow {
+            offset: [0, 12],
+            blur: 36,
+            spread: 0,
+            color: Color32::from_black_alpha(150),
+        }
+    }
+}
+
+/// Name of the heavier font family, when Windows has one.
+pub const BOLD_FAMILY: &str = "mvp-bold";
+
+/// Whether the bold face could be loaded at start-up.
+static BOLD_FACE: AtomicBool = AtomicBool::new(false);
+
+/// The heading face: the bold cut of the system font, or the body face when
+/// Windows has no bold face to offer.
+///
+/// `epaint` cannot synthesise a bold weight, so headings would otherwise be
+/// distinguishable only by size. Loading the real bold file — and *falling back
+/// silently* if it is missing — is what makes a title look like a title without
+/// making a stripped-down Windows fail to start.
+pub fn strong_font(size: f32) -> FontId {
+    if BOLD_FACE.load(Ordering::Relaxed) {
+        FontId::new(size, FontFamily::Name(BOLD_FAMILY.into()))
+    } else {
+        FontId::proportional(size)
     }
 }
 
@@ -278,6 +398,23 @@ const CJK_FONT_CANDIDATES: &[(&str, u32)] = &[
     ("Deng.ttf", 0),
     ("msjh.ttc", 1),
     ("simsun.ttc", 0),
+];
+
+/// Bold Latin face, used for headings and window titles.
+///
+/// Segoe UI Bold is part of the same family as [`UI_FONT_CANDIDATES`], so a
+/// heading and the body under it keep identical metrics and only differ in
+/// weight — which is exactly the pairing macOS gets from SF Pro.
+const BOLD_FONT_CANDIDATES: &[&str] = &["segoeuib.ttf", "tahomabd.ttf", "arialbd.ttf"];
+
+/// Bold CJK, so a Chinese heading does not drop back to the regular weight at
+/// the first ideograph. `simhei.ttf` is the last resort: it is a family of its
+/// own, but it is unambiguously heavy, and a heading that is heavy for the wrong
+/// reason still reads as a heading.
+const CJK_BOLD_FONT_CANDIDATES: &[(&str, u32)] = &[
+    ("msyhbd.ttc", 0),
+    ("msjhbd.ttc", 0),
+    ("simhei.ttf", 0),
 ];
 
 /// Directory Windows keeps its fonts in.
@@ -380,8 +517,26 @@ fn install_fonts(ctx: &Context) {
             monospace.push("cjk".to_owned());
         }
 
+        // Headings. Registered as a family of its own rather than as a replacement
+        // for the body font, because only some text — titles, section headings,
+        // the one number a dialog is about — is meant to be heavy.
+        let mut bold = Vec::new();
+        if load_font(&mut fonts, "ui_bold", BOLD_FONT_CANDIDATES) {
+            bold.push("ui_bold".to_owned());
+        }
+        if load_faces(&mut fonts, "cjk_bold", CJK_BOLD_FONT_CANDIDATES) {
+            bold.push("cjk_bold".to_owned());
+        }
+        if !bold.is_empty() {
+            fonts
+                .families
+                .insert(FontFamily::Name(BOLD_FAMILY.into()), bold);
+            BOLD_FACE.store(true, Ordering::Relaxed);
+        }
+
         log::info!(
-            "字体栈就绪: 文本 {proportional:?} / 等宽 {monospace:?}，耗时 {:.1} ms",
+            "字体栈就绪: 文本 {proportional:?} / 等宽 {monospace:?} / 粗体 {}，耗时 {:.1} ms",
+            BOLD_FACE.load(Ordering::Relaxed),
             started.elapsed().as_secs_f32() * 1000.0
         );
         if proportional.is_empty() {
@@ -394,10 +549,14 @@ fn install_fonts(ctx: &Context) {
     });
 }
 
-/// Convenience: a rounded selection highlight drawn behind a row.
+/// Convenience: a selection highlight drawn behind a row.
+///
+/// Selected rows use the translucent accent rather than a solid fill, so the row
+/// keeps whatever surface it was drawn on and the text over it keeps its
+/// contrast — the same reason Apple's list selections are translucent.
 pub fn row_fill(tokens: &Tokens, selected: bool, hovered: bool) -> Color32 {
     if selected {
-        tokens.accent.gamma_multiply(0.28)
+        tokens.accent_soft
     } else if hovered {
         tokens.hover
     } else {
@@ -453,7 +612,9 @@ mod tests {
             .iter()
             .copied()
             .chain(MONO_FONT_CANDIDATES.iter().copied())
+            .chain(BOLD_FONT_CANDIDATES.iter().copied())
             .chain(CJK_FONT_CANDIDATES.iter().map(|(file, _)| *file))
+            .chain(CJK_BOLD_FONT_CANDIDATES.iter().map(|(file, _)| *file))
         {
             assert!(
                 !file.contains(['/', '\\']),
@@ -490,6 +651,126 @@ mod tests {
         // header must not be read past its end.
         assert_eq!(face_count(&[0, 1, 0, 0, 0, 10]), 1);
         assert_eq!(face_count(b"ttcf"), 1);
+    }
+
+    /// The steps of the radius scale must grow outwards. A chip drawn rounder
+    /// than the card it sits on is the kind of detail that makes an interface
+    /// feel assembled rather than designed.
+    #[test]
+    fn the_radius_scale_grows_outwards() {
+        assert!(radius::SM < radius::MD);
+        assert!(radius::MD < radius::LG);
+        assert!(radius::LG < radius::XL);
+        // Anything bigger than a quarter of a 26 pt control would start to read
+        // as a pill and destroy the difference between the steps.
+        assert!(radius::XL <= 20.0);
+    }
+
+    /// The spacing scale is the 4 pt grid, with one half-step for the gap inside
+    /// a control — which is why the half-step is checked against `XS` rather than
+    /// against the grid.
+    #[test]
+    fn the_spacing_scale_is_a_four_point_grid() {
+        for step in [
+            space::XS,
+            space::SM,
+            space::MD,
+            space::LG,
+            space::XL,
+            space::XXL,
+        ] {
+            assert!(step > 0.0);
+            assert!(
+                (step % 4.0).abs() < f32::EPSILON,
+                "{step} is off the 4 pt grid"
+            );
+        }
+        assert!((space::XXS - space::XS / 2.0).abs() < f32::EPSILON);
+        assert!(space::XXS < space::XS && space::XS < space::SM);
+        assert!(space::XL < space::XXL);
+    }
+
+    /// Translucent state fills have to *be* translucent: a selection painted at
+    /// full alpha hides the surface behind it, which is what made the old
+    /// selection look like a different window.
+    #[test]
+    fn state_fills_are_translucent_and_keep_their_hue() {
+        let t = Tokens::default();
+        for soft in [
+            t.hover,
+            t.active,
+            t.separator,
+            t.border,
+            t.border_strong,
+            t.track,
+            t.accent_soft,
+            t.focus_ring,
+            t.skeleton,
+            t.skeleton_highlight,
+            t.danger_soft,
+        ] {
+            assert!(soft.a() > 0 && soft.a() < 255, "expected a translucent fill");
+        }
+        // The soft variants are the same colour as their solid counterpart, only
+        // quieter. `Color32` stores *premultiplied* channels, so an opacity of
+        // 61/255 scales the channels stored for a translucent colour: they have
+        // to be unmultiplied before two colours can be compared meaningfully.
+        let un = |c: Color32| {
+            let alpha = f32::from(c.a());
+            let channel = |v: u8| {
+                if alpha == 0.0 {
+                    0.0
+                } else {
+                    f32::from(v) * 255.0 / alpha
+                }
+            };
+            (channel(c.r()), channel(c.g()), channel(c.b()))
+        };
+        let same_hue = |soft: Color32, solid: Color32, what: &str| {
+            let (a, b) = (un(soft), un(solid));
+            let close = |x: f32, y: f32| (x - y).abs() <= 2.0;
+            assert!(
+                close(a.0, b.0) && close(a.1, b.1) && close(a.2, b.2),
+                "{what}: {a:?} is not the same hue as {b:?}"
+            );
+        };
+        same_hue(t.accent_soft, t.accent, "accent_soft");
+        same_hue(t.danger_soft, t.danger, "danger_soft");
+    }
+
+    /// A skeleton is a *hint* of content: visible against the surface, quieter
+    /// than the separator that will replace it, and its travelling highlight has
+    /// to be the brightest of the three.
+    #[test]
+    fn skeleton_fills_are_quieter_than_the_content_they_stand_in_for() {
+        let t = Tokens::default();
+        assert!(t.skeleton.a() < t.separator.a(), "the skeleton is a whisper");
+        assert!(
+            t.skeleton_highlight.a() > t.separator.a(),
+            "the travelling band must be visible"
+        );
+        assert!(t.skeleton_highlight.a() < 60, "and must not flash");
+    }
+
+    /// The pressed accent is the accent family one step darker, so a press reads
+    /// as the same button being held down rather than as a different control.
+    #[test]
+    fn the_pressed_accent_is_the_accent_one_step_darker() {
+        let t = Tokens::default();
+        let lum = |c: Color32| c.r() as u32 + c.g() as u32 + c.b() as u32;
+        assert!(lum(t.accent_pressed) < lum(t.accent), "a press must darken");
+        assert!(
+            t.accent_hover.b() >= t.accent.b(),
+            "hovering must not lose the blue"
+        );
+        // All three states are blues: the blue channel is the strongest in each,
+        // so hover and press change the weight of the accent, never its hue.
+        for state in [t.accent, t.accent_hover, t.accent_pressed] {
+            assert!(
+                state.b() > state.g() && state.g() > state.r(),
+                "the accent must stay blue"
+            );
+        }
     }
 
     #[test]

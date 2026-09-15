@@ -6,6 +6,7 @@ use crate::app::PlayerApp;
 use crate::icons::Icon;
 use crate::state::Overlay;
 use crate::theme::{font, space};
+use crate::ui::glass;
 use crate::ui::widgets;
 
 /// Draw whichever dialog is open.
@@ -37,11 +38,7 @@ fn url_dialog(app: &mut PlayerApp, ctx: &Context) {
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -40.0))
-        .frame(
-            egui::Frame::window(&ctx.style())
-                .fill(tokens.elevated)
-                .inner_margin(egui::Margin::same(space::LG as i8)),
-        )
+        .frame(glass::window_shell(&tokens, glass::sheet_margin(), glass::SHEET_RADIUS))
         .show(ctx, |ui| {
             ui.set_width(width);
             ui.label(
@@ -64,16 +61,11 @@ fn url_dialog(app: &mut PlayerApp, ctx: &Context) {
             }
             ui.add_space(space::MD);
             ui.horizontal(|ui| {
-                if ui
-                    .add(
-                        egui::Button::new(RichText::new("播放").size(font::BODY))
-                            .fill(tokens.accent),
-                    )
-                    .clicked()
-                {
+                // Accent for the action the dialog is for, grey for the way out.
+                if widgets::primary_button(ui, &tokens, "播放", 72.0) {
                     submit = true;
                 }
-                if ui.button(RichText::new("取消").size(font::BODY)).clicked() {
+                if widgets::secondary_button(ui, &tokens, "取消", 72.0) {
                     app.ui.close_overlay();
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -90,6 +82,14 @@ fn url_dialog(app: &mut PlayerApp, ctx: &Context) {
                     }
                 });
             });
+            // Over the content: the veil, the lit rim and the light that follows
+            // the pointer across the sheet.
+            glass::paint_overlay_ui(
+                ui,
+                &tokens,
+                glass::content_rect(ui, glass::sheet_margin()),
+                glass::Glass::float(glass::SHEET_RADIUS),
+            );
         });
     if submit {
         let url = app.ui.url_input.trim().to_string();
@@ -115,11 +115,7 @@ fn shortcuts_dialog(app: &mut PlayerApp, ctx: &Context) {
         .resizable(true)
         .default_size(size)
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-        .frame(
-            egui::Frame::window(&ctx.style())
-                .fill(tokens.elevated)
-                .inner_margin(egui::Margin::same(space::LG as i8)),
-        )
+        .frame(glass::window_shell(&tokens, glass::sheet_margin(), glass::SHEET_RADIUS))
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
                 let (rect, _) =
@@ -146,6 +142,14 @@ fn shortcuts_dialog(app: &mut PlayerApp, ctx: &Context) {
                         });
                     }
                 });
+            // Over the content: the veil, the lit rim and the light that follows
+            // the pointer across the sheet.
+            glass::paint_overlay_ui(
+                ui,
+                &tokens,
+                glass::content_rect(ui, glass::sheet_margin()),
+                glass::Glass::float(glass::SHEET_RADIUS),
+            );
         });
     if !open {
         app.ui.close_overlay();
@@ -162,11 +166,7 @@ fn about_dialog(app: &mut PlayerApp, ctx: &Context) {
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-        .frame(
-            egui::Frame::window(&ctx.style())
-                .fill(tokens.elevated)
-                .inner_margin(egui::Margin::same(space::LG as i8)),
-        )
+        .frame(glass::window_shell(&tokens, glass::sheet_margin(), glass::SHEET_RADIUS))
         .show(ctx, |ui| {
             ui.set_width(width);
             ui.vertical_centered(|ui| {
@@ -225,6 +225,14 @@ fn about_dialog(app: &mut PlayerApp, ctx: &Context) {
                     );
                 }
             });
+            // Over the content: the veil, the lit rim and the light that follows
+            // the pointer across the sheet.
+            glass::paint_overlay_ui(
+                ui,
+                &tokens,
+                glass::content_rect(ui, glass::sheet_margin()),
+                glass::Glass::float(glass::SHEET_RADIUS),
+            );
         });
     if show_shortcuts {
         app.ui.open_overlay(Overlay::Shortcuts);

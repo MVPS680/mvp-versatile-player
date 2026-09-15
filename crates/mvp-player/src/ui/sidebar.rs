@@ -7,15 +7,16 @@ use crate::icons::Icon;
 use crate::settings::SidebarTab;
 use crate::state::{Mode, Overlay, Toast};
 use crate::theme::{font, space, Tokens};
+use crate::ui::glass;
 use crate::ui::widgets;
 
 /// Draw the docked sidebar.
 pub fn draw(app: &mut PlayerApp, ctx: &Context) {
     let tokens = app.theme.tokens.clone();
-    let frame = egui::Frame::new()
-        .fill(tokens.panel)
-        .inner_margin(egui::Margin::symmetric(space::SM as i8, space::SM as i8))
-        .stroke(egui::Stroke::new(1.0_f32, tokens.border));
+    // Liquid Glass, cut on the left edge — the one that faces the picture.
+    let margin = egui::Margin::symmetric(space::SM as i8, space::SM as i8);
+    let material = glass::Glass::chrome(glass::Rim::LEFT);
+    let frame = glass::chrome_shell(margin);
 
     // The sidebar is a third of the interface on a wide screen and a nuisance
     // on a narrow one: a fixed 460 pt ceiling would leave a 720 pt window with
@@ -30,6 +31,7 @@ pub fn draw(app: &mut PlayerApp, ctx: &Context) {
         .width_range(min_width..=max_width)
         .resizable(true)
         .show(ctx, |ui| {
+            glass::paint_ui(ui, &tokens, glass::surface_rect(ui, margin), material);
             let tabs: Vec<&str> = SidebarTab::all().iter().map(|t| t.label()).collect();
             let active = SidebarTab::all()
                 .iter()
@@ -375,7 +377,19 @@ fn tracks_tab(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
         return;
     }
     let Some(info) = app.engine.info() else {
-        widgets::empty_hint(ui, tokens, "正在读取轨道信息…");
+        // A skeleton with the shape of the answer, rather than a line of text
+                // saying that an answer is coming: the rows below are where the tracks
+                // themselves will appear.
+                for index in 0..3 {
+                    widgets::skeleton_row(
+                        ui,
+                        tokens,
+                        ui.available_width(),
+                        14.0,
+                        ui.input(|i| i.time) + f64::from(index) * 0.22,
+                    );
+                    ui.add_space(space::SM);
+                }
         return;
     };
 

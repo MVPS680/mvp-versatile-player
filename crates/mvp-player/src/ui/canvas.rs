@@ -98,7 +98,7 @@ fn media_view(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
                         egui::pos2(x, area.top()),
                         egui::pos2(x, area.bottom()),
                     ],
-                    Stroke::new(1.0, tokens.accent.gamma_multiply(0.5)),
+                    Stroke::new(1.0_f32, tokens.accent.gamma_multiply(0.5)),
                 );
             }
         }
@@ -161,8 +161,19 @@ fn video_view(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens, area: Rect) -> 
             );
         }
         None => {
+            // A spinner rather than a static line of text: "preparing" is a state
+            // that ends by itself, and a ring whose gap moves is the difference
+            // between "working" and "stuck".
+            let center = area.center();
+            widgets::spinner(
+                ui,
+                tokens,
+                center - egui::vec2(0.0, 24.0),
+                28.0,
+                ui.input(|i| i.time),
+            );
             ui.painter().text(
-                area.center(),
+                center,
                 egui::Align2::CENTER_CENTER,
                 "正在准备画面…",
                 egui::FontId::proportional(font::BODY),
@@ -171,6 +182,10 @@ fn video_view(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens, area: Rect) -> 
         }
     }
 
+    // The subtitles, the scrub line, the state banner and the pointer handling
+    // all live in `media_view` now: they need the picture's rectangle, not the
+    // canvas, and this function is only responsible for putting the frame on
+    // screen and reporting where it landed.
     rect
 }
 
@@ -606,9 +621,9 @@ fn draw_record(app: &PlayerApp, painter: &egui::Painter, rect: Rect, tokens: &To
 
     // The record itself: a dark disc, its rim, and the grooves a record has.
     painter.circle_filled(center, radius, tokens.elevated);
-    painter.circle_stroke(center, radius, Stroke::new(1.0, tokens.border_strong));
+    painter.circle_stroke(center, radius, Stroke::new(1.0_f32, tokens.border_strong));
     for groove in AUDIO_GROOVES {
-        painter.circle_stroke(center, radius * groove, Stroke::new(1.0, tokens.border));
+        painter.circle_stroke(center, radius * groove, Stroke::new(1.0_f32, tokens.border));
     }
     painter.circle_filled(center, radius * AUDIO_LABEL, tokens.accent);
     icons::draw(
@@ -896,7 +911,7 @@ fn empty_blocks(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
             ui.painter().circle_stroke(
                 logo_rect.center(),
                 radius,
-                Stroke::new(1.5, tokens.accent.gamma_multiply(0.55)),
+                Stroke::new(1.5_f32, tokens.accent.gamma_multiply(0.55)),
             );
             icons::draw(
                 ui.painter(),
@@ -908,8 +923,7 @@ fn empty_blocks(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
             ui.add_space(space::LG);
             ui.label(
                 RichText::new("MVP-Versatile-Player")
-                    .size(font::H1)
-                    .strong()
+                    .font(crate::theme::strong_font(font::H1))
                     .color(tokens.text),
             );
             ui.add_space(space::XS);
@@ -925,36 +939,19 @@ fn empty_blocks(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
                 let half = (width / 2.0 - space::XS).max(48.0);
                 let side = ((ui.available_width() - width) / 2.0).max(0.0);
                 ui.add_space(side);
-                if ui
-                    .add_sized(
-                        Vec2::new(half, 40.0),
-                        egui::Button::new(
-                            RichText::new("打开文件…").size(font::BODY),
-                        )
-                        .fill(tokens.accent),
-                    )
-                    .clicked()
-                {
+                // One accent button, one quiet one. The accent marks the action
+                // the screen exists for; nothing else on the page wears it.
+                if widgets::primary_button(ui, tokens, "打开文件…", half) {
                     app.request_open_file();
                 }
-                if ui
-                    .add_sized(
-                        Vec2::new(half, 40.0),
-                        egui::Button::new(RichText::new("打开文件夹…").size(font::BODY))
-                            .fill(tokens.elevated),
-                    )
-                    .clicked()
-                {
+                if widgets::secondary_button(ui, tokens, "打开文件夹…", half) {
                     app.request_open_folder();
                 }
             });
 
             ui.add_space(space::MD);
             ui.vertical_centered(|ui| {
-                if ui
-                    .button(RichText::new("打开网络串流…").size(font::SMALL))
-                    .clicked()
-                {
+                if widgets::secondary_button(ui, tokens, "打开网络串流…", 0.0) {
                     app.ui.url_input.clear();
                     app.ui.url_focus = true;
                     app.ui.open_overlay(Overlay::OpenUrl);
@@ -971,10 +968,10 @@ fn empty_blocks(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
             // ---- recent files ------------------------------------------
             app.settings.prune_recent();
             if !app.settings.recent_files.is_empty() {
-                ui.add_space(space::XL);
+                ui.add_space(space::XXL);
                 ui.label(
                     RichText::new("最近播放")
-                        .size(font::H3)
+                        .font(crate::theme::strong_font(font::H3))
                         .color(tokens.text),
                 );
                 ui.add_space(space::XS);

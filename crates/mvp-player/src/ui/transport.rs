@@ -7,20 +7,24 @@ use crate::app::PlayerApp;
 use crate::icons::Icon;
 use crate::state::{Overlay, Toast};
 use crate::theme::{font, space, Tokens};
+use crate::ui::glass;
 use crate::ui::widgets;
 
 /// The docked transport bar under the video.
 pub fn draw(app: &mut PlayerApp, ctx: &Context) {
     let tokens = app.theme.tokens.clone();
-    let frame = egui::Frame::new()
-        .fill(tokens.panel)
-        .inner_margin(egui::Margin::symmetric(space::MD as i8, space::SM as i8))
-        .stroke(egui::Stroke::new(1.0_f32, tokens.border));
+    // Liquid Glass: the frame carries no fill of its own, because the material is
+    // painted below and it has to be able to see through to the window behind it.
+    // The rim is cut on the top edge — the one facing the picture.
+    let margin = egui::Margin::symmetric(space::MD as i8, space::SM as i8);
+    let material = glass::Glass::chrome(glass::Rim::TOP);
 
     egui::TopBottomPanel::bottom("mvp_transport")
-        .frame(frame)
+        .frame(glass::chrome_shell(margin))
         .exact_height(84.0)
         .show(ctx, |ui| {
+            // Behind the content: the fill and the rim belong under the controls.
+            glass::paint_ui(ui, &tokens, glass::surface_rect(ui, margin), material);
             seek_row(app, ui, &tokens);
             ui.add_space(2.0);
             button_row(app, ui, &tokens);
@@ -37,16 +41,30 @@ pub fn draw_overlay(app: &mut PlayerApp, ctx: &Context) {
         .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -24.0))
         .order(egui::Order::Foreground)
         .show(ctx, |ui| {
+            // The floating bar is the one surface with the picture behind it, so it
+            // is a sheet of glass — lit on all four edges, with a highlight that
+            // follows the pointer across it. Its radius is one step smaller than a
+            // sheet's: a wide, short bar wants less rounding than a tall panel.
+            const OVERLAY_RADIUS: f32 = crate::theme::radius::LG;
+            let margin = egui::Margin::symmetric(space::LG as i8, space::SM as i8);
+            let material = glass::Glass::float(OVERLAY_RADIUS);
             egui::Frame::new()
-                .fill(tokens.elevated.gamma_multiply(0.94))
-                .corner_radius(egui::CornerRadius::same(12))
-                .inner_margin(egui::Margin::symmetric(space::LG as i8, space::SM as i8))
-                .stroke(egui::Stroke::new(1.0_f32, tokens.border_strong))
+                .fill(glass::base_fill(&tokens, glass::Thickness::Float))
+                .corner_radius(egui::CornerRadius::same(OVERLAY_RADIUS as u8))
+                .inner_margin(margin)
                 .show(ui, |ui| {
                     ui.set_width(width);
                     seek_row(app, ui, &tokens);
                     ui.add_space(2.0);
                     button_row(app, ui, &tokens);
+                    // Over the content: the veil, the rim and the light, painted
+                    // last because that is the order light arrives in.
+                    glass::paint_overlay_ui(
+                        ui,
+                        &tokens,
+                        glass::content_rect(ui, margin),
+                        material,
+                    );
                 });
         });
 }

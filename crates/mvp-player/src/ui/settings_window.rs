@@ -9,6 +9,7 @@ use crate::settings::{AspectMode, EndAction};
 use crate::state::SettingsTab;
 use crate::state::{Overlay, Toast};
 use crate::theme::{font, space, Tokens};
+use crate::ui::glass;
 use crate::ui::widgets;
 
 /// Draw the settings window when it is open.
@@ -38,11 +39,9 @@ pub fn draw(app: &mut PlayerApp, ctx: &Context) {
         .default_size(size)
         .min_size(min)
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-        .frame(
-            egui::Frame::window(&ctx.style())
-                .fill(tokens.elevated)
-                .inner_margin(egui::Margin::same(space::LG as i8)),
-        )
+        // Liquid Glass. The sheet is the one surface here that floats over the
+        // picture, so it is the one that gets the full material.
+        .frame(glass::window_shell(&tokens, glass::sheet_margin(), glass::SHEET_RADIUS))
         .show(ctx, |ui| {
             ui.horizontal_top(|ui| {
                 // ---- tab rail ------------------------------------------
@@ -55,24 +54,20 @@ pub fn draw(app: &mut PlayerApp, ctx: &Context) {
                             egui::vec2(132.0, 34.0),
                             egui::Sense::click(),
                         );
+                        // A rounded pill behind the current page, the way System
+                        // Settings marks the page it is showing. No leading bar:
+                        // the fill *is* the indicator, and two indicators for one
+                        // state is one too many.
                         if selected {
                             ui.painter().rect_filled(
                                 rect,
-                                egui::CornerRadius::same(6),
-                                tokens.accent.gamma_multiply(0.20),
-                            );
-                            ui.painter().rect_filled(
-                                egui::Rect::from_min_size(
-                                    rect.left_top() + egui::vec2(0.0, 6.0),
-                                    egui::vec2(3.0, rect.height() - 12.0),
-                                ),
-                                egui::CornerRadius::same(2),
-                                tokens.accent,
+                                egui::CornerRadius::same(crate::theme::radius::MD as u8),
+                                tokens.accent_soft,
                             );
                         } else if response.hovered() {
                             ui.painter().rect_filled(
                                 rect,
-                                egui::CornerRadius::same(6),
+                                egui::CornerRadius::same(crate::theme::radius::MD as u8),
                                 tokens.hover,
                             );
                         }
@@ -118,6 +113,14 @@ pub fn draw(app: &mut PlayerApp, ctx: &Context) {
                         });
                     });
             });
+            // Over the content, once the sheet has been laid out: the graded veil,
+            // the bevel, the lit rim and the highlight under the pointer.
+            glass::paint_overlay_ui(
+                ui,
+                &tokens,
+                glass::content_rect(ui, glass::sheet_margin()),
+                glass::Glass::float(glass::SHEET_RADIUS),
+            );
         });
     if !open {
         app.ui.close_overlay();
