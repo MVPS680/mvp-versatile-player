@@ -98,7 +98,7 @@ fn media_view(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
                         egui::pos2(x, area.top()),
                         egui::pos2(x, area.bottom()),
                     ],
-                    Stroke::new(1.0_f32, tokens.accent.gamma_multiply(0.5)),
+                    Stroke::new(1.0, tokens.accent.gamma_multiply(0.5)),
                 );
             }
         }
@@ -171,14 +171,43 @@ fn video_view(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens, area: Rect) -> 
         }
     }
 
-    rect
+    // ---- subtitles ------------------------------------------------------
+    if app.settings.subtitles_enabled {
+        draw_subtitles(app, ui, &rect, tokens);
+    }
+
+    // ---- interaction ----------------------------------------------------
+    handle_video_interaction(app, ui, &response, &rect);
+
+    // ---- state banners --------------------------------------------------
+    let state = app.engine.state();
+    if let mvp_core::PlaybackState::Error(message) = &state {
+        ui.painter().text(
+            area.center() + egui::vec2(0.0, -40.0),
+            egui::Align2::CENTER_CENTER,
+            message,
+            egui::FontId::proportional(font::BODY),
+            tokens.danger,
+        );
+    }
+
+    // Hover scrub preview line.
+    if let Some(time) = app.ui.video_hover_time {
+        let duration = app.engine.duration();
+        if duration > 0.0 {
+            let fraction = (time / duration).clamp(0.0, 1.0) as f32;
+            let x = area.left() + area.width() * fraction;
+            ui.painter().line_segment(
+                [
+                    egui::pos2(x, area.top()),
+                    egui::pos2(x, area.bottom()),
+                ],
+                Stroke::new(1.0, tokens.accent.gamma_multiply(0.5)),
+            );
+        }
+    }
 }
 
-/// Clicks, drags and the wheel, shared by the video canvas and the audio
-/// screen.
-///
-/// `pan` is whether dragging moves a picture around; on the audio screen there
-/// is nothing to move, and a drag is then only a way of waking the controls.
 fn handle_video_interaction(
     app: &mut PlayerApp,
     ui: &mut Ui,
@@ -606,9 +635,9 @@ fn draw_record(app: &PlayerApp, painter: &egui::Painter, rect: Rect, tokens: &To
 
     // The record itself: a dark disc, its rim, and the grooves a record has.
     painter.circle_filled(center, radius, tokens.elevated);
-    painter.circle_stroke(center, radius, Stroke::new(1.0_f32, tokens.border_strong));
+    painter.circle_stroke(center, radius, Stroke::new(1.0, tokens.border_strong));
     for groove in AUDIO_GROOVES {
-        painter.circle_stroke(center, radius * groove, Stroke::new(1.0_f32, tokens.border));
+        painter.circle_stroke(center, radius * groove, Stroke::new(1.0, tokens.border));
     }
     painter.circle_filled(center, radius * AUDIO_LABEL, tokens.accent);
     icons::draw(
@@ -895,8 +924,8 @@ fn empty_blocks(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
             );
             ui.painter().circle_stroke(
                 logo_rect.center(),
-                radius,
-                Stroke::new(1.5_f32, tokens.accent.gamma_multiply(0.55)),
+                42.0,
+                Stroke::new(1.5, tokens.accent.gamma_multiply(0.55)),
             );
             icons::draw(
                 ui.painter(),
