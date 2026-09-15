@@ -109,6 +109,8 @@ pub struct PlayerApp {
 
     /// Native window handle, used for the dark title bar and taskbar hints.
     pub hwnd: isize,
+    /// Keeps the window inside the screen it is on. See [`crate::display`].
+    pub window_fit: crate::display::Guard,
     /// The dark-title-bar value that has been applied, if any. `None` until the
     /// window exists.
     pub titlebar_dark: Option<bool>,
@@ -122,6 +124,15 @@ pub struct PlayerApp {
     /// file has been probed: "external subtitles win" only applies when the file
     /// has no embedded track worth showing.
     pub pending_sidecar: Option<PathBuf>,
+
+    /// `true` when the file being opened names an audio extension.
+    ///
+    /// Which screen a file gets is decided by the probe, which is the
+    /// authority — but the probe takes a few milliseconds, and in them an MP3
+    /// would still be showing the video canvas' "正在准备画面…". Nothing can be
+    /// prepared for a file that has no picture, so the extension covers that
+    /// gap; see [`PlayerApp::is_audio_only`].
+    pub pending_audio: bool,
 
     /// Wall-clock instant the process started, for the startup-time readout.
     pub process_start: Instant,
@@ -210,10 +221,12 @@ impl PlayerApp {
             instance,
             ipc_rx,
             hwnd,
+            window_fit: crate::display::Guard::default(),
             titlebar_dark: None,
             sleep_blocker: SleepBlocker::new(false),
             video_target: (0, 0),
             pending_sidecar: None,
+            pending_audio: false,
             process_start,
             info_source: None,
             last_duration: 0.0,
@@ -382,6 +395,11 @@ impl PlayerApp {
             self.error(format!("无法打开: {err}"));
             return;
         }
+        // Before the probe lands, the file name is the only thing that knows
+        // this file has nothing to show (see `pending_audio`).
+        self.pending_audio = local
+            .as_deref()
+            .is_some_and(|path| mvp_core::util::classify(path) == MediaKind::Audio);
         // Restart each file at a clean slate.
         self.engine.set_speed(self.settings.speed);
         self.engine.set_volume(self.settings.volume);
@@ -1016,6 +1034,35 @@ impl PlayerApp {
         self.store.mark_dirty();
     }
 
+    /// `true` when what is on screen is sound and nothing else.
+    ///
+    /// The probe is the authority as soon as it lands; before that the file
+    /// name is (see [`PlayerApp::pending_audio`]). "Has no picture" is a
+    /// property of the file, not of how far the pipeline has got, which is why
+    /// this is asked *before* the first frame is decoded as well as after.
+    pub fn is_audio_only(&self) -> bool {
+        if self.mode != Mode::Media {
+            return false;
+        }
+        match self.engine.info() {
+            Some(info) => info.is_audio_only(),
+            None => self.pending_audio,
+        }
+    }
+
+    /// `true` when there is a picture on screen: a video frame or an image.
+    ///
+    /// The picture-only commands — rotate, flip, snapshot, frame stepping —
+    /// ask this rather than "is anything open?", so an audio file does not
+    /// offer controls that could only ever do nothing to it.
+    pub fn has_picture(&self) -> bool {
+        match self.mode {
+            Mode::Image => true,
+            Mode::Media => !self.is_audio_only(),
+            Mode::Empty => false,
+        }
+    }
+
     /// Human readable "now playing" line for the OSD.
     pub fn now_playing_label(&self) -> Option<String> {
         match self.mode {
@@ -1201,7 +1248,10 @@ impl PlayerApp {
 
     /// Show the next frame: the one a backward step left, or the decoder's next.
     pub fn step_forward_frame(&mut self, ctx: &Context) {
-        if !self.mode.is_media() {
+        // A file with no picture has no frames to step through — and pausing it
+        // would be the only thing this could still do, which is not what "下一帧"
+        // means to anyone.
+        if !self.mode.is_media() || self.is_audio_only() {
             return;
         }
         self.engine.pause();
@@ -1374,6 +1424,77 @@ impl PlayerApp {
         self.toast(Toast::info("已移除外部字幕"));
     }
 
+    /// Keep the window on the screen, and remember where the user put it.
+    ///
+    /// This runs on the whole session, not just at start-up, because the screen
+    /// can change underneath a running player: the resolution can drop, a
+    /// remote-desktop session can resize, and the window can be dragged onto a
+    /// monitor with less room than it needs. The guard only reacts when the
+    /// window manager reports a *different* screen, so a window the user has
+    /// sized or stretched deliberately is left exactly where they left it.
+    ///
+    /// The cost per frame is a handful of comparisons — the viewport values are
+    /// already in the input state.
+    pub fn sync_display(&mut self, ctx: &Context) {
+        let (inner, outer, monitor, maximized, fullscreen) = ctx.input(|i| {
+            let viewport = i.viewport();
+            (
+                viewport.inner_rect,
+                viewport.outer_rect,
+                viewport.monitor_size,
+                viewport.maximized,
+                viewport.fullscreen,
+            )
+        });
+
+        // ---- remember the geometry for the next launch --------------------
+        //
+        // A maximised or fullscreen window reports the *screen's* size, not the
+        // size the user chose, so neither is worth storing: what has to survive
+        // is the size the window restores to when it is small again.
+        let maximized = maximized.unwrap_or(false);
+        let fullscreen = fullscreen.unwrap_or(false);
+        if !maximized && !fullscreen {
+            if let Some(inner) = inner {
+                let size = [inner.width(), inner.height()];
+                if size[0] > 0.0 && size[1] > 0.0 && size != self.settings.window_size {
+                    self.settings.window_size = size;
+                    self.store.mark_dirty();
+                }
+            }
+            if let Some(outer) = outer {
+                let position = [outer.min.x, outer.min.y];
+                if self.settings.window_pos != Some(position) {
+                    self.settings.window_pos = Some(position);
+                    self.store.mark_dirty();
+                }
+            }
+            if self.settings.maximized {
+                self.settings.maximized = false;
+                self.store.mark_dirty();
+            }
+        } else if maximized && !fullscreen && !self.settings.maximized {
+            self.settings.maximized = true;
+            self.store.mark_dirty();
+        }
+
+        // ---- keep it inside the screen ------------------------------------
+        if fullscreen || maximized {
+            return;
+        }
+        let inner = inner.map(|rect| [rect.width(), rect.height()]);
+        if let Some(fit) = self
+            .window_fit
+            .fit(inner, monitor.map(|size| [size.x, size.y]))
+        {
+            // The minimum has to come down first: a window cannot be resized
+            // below it, and on a screen smaller than the player's own minimum
+            // the resize would otherwise be silently refused.
+            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(fit.min.into()));
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(fit.size.into()));
+        }
+    }
+
     /// Keep the fullscreen flag in step with the real window.
     ///
     /// The window manager can leave fullscreen without asking us (a system
@@ -1511,6 +1632,7 @@ impl eframe::App for PlayerApp {
         self.handle_ipc();
         self.handle_engine_events(ctx);
         self.apply_window_chrome();
+        self.sync_display(ctx);
         self.sync_fullscreen(ctx);
         self.update_sleep_blocker();
         self.sync_engine();

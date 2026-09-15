@@ -28,6 +28,18 @@ use egui::{Context, Key, Modifiers};
 use crate::app::PlayerApp;
 use crate::state::{Mode, Overlay};
 
+/// How often the audio screen asks for a frame while it plays.
+///
+/// 30 frames a second is smooth enough for a clock and a progress ring, and it
+/// is a third of what the video path falls back to when no frame is due.
+const AUDIO_FRAME_SECONDS: f64 = 1.0 / 30.0;
+
+/// How often the interface asks for a frame while a file is still opening.
+///
+/// Nothing on screen moves then — the point is only to be there when it starts
+/// to, which is within a few tens of milliseconds for a local file.
+const OPENING_POLL_MS: u64 = 100;
+
 /// Paint one frame of the whole interface.
 pub fn draw(app: &mut PlayerApp, ctx: &Context) {
     handle_dropped_files(app, ctx);
@@ -73,12 +85,28 @@ fn schedule_repaint(app: &PlayerApp, ctx: &Context) {
     // settings window, and the end of a file still has to advance the playlist.
     match app.mode {
         Mode::Media => {
-            if app.engine.is_playing() {
-                let delay = app
-                    .engine
-                    .time_until_next_frame()
-                    .unwrap_or(0.008)
-                    .clamp(0.001, 0.05);
+            if app.engine.state() == mvp_core::PlaybackState::Opening {
+                // A file that is still opening has produced no frame *and* no
+                // event yet — the `Opened` event is what the audio screen takes
+                // its title and its length from, and the event is only ever
+                // read while a frame is being drawn. Nothing else asks for a
+                // frame in the meantime, so the interface has to keep asking,
+                // or it stays on 「正在打开…」 with a clock reading 0:00 until
+                // something else happens to move the window.
+                ctx.request_repaint_after(std::time::Duration::from_millis(OPENING_POLL_MS));
+            } else if app.engine.is_playing() {
+                // An audio file has no frames to keep up with. Its screen moves
+                // only as fast as the clock, the ring and the seek bar do, so it
+                // asks for a third of the frames a picture needs — the video
+                // path's "no frame due yet" fallback is 8 ms, and repainting at
+                // that rate for a file that will never produce a frame is a
+                // wake-up every 8 ms for the whole of the album.
+                let delay = if app.is_audio_only() {
+                    AUDIO_FRAME_SECONDS
+                } else {
+                    app.engine.time_until_next_frame().unwrap_or(0.008)
+                };
+                let delay = delay.clamp(0.001, 0.05);
                 ctx.request_repaint_after(std::time::Duration::from_secs_f64(delay));
             } else if app.engine.state().is_active() {
                 ctx.request_repaint_after(std::time::Duration::from_millis(120));

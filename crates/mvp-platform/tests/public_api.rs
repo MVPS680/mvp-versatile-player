@@ -8,6 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use mvp_platform::assoc::{self, AssocReport, FileKinds, APP_NAME, EXE_NAME, PROG_ID_PREFIX};
+use mvp_platform::monitor::{self, PixelRect};
 use mvp_platform::power::SleepBlocker;
 use mvp_platform::shell;
 use mvp_platform::single_instance::{self, AppInstance, IpcMessage};
@@ -109,4 +110,40 @@ fn power_signatures_are_stable() {
     let _: fn(bool) -> SleepBlocker = SleepBlocker::new;
     let _: fn(&SleepBlocker, bool) = SleepBlocker::set;
     let _: fn(&SleepBlocker) -> bool = SleepBlocker::is_enabled;
+}
+
+#[test]
+fn monitor_signatures_are_stable() {
+    // Only the signatures are named: measuring a monitor would make the test
+    // depend on the machine it runs on, and what has to stay stable is the
+    // shape of the API the player is built against.
+    let _: fn() -> Option<PixelRect> = monitor::primary_work_area;
+    let _: fn() -> Option<(f32, f32)> = monitor::primary_work_area_points;
+    let _: fn() -> u32 = monitor::system_dpi;
+    let _: fn(u32) -> f32 = monitor::dpi_scale;
+    let _: fn(i32, i32) -> Option<PixelRect> = monitor::work_area_at_point;
+    let _: fn((i32, i32, i32, i32)) -> Option<PixelRect> = monitor::work_area_for_rect;
+    let _: fn(isize) -> Option<PixelRect> = monitor::work_area_of_window;
+    let _: fn(isize) -> u32 = monitor::dpi_of_window;
+    let _: fn((f32, f32), (f32, f32)) -> bool = monitor::position_is_reachable;
+}
+
+#[test]
+fn monitor_rectangle_is_still_a_value_type() {
+    let rect = PixelRect {
+        x: -1920,
+        y: 0,
+        width: 1920,
+        height: 1080,
+    };
+    // `Copy` + `Eq`, and the edge helpers the callers rely on.
+    let copied: PixelRect = rect;
+    assert_eq!(copied, rect);
+    assert_eq!(rect.right(), 0);
+    assert_eq!(rect.bottom(), 1080);
+    assert!(PixelRect::default().is_empty());
+
+    // Physical pixels are fewer points the higher the scaling.
+    assert_eq!(rect.to_points(96), (1920.0, 1080.0));
+    assert_eq!(rect.to_points(144), (1280.0, 720.0));
 }

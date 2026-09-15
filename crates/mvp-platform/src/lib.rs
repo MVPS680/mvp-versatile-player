@@ -11,6 +11,9 @@
 //!   tinting, "reveal in Explorer", `ShellExecuteW` helpers, taskbar flashing.
 //! * [`power`] — [`power::SleepBlocker`] keeps the display awake during
 //!   playback.
+//! * [`monitor`] — how much room the screens give a window: work areas and
+//!   display scaling, measured before the window is created so it opens at a
+//!   size that fits.
 //!
 //! The crate is deliberately portable: every Windows-specific item has a
 //! `#[cfg(not(windows))]` counterpart that compiles and behaves as a no-op or
@@ -18,6 +21,7 @@
 //! on other hosts without pulling the `windows` crate in.
 
 pub mod assoc;
+pub mod monitor;
 pub mod power;
 pub mod shell;
 pub mod single_instance;

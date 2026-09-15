@@ -17,7 +17,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod display;
 mod icons;
+mod layout;
 mod settings;
 mod state;
 mod theme;
@@ -93,14 +95,39 @@ fn main() -> eframe::Result<()> {
     };
 
     // ---- persisted window geometry --------------------------------------
+    //
+    // Fitted to the screen *before* the window exists. The size on disk was
+    // chosen on whatever display the player last ran on, and that display may
+    // be wider, taller or less scaled than the one in front of the user now —
+    // asking for it unchanged is what used to open a window taller than the
+    // screen, with the transport bar off the bottom edge.
     let settings = settings::Settings::load();
+    let (window_size, window_min) = display::startup_size(settings.window_size);
+    // A remembered position is only usable while the screen it was chosen on is
+    // still there in the same shape. Unplugging a monitor or dropping the
+    // resolution otherwise reopens the window somewhere it cannot be reached,
+    // so an unreachable position is dropped and the window centred instead.
+    let window_pos = settings.window_pos.filter(|position| {
+        let reachable = display::position_reachable(*position, window_size);
+        if !reachable {
+            log::info!("上次的窗口位置 {position:?} 已不在屏幕上，改为居中显示");
+        }
+        reachable
+    });
+    log::info!(
+        "窗口尺寸 {:?}（最小 {:?}），屏幕可用区域 {:?}",
+        window_size,
+        window_min,
+        mvp_platform::monitor::primary_work_area_points()
+    );
+
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("MVP-Versatile-Player")
         .with_app_id("mvp-versatile-player")
-        .with_inner_size(settings.window_size)
-        .with_min_inner_size([720.0, 420.0])
+        .with_inner_size(window_size)
+        .with_min_inner_size(window_min)
         .with_icon(load_window_icon());
-    if let Some(position) = settings.window_pos {
+    if let Some(position) = window_pos {
         viewport = viewport.with_position(position);
     }
     // `-f` is a launch flag, not a preference: it must not be written back, or
@@ -116,7 +143,7 @@ fn main() -> eframe::Result<()> {
         viewport,
         renderer: eframe::Renderer::Glow,
         vsync: true,
-        centered: settings.window_pos.is_none(),
+        centered: window_pos.is_none(),
         persist_window: false,
         ..Default::default()
     };

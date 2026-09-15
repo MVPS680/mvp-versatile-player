@@ -198,6 +198,34 @@ impl MediaInfo {
     pub fn has_audio(&self) -> bool {
         !self.audio.is_empty()
     }
+
+    /// Whether this file has nothing but sound: audio, and nothing to show.
+    ///
+    /// A still image has no video stream either, but it does have a picture —
+    /// which is why the test goes through [`MediaInfo::has_video`] rather than
+    /// looking at the stream list, and why an image is never "audio only".
+    pub fn is_audio_only(&self) -> bool {
+        self.has_audio() && !self.has_video()
+    }
+
+    /// A container level metadata tag, looked up without regard to case.
+    ///
+    /// FFmpeg normalises the well-known names to lower case, but a third-party
+    /// muxer is free to write `Artist`, and some write an empty string rather
+    /// than leaving the tag out — so the lookup ignores case and treats blank
+    /// as absent.
+    pub fn tag(&self, name: &str) -> Option<&str> {
+        tag_value(&self.metadata, name)
+    }
+}
+
+/// The implementation of [`MediaInfo::tag`], free-standing so it can be tested
+/// without building a whole [`MediaInfo`].
+fn tag_value<'a>(tags: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    tags.iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.trim())
+        .filter(|value| !value.is_empty())
 }
 
 /// Best effort native name for an ISO-639-1/2 code, falling back to the code
@@ -654,5 +682,19 @@ mod tests {
         assert_eq!(default_index(&none, |v| *v), None);
         let plain = [false, false];
         assert_eq!(default_index(&plain, |v| *v), Some(0));
+    }
+
+    #[test]
+    fn tags_are_found_whatever_their_case() {
+        let tags = vec![
+            ("ARTIST".to_string(), " 周杰伦 ".to_string()),
+            ("album".to_string(), "十一月的萧邦".to_string()),
+            ("comment".to_string(), "   ".to_string()),
+        ];
+        assert_eq!(tag_value(&tags, "artist"), Some("周杰伦"));
+        assert_eq!(tag_value(&tags, "Album"), Some("十一月的萧邦"));
+        // A tag that is there but empty means "not set", not "".
+        assert_eq!(tag_value(&tags, "COMMENT"), None);
+        assert_eq!(tag_value(&tags, "title"), None);
     }
 }

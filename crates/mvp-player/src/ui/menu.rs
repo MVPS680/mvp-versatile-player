@@ -34,23 +34,37 @@ pub fn draw(app: &mut PlayerApp, ctx: &Context) {
                 help_menu(app, ui, &tokens);
 
                 // Right-aligned status: the current file and playback state.
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let state = app.engine.state();
-                    let label = crate::state::state_label(&state);
-                    let color = match crate::state::state_kind(&state) {
-                        crate::state::ToastKind::Success => tokens.success,
-                        crate::state::ToastKind::Error => tokens.danger,
-                        _ => tokens.text_weak,
-                    };
-                    ui.label(RichText::new(label).size(font::SMALL).color(color));
-                    if let Some(title) = app.now_playing_label() {
-                        ui.label(
-                            RichText::new(truncate(&title, 48))
-                                .size(font::SMALL)
-                                .color(tokens.text_weak),
-                        );
-                    }
-                });
+                //
+                // Dropped when the menu bar has no room left for it, and its
+                // title truncated by egui rather than by a fixed character
+                // count. A `right_to_left` layout given less space than it
+                // needs draws its contents *over* what came before it, which is
+                // what a narrow window used to do to the menus.
+                let free = ui.available_width();
+                if free >= 180.0 {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let state = app.engine.state();
+                        let label = crate::state::state_label(&state);
+                        let color = match crate::state::state_kind(&state) {
+                            crate::state::ToastKind::Success => tokens.success,
+                            crate::state::ToastKind::Error => tokens.danger,
+                            _ => tokens.text_weak,
+                        };
+                        ui.label(RichText::new(label).size(font::SMALL).color(color));
+                        if let Some(title) = app.now_playing_label() {
+                            ui.add_sized(
+                                egui::vec2((free * 0.45).clamp(90.0, 360.0), 18.0),
+                                egui::Label::new(
+                                    RichText::new(title)
+                                        .size(font::SMALL)
+                                        .color(tokens.text_weak),
+                                )
+                                .truncate()
+                                .selectable(false),
+                            );
+                        }
+                    });
+                }
             });
         });
 }
@@ -78,7 +92,9 @@ fn file_menu(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
         separator(ui, tokens);
         submenu_recent(app, ui, tokens);
         separator(ui, tokens);
-        if item(ui, tokens, "截图并保存", "S", app.mode != crate::state::Mode::Empty) {
+        // A snapshot is of a *picture*, so it goes with the picture: the audio
+        // screen has none, and greyed out is a better answer than an error.
+        if item(ui, tokens, "截图并保存", "S", app.has_picture()) {
             app.save_snapshot();
         }
         if item(ui, tokens, "打开截图目录", "", true) {
@@ -181,7 +197,9 @@ fn playback_menu(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
         if item(ui, tokens, "上一帧", ",", app.can_step_back()) {
             app.step_back_frame(ui.ctx());
         }
-        if item(ui, tokens, "下一帧", ".", active) {
+        // Stepping forward needs something to step *through*: `active` alone
+        // would offer it on the audio screen, where a step can only pause.
+        if item(ui, tokens, "下一帧", ".", active && app.has_picture()) {
             app.step_forward_frame(ui.ctx());
         }
         separator(ui, tokens);
@@ -254,7 +272,10 @@ fn playback_menu(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
 
 fn video_menu(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
     MenuButton::new("视频").ui(ui, |ui| {
-        let active = app.mode.is_media() || app.mode.is_image();
+        // The picture commands apply to a video frame or to an image, and the
+        // audio screen has neither — what is left in this menu is the encoding
+        // and the window, which are just as real there.
+        let active = app.has_picture();
         MenuButton::new("画面比例").ui(ui, |ui| {
             for mode in AspectMode::all() {
                 if ui

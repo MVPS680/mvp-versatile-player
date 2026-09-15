@@ -25,13 +25,18 @@ pub fn draw(app: &mut PlayerApp, ctx: &Context) {
         app.ui.audio_device_cache = None;
     }
     let tokens = app.theme.tokens.clone();
+    // The window is large by design — seven pages, two columns — which on a
+    // small screen is a window larger than the screen. It opens as big as the
+    // room allows and shrinks from there.
+    let size = crate::layout::Metrics::of(ctx).dialog_size([860.0, 620.0], [620.0, 440.0]);
+    let min = [620.0f32.min(size[0]), 440.0f32.min(size[1])];
     let mut open = true;
     egui::Window::new(RichText::new("设置").size(font::H2).strong())
         .open(&mut open)
         .collapsible(false)
         .resizable(true)
-        .default_size([860.0, 620.0])
-        .min_size([620.0, 440.0])
+        .default_size(size)
+        .min_size(min)
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
         .frame(
             egui::Frame::window(&ctx.style())

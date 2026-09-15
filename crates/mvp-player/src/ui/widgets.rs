@@ -60,11 +60,16 @@ pub fn row(
     /// Height of the label/control line itself.
     const LINE: f32 = 26.0;
 
-    let full = ui.available_width().max(220.0);
+    // The row uses whatever width it has. A forced 220 pt minimum used to push
+    // the control column past the right edge of a narrow settings page, where
+    // it was clipped rather than laid out — every row then ended at a different,
+    // invisible x.
+    let full = ui.available_width();
     // The control never takes more than its share, so a long label still has
-    // room to be read; the label column in turn never collapses to nothing.
-    let control_width = control_width.min(full * 0.6);
-    let label_width = (full - control_width - space::MD).max(90.0);
+    // room to be read; the label column gives way first, because the control is
+    // what the row is for.
+    let control_width = control_width.min(full * 0.6).max(0.0);
+    let label_width = (full - control_width - space::MD).max(0.0);
 
     // Reserve the whole row first and place the two columns by absolute
     // position. `allocate_ui_with_layout` sizes a region to its *content*, so
@@ -379,7 +384,9 @@ pub fn seek_bar(
     dragging: Option<f64>,
 ) -> SeekBarOutput {
     let height = 22.0;
-    let full = ui.available_width().max(80.0);
+    // The caller gives the bar its width; the floor only keeps a degenerate
+    // zero-width layout from producing a zero-length drag target.
+    let full = ui.available_width().max(24.0);
     let (rect, response) = ui.allocate_exact_size(Vec2::new(full, height), Sense::click_and_drag());
     let track_height = if response.hovered() || dragging.is_some() {
         6.0

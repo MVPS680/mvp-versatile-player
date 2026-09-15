@@ -17,10 +17,17 @@ pub fn draw(app: &mut PlayerApp, ctx: &Context) {
         .inner_margin(egui::Margin::symmetric(space::SM as i8, space::SM as i8))
         .stroke(egui::Stroke::new(1.0, tokens.border));
 
+    // The sidebar is a third of the interface on a wide screen and a nuisance
+    // on a narrow one: a fixed 460 pt ceiling would leave a 720 pt window with
+    // no picture left at all, so both its starting width and its limits follow
+    // the window.
+    let metrics = crate::layout::Metrics::of(ctx);
+    let (min_width, max_width) = metrics.sidebar_width_range();
+
     egui::SidePanel::right("mvp_sidebar")
         .frame(frame)
-        .default_width(300.0)
-        .width_range(240.0..=460.0)
+        .default_width(metrics.sidebar_default_width())
+        .width_range(min_width..=max_width)
         .resizable(true)
         .show(ctx, |ui| {
             let tabs: Vec<&str> = SidebarTab::all().iter().map(|t| t.label()).collect();
@@ -50,6 +57,10 @@ pub fn draw(app: &mut PlayerApp, ctx: &Context) {
 // ---------------------------------------------------------------------------
 
 fn playlist_tab(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
+    /// Space the hover actions (remove, move up, move down) occupy at the right
+    /// end of a row, so a title is never painted underneath them.
+    const ACTIONS_WIDTH: f32 = 84.0;
+
     // ---- toolbar ---------------------------------------------------------
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = space::XS;
@@ -78,22 +89,29 @@ fn playlist_tab(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
             app.mode = Mode::Empty;
             app.store.mark_dirty();
         }
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if widgets::tool_button(
-                tokens,
-                ui,
-                Icon::Refresh,
-                "移除不存在的文件",
-                !app.playlist.is_empty(),
-            )
-            .clicked()
-            {
-                let removed = app.playlist.prune_missing();
-                app.ui.playlist_selection = None;
-                app.toast(Toast::info(format!("已移除 {removed} 个无效条目")));
-                app.store.mark_dirty();
-            }
-        });
+        // Six buttons already fill the sidebar at its narrowest, so the prune
+        // button only appears when there is really room for it. Dropping it is
+        // what keeps the toolbar aligned: a `right_to_left` layout given less
+        // space than it needs draws its contents over what came before it, and
+        // the prune button has a menu entry to fall back on.
+        if ui.available_width() >= 34.0 {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if widgets::tool_button(
+                    tokens,
+                    ui,
+                    Icon::Refresh,
+                    "移除不存在的文件",
+                    !app.playlist.is_empty(),
+                )
+                .clicked()
+                {
+                    let removed = app.playlist.prune_missing();
+                    app.ui.playlist_selection = None;
+                    app.toast(Toast::info(format!("已移除 {removed} 个无效条目")));
+                    app.store.mark_dirty();
+                }
+            });
+        }
     });
 
     ui.add_space(space::XS);
@@ -170,10 +188,16 @@ fn playlist_tab(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
         }
 
         // Title.
-        painter.text(
+        //
+        // Painted, not laid out, so nothing would stop a long name from running
+        // under the hover buttons and out of the panel. The row therefore
+        // truncates by the room it actually has *and* paints inside a clip
+        // rectangle, which is what holds at every sidebar width.
+        let title_room = (rect.right() - ACTIONS_WIDTH) - (rect.left() + 30.0);
+        painter.with_clip_rect(rect.intersect(painter.clip_rect())).text(
             egui::pos2(rect.left() + 30.0, rect.center().y - 6.0),
             egui::Align2::LEFT_CENTER,
-            truncate(&title, 40),
+            truncate(&title, ((title_room / 9.0).floor() as usize).clamp(6, 40)),
             egui::FontId::proportional(font::BODY),
             if highlighted { tokens.text } else { tokens.text_weak },
         );
@@ -209,7 +233,7 @@ fn playlist_tab(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
             kind_icon,
             tokens.text_muted,
         );
-        painter.text(
+        painter.with_clip_rect(rect.intersect(painter.clip_rect())).text(
             egui::pos2(rect.left() + 44.0, rect.center().y + 8.0),
             egui::Align2::LEFT_CENTER,
             subtitle,

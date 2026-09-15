@@ -18,10 +18,20 @@ pub fn draw(app: &mut PlayerApp, ctx: &Context) {
     }
 }
 
+/// The width for a dialog that is a fixed size by design.
+///
+/// A dialog is drawn in its own layer, on top of everything and clipped by
+/// nothing, so a 460 pt dialog in a 400 pt window simply hangs off the side of
+/// the screen — with its buttons, which is where the "确定" was supposed to be.
+fn dialog_width(ctx: &Context, preferred: f32) -> f32 {
+    preferred.min((ctx.screen_rect().width() - 2.0 * space::LG).max(200.0))
+}
+
 fn url_dialog(app: &mut PlayerApp, ctx: &Context) {
     let tokens = app.theme.tokens.clone();
     let mut open = true;
     let mut submit = false;
+    let width = dialog_width(ctx, 460.0);
     egui::Window::new(RichText::new("打开网络串流").size(font::H3).strong())
         .open(&mut open)
         .collapsible(false)
@@ -33,7 +43,7 @@ fn url_dialog(app: &mut PlayerApp, ctx: &Context) {
                 .inner_margin(egui::Margin::same(space::LG as i8)),
         )
         .show(ctx, |ui| {
-            ui.set_width(460.0);
+            ui.set_width(width);
             ui.label(
                 RichText::new("支持 http、https、rtsp、rtmp、mms、udp、rtp、srt 等协议")
                     .size(font::TINY)
@@ -98,11 +108,12 @@ fn url_dialog(app: &mut PlayerApp, ctx: &Context) {
 fn shortcuts_dialog(app: &mut PlayerApp, ctx: &Context) {
     let tokens = app.theme.tokens.clone();
     let mut open = true;
+    let size = crate::layout::Metrics::of(ctx).dialog_size([440.0, 520.0], [320.0, 320.0]);
     egui::Window::new(RichText::new("键盘快捷键").size(font::H3).strong())
         .open(&mut open)
         .collapsible(false)
         .resizable(true)
-        .default_size([440.0, 520.0])
+        .default_size(size)
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
         .frame(
             egui::Frame::window(&ctx.style())
@@ -145,6 +156,7 @@ fn about_dialog(app: &mut PlayerApp, ctx: &Context) {
     let tokens = app.theme.tokens.clone();
     let mut open = true;
     let mut show_shortcuts = false;
+    let width = dialog_width(ctx, 400.0);
     egui::Window::new(RichText::new("关于").size(font::H3).strong())
         .open(&mut open)
         .collapsible(false)
@@ -156,7 +168,7 @@ fn about_dialog(app: &mut PlayerApp, ctx: &Context) {
                 .inner_margin(egui::Margin::same(space::LG as i8)),
         )
         .show(ctx, |ui| {
-            ui.set_width(400.0);
+            ui.set_width(width);
             ui.vertical_centered(|ui| {
                 let (rect, _) =
                     ui.allocate_exact_size(egui::Vec2::splat(56.0), egui::Sense::hover());
