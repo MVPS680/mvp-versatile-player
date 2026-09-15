@@ -324,23 +324,29 @@ pub mod shadow {
     use egui::epaint::Shadow;
     use egui::Color32;
 
-    /// Menus, tooltips and popovers.
+    /// Menus and popovers: a short, fairly dark shadow, because a menu is close to
+    /// the surface it covers.
     pub fn popup() -> Shadow {
         Shadow {
-            offset: [0, 6],
+            offset: [0, 8],
             blur: 20,
             spread: 0,
-            color: Color32::from_black_alpha(120),
+            color: Color32::from_black_alpha(0x2E),
         }
     }
 
-    /// Floating windows such as the settings sheet.
+    /// Floating windows and sheets.
+    ///
+    /// The reference implementation's `0 16px 32px rgba(0,0,0,.12)`: a *light*
+    /// shadow. The glass is supposed to float, not to sit in a black smear — the
+    /// previous value was half-again as dark and is the other half of why the
+    /// control island looked heavy.
     pub fn window() -> Shadow {
         Shadow {
-            offset: [0, 12],
-            blur: 36,
+            offset: [0, 16],
+            blur: 32,
             spread: 0,
-            color: Color32::from_black_alpha(150),
+            color: Color32::from_black_alpha(0x1F),
         }
     }
 }

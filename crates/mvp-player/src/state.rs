@@ -387,6 +387,13 @@ pub struct UiState {
     pub last_snapshot: Option<PathBuf>,
     /// Set while the user is scrubbing with the mouse over the video.
     pub video_hover_time: Option<f64>,
+    /// Where the picture was drawn this frame, when there is one.
+    ///
+    /// The glass surfaces that float over the picture need it to find the part of
+    /// the video texture behind themselves: a `glow`-backed `egui` cannot read the
+    /// framebuffer, but the picture is a texture this program uploaded, so a blur of
+    /// the backdrop is a blur of *that*.
+    pub picture_rect: Option<egui::Rect>,
 }
 
 impl Default for UiState {
@@ -420,6 +427,7 @@ impl Default for UiState {
             ffmpeg_config: String::new(),
             last_snapshot: None,
             video_hover_time: None,
+            picture_rect: None,
         }
     }
 }

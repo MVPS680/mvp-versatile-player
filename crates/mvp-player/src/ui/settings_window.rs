@@ -32,7 +32,8 @@ pub fn draw(app: &mut PlayerApp, ctx: &Context) {
     let size = crate::layout::Metrics::of(ctx).dialog_size([860.0, 620.0], [620.0, 440.0]);
     let min = [620.0f32.min(size[0]), 440.0f32.min(size[1])];
     let mut open = true;
-    egui::Window::new(RichText::new("设置").size(font::H2).strong())
+    let mut slot = None;
+    let shown = egui::Window::new(RichText::new("设置").size(font::H2).strong())
         .open(&mut open)
         .collapsible(false)
         .resizable(true)
@@ -41,8 +42,11 @@ pub fn draw(app: &mut PlayerApp, ctx: &Context) {
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
         // Liquid Glass. The sheet is the one surface here that floats over the
         // picture, so it is the one that gets the full material.
-        .frame(glass::window_shell(&tokens, glass::sheet_margin(), glass::SHEET_RADIUS))
+        .frame(glass::window_shell(glass::sheet_margin(), glass::SHEET_RADIUS))
         .show(ctx, |ui| {
+            // Reserved before the page is laid out: the frosted picture is opaque, so
+            // it has to land underneath everything the sheet draws.
+            slot = Some(widgets::frost_slot(ui));
             ui.horizontal_top(|ui| {
                 // ---- tab rail ------------------------------------------
                 ui.vertical(|ui| {
@@ -113,15 +117,21 @@ pub fn draw(app: &mut PlayerApp, ctx: &Context) {
                         });
                     });
             });
-            // Over the content, once the sheet has been laid out: the graded veil,
-            // the bevel, the lit rim and the highlight under the pointer.
-            glass::paint_overlay_ui(
-                ui,
-                &tokens,
-                glass::content_rect(ui, glass::sheet_margin()),
-                glass::Glass::float(glass::SHEET_RADIUS),
-            );
         });
+    // The sheet's glass is painted over the *window*, title bar included. Filled from
+    // the body's rect alone it would leave the title strip with no glass on it at all
+    // — a transparent band along the top of the panel.
+    if let Some(shown) = shown {
+        widgets::frost_surface(
+            ctx,
+            app,
+            &tokens,
+            slot,
+            shown.response.layer_id,
+            shown.response.rect,
+            glass::Glass::sheet(glass::SHEET_RADIUS),
+        );
+    }
     if !open {
         app.ui.close_overlay();
     }

@@ -28,18 +28,46 @@ fn dialog_width(ctx: &Context, preferred: f32) -> f32 {
     preferred.min((ctx.screen_rect().width() - 2.0 * space::LG).max(200.0))
 }
 
+/// Frost a dialog's sheet over the whole *window*, title bar included.
+///
+/// The rect a dialog's closure can measure is only its body — `egui::Window` lays the
+/// title bar out inside its frame but outside that `Ui` — so the glass is painted once
+/// `show` has handed back the window's own rect. Done from the body alone, every dialog
+/// shows a strip along its top with no glass on it at all.
+fn glass_sheet<R>(
+    ctx: &Context,
+    app: &PlayerApp,
+    tokens: &crate::theme::Tokens,
+    slot: Option<egui::layers::ShapeIdx>,
+    shown: Option<egui::InnerResponse<R>>,
+) {
+    if let Some(shown) = shown {
+        widgets::frost_surface(
+            ctx,
+            app,
+            tokens,
+            slot,
+            shown.response.layer_id,
+            shown.response.rect,
+            glass::Glass::sheet(glass::SHEET_RADIUS),
+        );
+    }
+}
+
 fn url_dialog(app: &mut PlayerApp, ctx: &Context) {
     let tokens = app.theme.tokens.clone();
     let mut open = true;
+    let mut slot = None;
     let mut submit = false;
     let width = dialog_width(ctx, 460.0);
-    egui::Window::new(RichText::new("打开网络串流").size(font::H3).strong())
+    let shown = egui::Window::new(RichText::new("打开网络串流").size(font::H3).strong())
         .open(&mut open)
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -40.0))
-        .frame(glass::window_shell(&tokens, glass::sheet_margin(), glass::SHEET_RADIUS))
+        .frame(glass::window_shell(glass::sheet_margin(), glass::SHEET_RADIUS))
         .show(ctx, |ui| {
+            slot = Some(widgets::frost_slot(ui));
             ui.set_width(width);
             ui.label(
                 RichText::new("支持 http、https、rtsp、rtmp、mms、udp、rtp、srt 等协议")
@@ -82,15 +110,8 @@ fn url_dialog(app: &mut PlayerApp, ctx: &Context) {
                     }
                 });
             });
-            // Over the content: the veil, the lit rim and the light that follows
-            // the pointer across the sheet.
-            glass::paint_overlay_ui(
-                ui,
-                &tokens,
-                glass::content_rect(ui, glass::sheet_margin()),
-                glass::Glass::float(glass::SHEET_RADIUS),
-            );
         });
+    glass_sheet(ctx, app, &tokens, slot, shown);
     if submit {
         let url = app.ui.url_input.trim().to_string();
         if url.is_empty() {
@@ -108,15 +129,17 @@ fn url_dialog(app: &mut PlayerApp, ctx: &Context) {
 fn shortcuts_dialog(app: &mut PlayerApp, ctx: &Context) {
     let tokens = app.theme.tokens.clone();
     let mut open = true;
+    let mut slot = None;
     let size = crate::layout::Metrics::of(ctx).dialog_size([440.0, 520.0], [320.0, 320.0]);
-    egui::Window::new(RichText::new("键盘快捷键").size(font::H3).strong())
+    let shown = egui::Window::new(RichText::new("键盘快捷键").size(font::H3).strong())
         .open(&mut open)
         .collapsible(false)
         .resizable(true)
         .default_size(size)
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-        .frame(glass::window_shell(&tokens, glass::sheet_margin(), glass::SHEET_RADIUS))
+        .frame(glass::window_shell(glass::sheet_margin(), glass::SHEET_RADIUS))
         .show(ctx, |ui| {
+            slot = Some(widgets::frost_slot(ui));
             ui.horizontal(|ui| {
                 let (rect, _) =
                     ui.allocate_exact_size(egui::Vec2::splat(22.0), egui::Sense::hover());
@@ -142,15 +165,8 @@ fn shortcuts_dialog(app: &mut PlayerApp, ctx: &Context) {
                         });
                     }
                 });
-            // Over the content: the veil, the lit rim and the light that follows
-            // the pointer across the sheet.
-            glass::paint_overlay_ui(
-                ui,
-                &tokens,
-                glass::content_rect(ui, glass::sheet_margin()),
-                glass::Glass::float(glass::SHEET_RADIUS),
-            );
         });
+    glass_sheet(ctx, app, &tokens, slot, shown);
     if !open {
         app.ui.close_overlay();
     }
@@ -159,15 +175,17 @@ fn shortcuts_dialog(app: &mut PlayerApp, ctx: &Context) {
 fn about_dialog(app: &mut PlayerApp, ctx: &Context) {
     let tokens = app.theme.tokens.clone();
     let mut open = true;
+    let mut slot = None;
     let mut show_shortcuts = false;
     let width = dialog_width(ctx, 400.0);
-    egui::Window::new(RichText::new("关于").size(font::H3).strong())
+    let shown = egui::Window::new(RichText::new("关于").size(font::H3).strong())
         .open(&mut open)
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-        .frame(glass::window_shell(&tokens, glass::sheet_margin(), glass::SHEET_RADIUS))
+        .frame(glass::window_shell(glass::sheet_margin(), glass::SHEET_RADIUS))
         .show(ctx, |ui| {
+            slot = Some(widgets::frost_slot(ui));
             ui.set_width(width);
             ui.vertical_centered(|ui| {
                 let (rect, _) =
@@ -225,15 +243,8 @@ fn about_dialog(app: &mut PlayerApp, ctx: &Context) {
                     );
                 }
             });
-            // Over the content: the veil, the lit rim and the light that follows
-            // the pointer across the sheet.
-            glass::paint_overlay_ui(
-                ui,
-                &tokens,
-                glass::content_rect(ui, glass::sheet_margin()),
-                glass::Glass::float(glass::SHEET_RADIUS),
-            );
         });
+    glass_sheet(ctx, app, &tokens, slot, shown);
     if show_shortcuts {
         app.ui.open_overlay(Overlay::Shortcuts);
         return;

@@ -16,6 +16,92 @@ use crate::icons::{self, Icon};
 use crate::state::Toast;
 use crate::theme::{self, font, radius, space, Tokens};
 
+/// A palette-free description of the picture the glass should frost.
+///
+/// `None` when there is nothing to frost — no picture (audio, a still image, an empty
+/// window) or a picture that has been rotated or mirrored. The frost samples the
+/// video texture through the rectangle the frame was drawn into, and those two
+/// transformations break exactly that correspondence; a wrong blur is worse than
+/// none.
+pub fn frost_source(app: &PlayerApp) -> Option<(egui::TextureId, egui::Rect)> {
+    let texture = app.texture.as_ref()?;
+    let rect = app.ui.picture_rect?;
+    if app.settings.rotation != 0 || app.settings.flip_h || app.settings.flip_v {
+        return None;
+    }
+    Some((texture.id(), rect))
+}
+
+/// Reserve the slot the frosted backdrop goes into.
+///
+/// Called *before* the content is laid out: the frost is opaque, so it has to land
+/// under the labels, and a floating surface only knows its rect once they exist.
+pub fn frost_slot(ui: &Ui) -> egui::layers::ShapeIdx {
+    ui.painter().add(egui::Shape::Noop)
+}
+
+/// The same glass for a *window* or an *area*, whose rect is only known once it has
+/// been laid out.
+///
+/// `egui::Window` lays its title bar out inside its own frame and *outside* the `Ui`
+/// the closure is handed, so the rect a closure can measure is the body — the title
+/// bar is not in it. Filled from the body's rect alone, a sheet shows a strip along
+/// its top with no glass on it at all: transparent, taking its colour from whatever
+/// is behind. The window's own rect comes back from `show`, and filling the slot
+/// afterwards is not a hack — the shape list is not consumed until the end of the
+/// frame, which is exactly the mechanism egui uses for the title bar's own
+/// background. The order works out too: the title bar is painted *after* the body, so
+/// the material still lands under the title's text and under the body's widgets. The
+/// whole sheet ends up one colour, with everything still readable on top of it.
+///
+/// `slot` is `None` when the container never ran its closure (a window that is
+/// closed), and then there is nothing to fill.
+pub fn frost_surface(
+    ctx: &egui::Context,
+    app: &PlayerApp,
+    tokens: &crate::theme::Tokens,
+    slot: Option<egui::layers::ShapeIdx>,
+    layer: egui::LayerId,
+    rect: Rect,
+    glass: crate::ui::glass::Glass,
+) {
+    if let Some(slot) = slot {
+        frost_into(&ctx.layer_painter(layer), app, slot, tokens, rect, glass);
+    }
+}
+
+/// The frosted picture plus the material, written into a shape slot.
+///
+/// The order is the whole point. The frost is opaque — it replaces the surface's own
+/// colour with the film's — so the bed has to go *on top of* it, not underneath: a
+/// panel whose colour comes from the video shows one colour where the film is bright
+/// and another where it is dark, which reads as two different panels glued together.
+/// With the bed over the frost the tone stays the surface's own, and the blurred film
+/// only shifts it. When there is nothing to frost, the material is still drawn: a
+/// surface must never be left un-glassed just because the picture is missing.
+fn frost_into(
+    painter: &egui::Painter,
+    app: &PlayerApp,
+    slot: egui::layers::ShapeIdx,
+    tokens: &crate::theme::Tokens,
+    rect: Rect,
+    glass: crate::ui::glass::Glass,
+) {
+    let mut shapes = Vec::new();
+    if let Some((texture, source)) = frost_source(app) {
+        shapes.extend(crate::ui::glass::frost_shapes(
+            texture,
+            rect,
+            source,
+            glass.radius,
+            crate::ui::glass::FROST_RADIUS,
+        ));
+    }
+    // The bed, the wash, the sheen and the rim, in that order, over the frost.
+    shapes.extend(crate::ui::glass::shapes(tokens, rect, glass, 1.0));
+    painter.set(slot, egui::Shape::Vec(shapes));
+}
+
 /// A block-level heading with a hairline underneath.
 ///
 /// The heading uses the bold cut of the system font and the hairline uses the
@@ -751,13 +837,24 @@ pub fn draw_toast(app: &PlayerApp, ctx: &Context, toast: &Toast) {
     // the frame behind it visible while the message leaves.
     painter.multiply_opacity(opacity);
     let radius = size.y / 2.0;
+    // The frosted picture goes down first: the HUD slides over the film, and a
+    // blurred copy of what is behind it is what makes the capsule read as glass
+    // rather than as a hole cut in the frame.
+    if let Some((texture, source)) = frost_source(app) {
+        crate::ui::glass::frosted(
+            &painter,
+            texture,
+            rect,
+            source,
+            radius,
+            crate::ui::glass::FROST_RADIUS,
+        );
+    }
     crate::ui::glass::paint(
         &painter,
         tokens,
         rect,
         crate::ui::glass::Glass::float(radius),
-        ctx.pointer_hover_pos(),
-        true,
     );
     // The state colour stays a wash *on* the glass, so a warning still reads as a
     // warning without turning the capsule into a coloured slab.
@@ -944,9 +1041,7 @@ pub fn pill_button(
             painter,
             tokens,
             rect,
-            crate::ui::glass::Glass::capsule(rect.height()).interactive(false),
-            None,
-            true,
+            crate::ui::glass::Glass::capsule(rect.height()),
         );
         if enabled && hover.max(press) > 0.0 {
             painter.rect_filled(

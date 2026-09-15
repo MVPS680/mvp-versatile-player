@@ -13,6 +13,9 @@ use crate::ui::widgets;
 pub fn draw(app: &mut PlayerApp, ctx: &Context) {
     let tokens = app.theme.tokens.clone();
     let frame = egui::Frame::new().fill(tokens.letterbox);
+    // Cleared every frame: only `media_view` knows where a picture went, and a stale
+    // rect would have the glass frost an empty stretch of letterbox.
+    app.ui.picture_rect = None;
     egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
         match app.mode {
             Mode::Empty => empty_state(app, ui, &tokens),
@@ -58,6 +61,9 @@ fn media_view(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
     } else {
         Some(video_view(app, ui, tokens, area))
     };
+    // Remembered for the glass surfaces that float over the picture: they frost the
+    // video texture behind themselves, and this is the part of the screen it is on.
+    app.ui.picture_rect = picture;
 
     // ---- subtitles ------------------------------------------------------
     // Over the picture — or, with no picture to be over, along the bottom of
@@ -69,9 +75,7 @@ fn media_view(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
     }
 
     // ---- interaction ----------------------------------------------------
-    // Dragging moves the picture around, which is not something the audio
-    // screen's record does.
-    handle_video_interaction(app, ui, &response, picture.is_some());
+    handle_video_interaction(app, ui, &response);
 
     // ---- state banners --------------------------------------------------
     let state = app.engine.state();
@@ -189,17 +193,15 @@ fn video_view(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens, area: Rect) -> 
     rect
 }
 
-/// Clicks, drags and the wheel, shared by the video canvas and the audio
-/// screen.
+/// Clicks, drags and the wheel on the video canvas and the audio screen.
 ///
-/// `pan` is whether dragging moves a picture around; on the audio screen there
-/// is nothing to move, and a drag is then only a way of waking the controls.
-fn handle_video_interaction(
-    app: &mut PlayerApp,
-    ui: &mut Ui,
-    response: &egui::Response,
-    pan: bool,
-) {
+/// Nothing here moves the picture. A video is fitted to the canvas — that is what
+/// `destination_rect` decides, from the source size and the aspect setting — so a drag
+/// over it used to do nothing to the video at all while quietly writing to the *image*
+/// viewer's pan, which is a different mode's state: dragging a *still* is the viewer's
+/// job, and it has its own handling for it. What a drag does here is wake the
+/// controls, which is what a click does.
+fn handle_video_interaction(app: &mut PlayerApp, ui: &mut Ui, response: &egui::Response) {
     if response.double_clicked() && app.settings.double_click_fullscreen {
         app.toggle_fullscreen(ui.ctx());
         return;
@@ -210,9 +212,6 @@ fn handle_video_interaction(
     }
     if response.dragged() {
         app.ui.wake_controls(3.0);
-        if pan {
-            app.image.pan(response.drag_delta().x, response.drag_delta().y);
-        }
     }
 
     // Scroll: volume by default, seek with Ctrl.
@@ -872,16 +871,15 @@ fn paint_checkerboard(painter: &egui::Painter, rect: Rect, tokens: &Tokens) {
 
 /// The player's welcome screen: shown until something is open.
 ///
-/// A tall block on a short window, so it scrolls rather than losing its bottom
-/// half off the screen, and every width inside it is taken from the room there
-/// actually is — a 460 pt pair of buttons centred on a 400 pt canvas used to be
-/// centred on a point outside the window.
+/// Deliberately **not** a `ScrollArea`. The canvas is where a picture goes; a column
+/// that can be scrolled inside it reads as a web page rather than as a player, and the
+/// wheel over the canvas belongs to the volume (and to seeks with Ctrl held) — a
+/// scroll area in front of it would swallow both. What the scrolling was standing in
+/// for is done properly here instead: every block and every gap takes its size from
+/// the room actually available, so the column *fits* the canvas on a short window
+/// rather than sliding around in it.
 fn empty_state(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
-    egui::ScrollArea::vertical()
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            empty_blocks(app, ui, tokens);
-        });
+    empty_blocks(app, ui, tokens);
 }
 
 /// The blocks in the welcome column, top to bottom.
@@ -893,7 +891,19 @@ fn empty_blocks(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
     let metrics = crate::layout::Metrics::new(area.width(), area.height());
     let content = metrics.content_width(room, 460.0, 180.0);
     let recent_width = metrics.content_width(room, 520.0, 180.0);
-    let logo = if area.height() < 560.0 { 60.0 } else { 84.0 };
+    // Two steps down in size, so the column can give room back without ever being
+    // clipped: the logo shrinks, the gaps close up, and the recent list — the one
+    // block that is a convenience rather than the screen's purpose — goes away
+    // entirely before the buttons would.
+    let short = area.height() < 620.0;
+    let tiny = area.height() < 440.0;
+    let logo = match (tiny, short) {
+        (true, _) => 44.0,
+        (false, true) => 60.0,
+        (false, false) => 84.0,
+    };
+    let gap_before_buttons = if short { space::LG } else { space::XL };
+    let gap_after_buttons = if short { space::SM } else { space::MD };
 
     ui.scope_builder(egui::UiBuilder::new().max_rect(area.shrink(space::XL)), |ui| {
         ui.vertical_centered(|ui| {
@@ -933,7 +943,7 @@ fn empty_blocks(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
                     .color(tokens.text_weak),
             );
 
-            ui.add_space(space::XL);
+            ui.add_space(gap_before_buttons);
             ui.horizontal(|ui| {
                 let width = content;
                 let half = (width / 2.0 - space::XS).max(48.0);
@@ -949,7 +959,7 @@ fn empty_blocks(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
                 }
             });
 
-            ui.add_space(space::MD);
+            ui.add_space(gap_after_buttons);
             ui.vertical_centered(|ui| {
                 if widgets::secondary_button(ui, tokens, "打开网络串流…", 0.0) {
                     app.ui.url_input.clear();
@@ -958,7 +968,7 @@ fn empty_blocks(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
                 }
             });
 
-            ui.add_space(space::MD);
+            ui.add_space(gap_after_buttons);
             ui.label(
                 RichText::new("也可以直接把文件或文件夹拖入窗口")
                     .size(font::TINY)
@@ -967,16 +977,25 @@ fn empty_blocks(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
 
             // ---- recent files ------------------------------------------
             app.settings.prune_recent();
-            if !app.settings.recent_files.is_empty() {
-                ui.add_space(space::XXL);
+            if !app.settings.recent_files.is_empty() && !tiny {
+                ui.add_space(if short { space::LG } else { space::XXL });
                 ui.label(
                     RichText::new("最近播放")
-                        .font(crate::theme::strong_font(font::H3))
+                        .font(crate::theme::strong_font(if short {
+                            font::BODY
+                        } else {
+                            font::H3
+                        }))
                         .color(tokens.text),
                 );
                 ui.add_space(space::XS);
-                let entries: Vec<std::path::PathBuf> =
-                    app.settings.recent_files.iter().take(6).cloned().collect();
+                let entries: Vec<std::path::PathBuf> = app
+                    .settings
+                    .recent_files
+                    .iter()
+                    .take(if short { 3 } else { 6 })
+                    .cloned()
+                    .collect();
                 let mut chosen = None;
                 let width = recent_width;
                 for path in entries {
