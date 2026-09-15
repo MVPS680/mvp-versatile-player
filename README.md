@@ -104,8 +104,26 @@
 .\scripts\setup-ffmpeg.ps1
 ```
 
-脚本会下载 BtbN 的 FFmpeg 9.0 **共享库**构建、解压到 `C:\ffmpeg-dev`，
-探测 `libclang`，并把结果写进 `.cargo/config.toml`。
+脚本会找到（或下载）BtbN 的 FFmpeg 9.0 **共享库**构建，探测 `libclang`，
+并把两个路径写进 `.cargo/config.toml`。
+
+> `.cargo/config.toml` 是**本机生成**的文件，已被 `.gitignore` 忽略。
+> 它记录的是「这台机器上 SDK 装在哪」——这是机器的事实，不是项目的配置：
+> 入库会让每次 `git pull` 都用别人的绝对路径盖掉自己的。所以每台机器跑一次
+> 本脚本即可，之后永远不需要手改路径。
+>
+> 脚本可以重复运行：已解压的 FFmpeg 会被复用（不会重新下载 1 GB），
+> 没变化时不会重写配置。常用参数：`-FfmpegDir <已有开发包>`、
+> `-LibclangPath <目录或 dll>`、`-NoDownload`（不联网，找不到就报错）。
+
+`scripts/dev.ps1` 在发现配置缺失时会自动跑一次这个脚本（带 `-NoDownload`，
+避免一次测试命令静默下载一整个 GB），所以新克隆的仓库直接：
+
+```powershell
+.\scripts\dev.ps1 test --workspace
+```
+
+也能跑起来。
 
 <details>
 <summary>手动准备</summary>
@@ -118,7 +136,9 @@
 > ⚠️ 请使用 **n9.0 发行分支**，不要用 `master`。`master` 的枚举里包含
 > `ffmpeg-next 9.0.0` 尚不认识的编解码器，会编译失败。
 
-解压后把路径写入 `.cargo/config.toml`（或直接设置同名环境变量）：
+解压后重跑 `scripts/setup-ffmpeg.ps1 -FfmpegDir <解压目录>` 即可；
+也可以自己写 `.cargo/config.toml`（或直接设置同名环境变量）。两者都只是
+本机路径的记录，不入库：
 
 ```toml
 [env]
@@ -126,8 +146,24 @@ FFMPEG_DIR = { value = "C:/ffmpeg-dev/ffmpeg-n9.0-latest-win64-gpl-shared-9.0", 
 LIBCLANG_PATH = { value = "C:/path/to/clang/native", force = false }
 ```
 
-`LIBCLANG_PATH` 缺失时，如果装了 Python 可以直接 `pip install libclang`，
-其自带的 `libclang.dll` 位于 `Lib/site-packages/clang/native`。
+`LIBCLANG_PATH` 缺失时，脚本会按下面顺序找（见 `scripts/ffmpeg-env.ps1`）：
+环境变量 → 已写的配置 → `python -c "import clang"`（`pip install libclang` 自带的
+`libclang.dll` 就在 `Lib/site-packages/clang/native`）→ LLVM / Scoop /
+Visual Studio 自带的 LLVM。如果把 LLVM 装到 `C:\Program Files\LLVM`
+（`clang-sys` 会自己去那里找），就完全不需要写 `LIBCLANG_PATH`。
+
+</details>
+
+<details>
+<summary>构建失败时先看这两条</summary>
+
+- `Unable to find libclang: … set the LIBCLANG_PATH environment variable …`
+  —— `ffmpeg-sys-next` 的 bindgen 步骤没找到 DLL。重跑
+  `scripts/setup-ffmpeg.ps1`；它找不到时会打印该装什么。
+- `FFMPEG_DIR` 相关的链接错误 / 找不到 `avcodec.lib`
+  —— 开发包不在预期位置。用 `scripts/setup-ffmpeg.ps1 -FfmpegDir <目录>` 指过去。
+
+两者都只影响本机构建输入，不会影响仓库里的任何文件。
 
 </details>
 
@@ -147,8 +183,9 @@ LIBCLANG_PATH = { value = "C:/path/to/clang/native", force = false }
 .\scripts\dev.ps1 test --workspace
 ```
 
-`scripts/dev.ps1` 只是把 FFmpeg 的 `bin` 目录加入 `PATH` 后转发给 cargo；
-它存在的唯一原因是 `cargo run` / `cargo test` 需要能在运行时找到那些 DLL。
+`scripts/dev.ps1` 把 FFmpeg 的 `bin` 目录加入 `PATH` 后转发给 cargo
+（缺配置时先跑一次 `setup-ffmpeg.ps1`）；它存在的唯一原因是
+`cargo run` / `cargo test` 需要能在运行时找到那些 DLL。
 `build.rs` 会把 DLL 复制到 `target/<profile>/`，所以直接运行
 `target\release\mvp-versatile-player.exe` 也是可以的。
 
@@ -316,8 +353,7 @@ FFmpeg 的表在第一次用到时才初始化，声卡在第一次播放时才�
 文件关联会真的写注册表，所以那部分测试默认是 `#[ignore]` 的。要验证它：
 
 ```powershell
-$env:PATH = "C:\ffmpeg-dev\ffmpeg-n9.0-latest-win64-gpl-shared-9.0\bin;$env:PATH"
-cargo test -p mvp-platform --test registry_live -- --ignored --test-threads=1
+.\scripts\dev.ps1 test -p mvp-platform --test registry_live -- --ignored --test-threads=1
 ```
 
 这 5 个测试会注册、检查、再注销，并确认：
@@ -403,8 +439,8 @@ $env:RUST_LOG = "mvp_core=debug"   # 需要看内部细节时
 │   ├── mvp-platform/  Windows 集成
 │   ├── mvp-subtitle/  字幕解析
 │   └── mvp-player/    egui 界面（可执行文件）
-├── scripts/           构建、打包、图标与测试素材生成
+├── scripts/           构建、打包、图标与测试素材生成（ffmpeg-env.ps1 是本机路径探测）
 ├── testdata/          端到端测试用的媒体文件（约 500 KB）
 ├── Cargo.toml         workspace
-└── .cargo/config.toml FFmpeg / libclang 路径
+└── .cargo/config.toml FFmpeg / libclang 路径（本机生成，未纳入版本控制）
 ```

@@ -6,6 +6,11 @@
 # The packaged player ships those DLLs next to the executable and does not need
 # this script; it exists purely to make `cargo test` work from a dev checkout.
 #
+# A fresh clone has no `.cargo/config.toml` (it is generated per machine and
+# ignored by git — see `ffmpeg-env.ps1`), so this script prepares it on the way
+# past. `-NoDownload` there keeps a stray `dev.ps1 test` from silently pulling a
+# gigabyte of SDK: with nothing on the disk it stops and says what to run.
+#
 # Usage:  .\scripts\dev.ps1 test -p mvp-core
 #         .\scripts\dev.ps1 run -p mvp-player --release
 
@@ -22,17 +27,27 @@ if (Get-Variable -Name PSNativeCommandUseErrorActionPreference -ErrorAction Sile
     $PSNativeCommandUseErrorActionPreference = $false
 }
 
-$root = Split-Path -Parent $PSScriptRoot
-$ffmpegDir = $env:FFMPEG_DIR
-if (-not $ffmpegDir) {
-    $ffmpegDir = 'C:\ffmpeg-dev\ffmpeg-n9.0-latest-win64-gpl-shared-9.0'
+. "$PSScriptRoot\ffmpeg-env.ps1"
+$root = $MvpRepoRoot
+
+if (-not (Test-Path $MvpConfigPath)) {
+    Write-Host '尚未准备本机的 FFmpeg / libclang 配置，先运行一次 setup-ffmpeg.ps1…' -ForegroundColor Cyan
+    try {
+        & (Join-Path $PSScriptRoot 'setup-ffmpeg.ps1') -NoDownload
+    } catch {
+        Write-Host $_.Exception.Message -ForegroundColor Red
+        Write-Host '请先运行： .\scripts\setup-ffmpeg.ps1' -ForegroundColor Yellow
+        exit 1
+    }
 }
 
-$binDir = Join-Path $ffmpegDir 'bin'
-if (-not (Test-Path $binDir)) {
-    Write-Warning "FFmpeg bin directory not found at '$binDir'; binaries may fail to start."
+# The kit itself: whatever the helper can find, which is also what cargo will
+# link against through `.cargo/config.toml`.
+$ffmpegDir = Get-MvpFfmpegDir
+if (-not $ffmpegDir) {
+    Write-Warning "找不到 FFmpeg 开发包；请先运行 .\scripts\setup-ffmpeg.ps1"
 } else {
-    $env:PATH = "$binDir;$env:PATH"
+    $env:PATH = "$(Join-Path $ffmpegDir 'bin');$env:PATH"
 }
 
 # Forward slashes, exactly as `scripts/setup-ffmpeg.ps1` writes it into
@@ -40,7 +55,13 @@ if (-not (Test-Path $binDir)) {
 # `cargo:rerun-if-env-changed=FFMPEG_DIR`, so a value that differs only in its
 # separators would make every switch between `cargo run` and this script look
 # like a configuration change and re-run bindgen (a multi-minute rebuild).
-$env:FFMPEG_DIR = $ffmpegDir -replace '\\', '/'
+#
+# Only when there is a kit to point at: exporting an empty value would *set*
+# the variable (`force = false` never overrides a set variable) and hide the
+# one cargo wrote, turning a clear "kit missing" error into a confusing one.
+if ($ffmpegDir) {
+    $env:FFMPEG_DIR = $ffmpegDir -replace '\\', '/'
+}
 Push-Location $root
 try {
     & cargo @CargoArgs

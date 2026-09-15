@@ -18,7 +18,9 @@ if (Get-Variable -Name PSNativeCommandUseErrorActionPreference -ErrorAction Sile
     $PSNativeCommandUseErrorActionPreference = $false
 }
 
-$root = Split-Path -Parent $PSScriptRoot
+. "$PSScriptRoot\ffmpeg-env.ps1"
+
+$root = $MvpRepoRoot
 $exeName = 'mvp-versatile-player.exe'
 $releaseDir = Join-Path $root 'target\release'
 
@@ -40,9 +42,13 @@ New-Item -ItemType Directory -Force -Path $Output | Out-Null
 
 Copy-Item $exe (Join-Path $Output $exeName)
 
-# The FFmpeg shared libraries the executable loads at start-up.
-$ffmpegDir = $env:FFMPEG_DIR
-if (-not $ffmpegDir) { $ffmpegDir = 'C:\ffmpeg-dev\ffmpeg-n9.0-latest-win64-gpl-shared-9.0' }
+# The FFmpeg shared libraries the executable loads at start-up. The same
+# helper the other scripts use, so a kit that was moved or re-downloaded is
+# picked up without editing anything.
+$ffmpegDir = Get-MvpFfmpegDir
+if (-not $ffmpegDir) {
+    throw "找不到 FFmpeg 开发包，请先运行 .\scripts\setup-ffmpeg.ps1"
+}
 $dlls = Get-ChildItem (Join-Path $ffmpegDir 'bin') -Filter *.dll
 foreach ($dll in $dlls) {
     Copy-Item $dll.FullName (Join-Path $Output $dll.Name)

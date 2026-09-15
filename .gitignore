@@ -9,3 +9,8 @@
 Thumbs.db
 # heroui-agents-md
 .heroui-docs/
+
+# 本机生成的 FFmpeg / libclang 路径（由 scripts/setup-ffmpeg.ps1 写出）。
+# 它记录的是「这台机器上 SDK 装在哪」，不该跟着仓库走：入库会让每次
+# git pull 都用别人的绝对路径盖掉自己的。
+.cargo/config.toml
