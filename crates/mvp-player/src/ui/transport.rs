@@ -7,24 +7,20 @@ use crate::app::PlayerApp;
 use crate::icons::Icon;
 use crate::state::{Overlay, Toast};
 use crate::theme::{font, space, Tokens};
-use crate::ui::glass;
+use crate::ui::surface;
 use crate::ui::widgets;
 
 /// The docked transport bar under the video.
 pub fn draw(app: &mut PlayerApp, ctx: &Context) {
     let tokens = app.theme.tokens.clone();
-    // Liquid Glass: the frame carries no fill of its own, because the material is
-    // painted below and it has to be able to see through to the window behind it.
-    // The rim is cut on the top edge — the one facing the picture.
+    // An opaque panel. The hairline that separates it from the picture is egui's own
+    // panel separator line, drawn on the edge that faces content.
     let margin = egui::Margin::symmetric(space::MD as i8, space::SM as i8);
-    let material = glass::Glass::chrome(glass::Rim::TOP);
 
     egui::TopBottomPanel::bottom("mvp_transport")
-        .frame(glass::chrome_shell(margin))
+        .frame(surface::bar_shell(&tokens, margin))
         .exact_height(84.0)
         .show(ctx, |ui| {
-            // Behind the content: the fill and the rim belong under the controls.
-            glass::paint_ui(ui, &tokens, glass::surface_rect(ui, margin), material);
             seek_row(app, ui, &tokens);
             ui.add_space(2.0);
             button_row(app, ui, &tokens);
@@ -37,50 +33,23 @@ pub fn draw_overlay(app: &mut PlayerApp, ctx: &Context) {
     // The floating bar follows the screen rather than a fixed 720 pt: on a
     // narrow display it has to shrink, not hang off both edges of the picture.
     let width = crate::layout::Metrics::of(ctx).transport_overlay_width();
-    // The floating bar is the one surface with the picture behind it, so it is a
-    // sheet of glass — lit on all four edges, with a static highlight across it. Its
-    // radius is one step smaller than a sheet's: a wide, short bar wants less rounding
-    // than a tall panel.
+    // The island is the one transport surface drawn *over* the picture rather than
+    // above it, so it is an opaque sheet: it has to stay readable over a white frame.
+    // Its radius is one step smaller than a sheet's — a wide, short bar wants less
+    // rounding than a tall panel.
     const OVERLAY_RADIUS: f32 = crate::theme::radius::LG;
     let margin = egui::Margin::symmetric(space::LG as i8, space::SM as i8);
-    let material = glass::Glass::float(OVERLAY_RADIUS);
-    let mut slot = None;
-    let island = egui::Area::new(egui::Id::new("mvp_transport_overlay"))
+    egui::Area::new(egui::Id::new("mvp_transport_overlay"))
         .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -24.0))
         .order(egui::Order::Foreground)
         .show(ctx, |ui| {
-            // No fill on the frame: the bed belongs to the material, so the island
-            // cannot end up with two of them (or none, once the frost covers the
-            // frame's).
-            egui::Frame::new()
-                .corner_radius(egui::CornerRadius::same(OVERLAY_RADIUS as u8))
-                .inner_margin(margin)
-                // The reference's shadow: light, offset downwards. This is what
-                // tells the eye the island floats — before this round the island
-                // had no shadow at all and a bright halo instead, which is why it
-                // read as an outline rather than as glass.
-                .shadow(crate::theme::shadow::window())
-                .show(ui, |ui| {
-                    // Reserved before the controls: the frosted picture is opaque, so
-                    // it has to land underneath them.
-                    slot = Some(widgets::frost_slot(ui));
-                    ui.set_width(width);
-                    seek_row(app, ui, &tokens);
-                    ui.add_space(2.0);
-                    button_row(app, ui, &tokens);
-                });
+            surface::sheet_shell(&tokens, margin, OVERLAY_RADIUS).show(ui, |ui| {
+                ui.set_width(width);
+                seek_row(app, ui, &tokens);
+                ui.add_space(2.0);
+                button_row(app, ui, &tokens);
+            });
         });
-    // The glass covers the island's whole rect — the frame's rect, which is what the
-    // area reports and what the content alone would not.
-    widgets::frost_surface(
-        ctx,
-        app,
-        &tokens,
-        slot,
-        island.response.layer_id,
-        island.response.rect,
-        material,
-    );
 }
 
 /// Timestamp + seek bar + duration.

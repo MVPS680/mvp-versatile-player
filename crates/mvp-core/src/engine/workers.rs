@@ -425,7 +425,18 @@ fn demuxer_main(
             // may hold a second's worth of stale data, and waiting for a slot in
             // them would stall the seek behind it.
             shared.request_flush(generation, target);
-            seek_container(&mut ictx, target)?;
+            // A seek that fails because a *newer* one arrived is not a broken
+            // file: the interrupt callback returns as soon as another request is
+            // in the slot, which is what fast scrubbing looks like from inside
+            // FFmpeg. Tearing the demuxer down here (`?`) left the player with a
+            // dead pipeline and an error banner after nothing worse than
+            // dragging the seek bar quickly; the newer request is served by the
+            // top of this loop either way. A genuinely unseekable file is the
+            // same story: the reads that follow simply carry on from wherever
+            // the demuxer got to.
+            if let Err(err) = seek_container(&mut ictx, target) {
+                log::warn!("跳转失败（{err}），继续播放: {target:.3}s");
+            }
             reached_eof = false;
             ended = false;
             if shared.stepping.load(Ordering::Relaxed) > 0 {
@@ -579,7 +590,7 @@ fn handle_eof(
             // will ask for the replay this loop is about to perform.
             shared.clock.seek(0.0);
             shared.clock.set_running(true);
-            if let Some(sink) = shared.audio.lock().as_ref() {
+            if let Some(sink) = shared.audio_sink() {
                 sink.set_paused(false);
             }
             shared.set_state(PlaybackState::Playing);
@@ -624,7 +635,7 @@ fn handle_eof(
     if finished {
         *ended = true;
         shared.clock.set_running(false);
-        if let Some(sink) = shared.audio.lock().as_ref() {
+        if let Some(sink) = shared.audio_sink() {
             sink.set_paused(true);
         }
         shared.set_state(PlaybackState::Ended);

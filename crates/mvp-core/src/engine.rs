@@ -387,6 +387,20 @@ impl Shared {
         self.audio_flush.lock().take()
     }
 
+    /// The output device, when the open file has one.
+    ///
+    /// Cloned out of the lock rather than borrowed from it. Everything that can
+    /// be done with the sink — `set_paused`, `flush`, `close`, and dropping the
+    /// last reference, which stops the stream — goes down into the audio driver,
+    /// and holding `audio` across that would freeze every other thread that
+    /// wants the device. The interface asks for it on every frame, so a driver
+    /// call that takes its time would show up as a window that stops responding
+    /// rather than as an error. This is the same trap the seek request slot
+    /// documents in `demuxer_main`.
+    fn audio_sink(&self) -> Option<Arc<AudioSink>> {
+        self.audio.lock().clone()
+    }
+
     /// `true` when the video worker should stop what it is doing right now.
     pub fn video_flush_pending(&self) -> bool {
         self.video_flush.lock().is_some()
@@ -449,7 +463,10 @@ impl Engine {
         self.shared.clock.set_audio(None);
         self.shared.clock.seek(0.0);
         self.shared.clock.set_running(false);
-        *self.shared.audio.lock() = None;
+        // Dropped outside the lock: losing the last reference stops the stream,
+        // which is a call into the audio driver.
+        let previous = self.shared.audio.lock().take();
+        drop(previous);
         *self.source.lock() = Some(source.clone());
 
         self.shared.set_state(PlaybackState::Opening);
@@ -498,20 +515,26 @@ impl Engine {
     /// * only then are the threads joined.
     pub fn stop(&self) {
         self.shared.abort.store(true, Ordering::SeqCst);
-        if let Some(sink) = self.shared.audio.lock().as_ref() {
+        if let Some(sink) = self.shared.audio_sink() {
             sink.close();
         }
         let thread = self.threads.lock().pop();
         if let Some(handle) = thread {
             join_bounded(handle);
         }
-        for handle in self.shared.workers.lock().drain(..) {
+        // Drained first, joined after: `spawn_worker` takes this lock from the
+        // demuxer thread, and a join is not something to hold it across.
+        let workers: Vec<_> = self.shared.workers.lock().drain(..).collect();
+        for handle in workers {
             join_bounded(handle);
         }
         self.shared.video_queue.lock().clear();
         self.shared.pool.clear();
         self.shared.clock.set_running(false);
-        if let Some(sink) = self.shared.audio.lock().take() {
+        // The last reference stops the device, so it is released outside the
+        // lock as well.
+        let sink = self.shared.audio.lock().take();
+        if let Some(sink) = sink {
             sink.flush(0.0);
             drop(sink);
         }
@@ -541,7 +564,7 @@ impl Engine {
         if !state.is_active() {
             return;
         }
-        if let Some(sink) = self.shared.audio.lock().as_ref() {
+        if let Some(sink) = self.shared.audio_sink() {
             sink.set_paused(false);
         }
         self.shared.clock.set_running(true);
@@ -553,7 +576,7 @@ impl Engine {
         if !self.shared.state().is_playing() {
             return;
         }
-        if let Some(sink) = self.shared.audio.lock().as_ref() {
+        if let Some(sink) = self.shared.audio_sink() {
             sink.set_paused(true);
         }
         self.shared.clock.set_running(false);
@@ -610,7 +633,7 @@ impl Engine {
         let target = clamp_position(position, *self.shared.duration.lock());
         self.shared.clock.seek(target);
         self.shared.clock.set_running(true);
-        if let Some(sink) = self.shared.audio.lock().as_ref() {
+        if let Some(sink) = self.shared.audio_sink() {
             sink.set_paused(false);
         }
         self.shared.set_state(PlaybackState::Playing);
@@ -678,7 +701,7 @@ impl Engine {
     /// what the interface should show when it wants to say "how loud is it
     /// really", and it is what [`Engine::set_volume`] has to keep in step.
     pub fn effective_gain(&self) -> f32 {
-        match self.shared.audio.lock().as_ref() {
+        match self.shared.audio_sink() {
             Some(sink) => sink.effective_gain(),
             // No device (or audio disabled): the engine's own values are what
             // the producer would use.
@@ -698,8 +721,7 @@ impl Engine {
     /// every chunk with the *sink's* gain, so a volume change that is not
     /// forwarded moves a number on screen and nothing else.
     fn publish_gain(&self) {
-        let audio = self.shared.audio.lock();
-        if let Some(sink) = audio.as_ref() {
+        if let Some(sink) = self.shared.audio_sink() {
             sink.set_volume(self.shared.volume());
             sink.set_muted(self.shared.muted.load(Ordering::Relaxed));
         }

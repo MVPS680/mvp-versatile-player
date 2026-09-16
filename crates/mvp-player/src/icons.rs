@@ -282,18 +282,22 @@ pub fn draw(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             c.poly(painter, &[(16.5, 6.0), (21.0, 8.6), (16.5, 11.2)], color);
         }
         Icon::Folder => {
-            c.poly(
-                painter,
-                &[
-                    (3.5, 6.0),
-                    (10.0, 6.0),
-                    (11.8, 8.4),
-                    (20.5, 8.4),
-                    (20.5, 19.0),
-                    (3.5, 19.0),
-                ],
-                color,
-            );
+            // An outline, not a solid. The playlist toolbar puts this next to
+            // `Plus`, `Link` and `Close`, all of which are line art — one filled
+            // silhouette in that row is what makes a toolbar look like two icon
+            // sets that happen to be sharing a shelf.
+            let outline = [
+                (4.0, 18.5),
+                (4.0, 6.5),
+                (9.7, 6.5),
+                (11.9, 9.2),
+                (20.0, 9.2),
+                (20.0, 18.5),
+                (4.0, 18.5),
+            ];
+            for pair in outline.windows(2) {
+                c.line(painter, pair[0], pair[1], stroke);
+            }
         }
         Icon::Image => {
             let r = egui::Rect::from_min_max(c.p(3.5, 5.0), c.p(20.5, 19.0));
@@ -337,29 +341,21 @@ pub fn draw(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             c.poly(painter, &[(18.5, 4.5), (21.5, 7.0), (18.5, 9.5)], color);
         }
         Icon::Speed => {
-            let radius = c.s(8.0);
-            let segments = 28;
-            for i in 0..segments {
-                let t = i as f32 / (segments - 1) as f32;
-                let angle = std::f32::consts::PI + t * std::f32::consts::PI;
-                let (s, co) = angle.sin_cos();
-                let width = if i < segments / 2 { thin } else { Stroke::new(w, color) };
-                painter.line_segment(
-                    [
-                        Pos2::new(
-                            c.p(12.0, 13.5).x + co * radius,
-                            c.p(12.0, 13.5).y + s * radius,
-                        ),
-                        Pos2::new(
-                            c.p(12.0, 13.5).x + co * (radius - c.s(3.0)),
-                            c.p(12.0, 13.5).y + s * (radius - c.s(3.0)),
-                        ),
-                    ],
-                    width,
-                );
-            }
-            c.line(painter, (12.0, 13.5), (16.6, 9.4), Stroke::new(w, color));
-            c.circle(painter, (12.0, 13.5), 1.6, color);
+            // A dial with a needle, not a ruler with ticks.
+            //
+            // This was twenty-eight tick marks across half a circle and then seven,
+            // and neither worked: the glyph is drawn at about 14 pt, where a tick is
+            // under two points long, so however many of them there are the result is
+            // a smudge with a line through it. An arc, a needle and a hub are three
+            // shapes, and all three survive the size.
+            painter.arc(
+                c.p(12.0, 13.0),
+                c.s(8.0),
+                std::f32::consts::PI..std::f32::consts::TAU,
+                stroke,
+            );
+            c.line(painter, (12.0, 13.0), (17.2, 8.6), Stroke::new(w, color));
+            c.circle(painter, (12.0, 13.0), 1.7, color);
         }
         Icon::Subtitles => {
             let r = egui::Rect::from_min_max(c.p(3.0, 5.5), c.p(21.0, 18.5));
@@ -437,13 +433,48 @@ pub fn draw(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             c.line(painter, (12.0, 16.0), (19.0, 9.0), stroke);
         }
         Icon::Refresh => {
-            painter.arc(c.p(12.0, 12.0), c.s(7.5), 0.7..5.0, stroke);
-            c.poly(painter, &[(19.5, 4.5), (20.5, 10.0), (15.2, 7.6)], color);
+            // A circular arrow: the arc, plus a chevron at its end laid out along
+            // the arc's own tangent.
+            //
+            // The chevron is two strokes rather than a filled triangle, which is
+            // what it used to be. At the 13 or 14 pt the toolbar draws this, that
+            // triangle came out under three points across and simply vanished into
+            // its own antialiasing — leaving a plain "C" that says nothing about
+            // refreshing anything. Strokes that follow the tangent keep their shape
+            // at every size, because their weight is the icon's, not their area.
+            const FROM: f32 = 0.6;
+            const TO: f32 = 5.5;
+            let centre = c.p(12.0, 12.0);
+            let radius = c.s(7.4);
+            painter.arc(centre, radius, FROM..TO, stroke);
+
+            let (sin, cos) = TO.sin_cos();
+            let tip = Pos2::new(centre.x + cos * radius, centre.y + sin * radius);
+            // The direction the sweep is travelling in when it reaches `tip`.
+            let tangent = Vec2::new(-sin, cos);
+            let back = tangent * -c.s(5.4);
+            let side = Vec2::new(-tangent.y, tangent.x) * c.s(3.0);
+            painter.line_segment([tip, tip + back + side], stroke);
+            painter.line_segment([tip, tip + back - side], stroke);
         }
         Icon::Link => {
-            painter.arc(c.p(8.0, 12.0), c.s(4.0), -1.2..1.2, stroke);
-            painter.arc(c.p(16.0, 12.0), c.s(4.0), 1.95..4.35, stroke);
-            c.line(painter, (9.5, 12.0), (14.5, 12.0), thin);
+            // A globe. What was here was two open arcs facing each other with a bar
+            // between them — a chain link on the design grid, and at the 11 to 14 pt
+            // the interface actually draws it at, three thin arcs that touch come out
+            // as an unreadable knot. A circle, a meridian and an equator are the same
+            // idea at any size, and they read as "network" rather than as "metal".
+            painter.circle_stroke(c.p(12.0, 12.0), c.s(8.0), stroke);
+            c.line(painter, (4.0, 12.0), (20.0, 12.0), thin);
+            let meridian: Vec<Pos2> = (0..=24)
+                .map(|step| {
+                    let angle = step as f32 / 24.0 * std::f32::consts::TAU;
+                    Pos2::new(
+                        c.p(12.0, 12.0).x + angle.sin() * c.s(3.2),
+                        c.p(12.0, 12.0).y - angle.cos() * c.s(8.0),
+                    )
+                })
+                .collect();
+            painter.add(Shape::line(meridian, thin));
         }
         Icon::Film => {
             let r = egui::Rect::from_min_max(c.p(3.0, 4.5), c.p(21.0, 19.5));
@@ -462,9 +493,18 @@ pub fn draw(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             painter.circle_filled(c.p(16.8, 15.2), c.s(2.3), color);
         }
         Icon::Clear => {
-            c.line(painter, (12.0, 4.5), (12.0, 15.5), Stroke::new(w, color));
-            c.poly(painter, &[(8.5, 12.0), (15.5, 12.0), (12.0, 16.5)], color);
-            c.line(painter, (5.0, 19.5), (19.0, 19.5), Stroke::new(w, color));
+            // A bin. What this used to draw was an arrow pointing down at a line,
+            // which means "download" or "save" everywhere else in the world — on
+            // the button that empties the playlist. The glyph has to say what the
+            // button does, and "delete" has one widely understood shape.
+            c.line(painter, (4.0, 7.2), (20.0, 7.2), thin);
+            c.line(painter, (9.4, 7.2), (9.4, 4.6), thin);
+            c.line(painter, (9.4, 4.6), (14.6, 4.6), thin);
+            c.line(painter, (14.6, 4.6), (14.6, 7.2), thin);
+            c.line(painter, (6.6, 7.2), (7.6, 19.6), thin);
+            c.line(painter, (17.4, 7.2), (16.4, 19.6), thin);
+            c.line(painter, (7.6, 19.6), (16.4, 19.6), thin);
+            c.line(painter, (12.0, 10.2), (12.0, 16.6), thin);
         }
         Icon::Save => {
             let r = egui::Rect::from_min_max(c.p(3.5, 3.5), c.p(20.5, 20.5));

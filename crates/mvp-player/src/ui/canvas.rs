@@ -7,15 +7,13 @@ use crate::icons::{self, Icon};
 use crate::settings::AspectMode;
 use crate::state::{Mode, Overlay, Toast};
 use crate::theme::{font, radius, space, Tokens};
+use crate::ui::surface;
 use crate::ui::widgets;
 
 /// Draw the central area.
 pub fn draw(app: &mut PlayerApp, ctx: &Context) {
     let tokens = app.theme.tokens.clone();
     let frame = egui::Frame::new().fill(tokens.letterbox);
-    // Cleared every frame: only `media_view` knows where a picture went, and a stale
-    // rect would have the glass frost an empty stretch of letterbox.
-    app.ui.picture_rect = None;
     egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
         match app.mode {
             Mode::Empty => empty_state(app, ui, &tokens),
@@ -61,9 +59,6 @@ fn media_view(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
     } else {
         Some(video_view(app, ui, tokens, area))
     };
-    // Remembered for the glass surfaces that float over the picture: they frost the
-    // video texture behind themselves, and this is the part of the screen it is on.
-    app.ui.picture_rect = picture;
 
     // ---- subtitles ------------------------------------------------------
     // Over the picture — or, with no picture to be over, along the bottom of
@@ -435,6 +430,10 @@ const AUDIO_RING_WIDTH: f32 = 3.0;
 const AUDIO_GROOVES: [f32; 3] = [0.60, 0.72, 0.84];
 /// Radius of the label at the centre of the record, as a fraction of the whole.
 const AUDIO_LABEL: f32 = 0.34;
+/// How far the glow around the record reaches, as a multiple of its own radius.
+const AUDIO_GLOW_SPREAD: f32 = 1.20;
+/// Alpha of that glow where it leaves the record.
+const AUDIO_GLOW_ALPHA: f32 = 0.20;
 /// Widest the sleeve's type is allowed to be, as a fraction of the canvas.
 const AUDIO_TEXT_WIDTH: f32 = 0.86;
 
@@ -610,13 +609,18 @@ fn draw_record(app: &PlayerApp, painter: &egui::Painter, rect: Rect, tokens: &To
     let center = rect.center();
     let radius = (rect.width().min(rect.height()) / 2.0 - AUDIO_RING_INSET).max(4.0);
 
-    // A halo, faked with a handful of translucent discs: `egui` has no gradient
-    // primitive, and a single disc at one alpha reads as a second rim.
-    for step in 0..5 {
-        let spread = 1.0 + 0.04 * step as f32;
-        let alpha = 0.06 * (1.0 - step as f32 / 5.0);
-        painter.circle_filled(center, radius * spread, tokens.accent.gamma_multiply(alpha));
-    }
+    // A glow, as a single mesh: one ring of vertices on the record's own edge and
+    // another at the far edge of the halo, with the alpha carried down from one to
+    // the other. `egui` has no radial-gradient primitive, and what this replaces
+    // was four translucent discs at 4 % steps — four *hard* circles a few points
+    // apart, each with its own visible rim. That is a set of rings, not a glow.
+    paint_halo(
+        painter,
+        center,
+        radius,
+        radius * AUDIO_GLOW_SPREAD,
+        tokens.accent,
+    );
 
     // The record itself: a dark disc, its rim, and the grooves a record has.
     painter.circle_filled(center, radius, tokens.elevated);
@@ -655,6 +659,47 @@ fn draw_record(app: &PlayerApp, painter: &egui::Painter, rect: Rect, tokens: &To
             );
         }
     }
+}
+
+/// A soft radial glow, from `inner` (at `alpha`) out to `outer` (at nothing).
+///
+/// Built as an annulus mesh rather than as a stack of discs, because a stack of
+/// discs is a stack of edges: five of them at 4 % radius steps read as five rings.
+/// Two rings of vertices interpolate the alpha across the whole band instead, so
+/// the falloff is continuous — a stack of discs is a stack of edges, and five of them
+/// at 4 % radius steps read as five rings.
+fn paint_halo(
+    painter: &egui::Painter,
+    center: egui::Pos2,
+    inner: f32,
+    outer: f32,
+    color: Color32,
+) {
+    /// Segments around the circle.
+    const SEGMENTS: usize = 48;
+
+    if outer <= inner || !inner.is_finite() || !outer.is_finite() {
+        return;
+    }
+    let mut mesh = egui::Mesh::default();
+    let mut ring = |radius: f32, alpha: f32| {
+        for step in 0..=SEGMENTS {
+            let angle = step as f32 / SEGMENTS as f32 * std::f32::consts::TAU;
+            let (sin, cos) = angle.sin_cos();
+            mesh.colored_vertex(
+                egui::pos2(center.x + cos * radius, center.y + sin * radius),
+                color.gamma_multiply(alpha),
+            );
+        }
+    };
+    ring(inner, AUDIO_GLOW_ALPHA);
+    ring(outer, 0.0);
+    let stride = (SEGMENTS + 1) as u32;
+    for index in 0..SEGMENTS as u32 {
+        mesh.add_triangle(index, index + stride, index + 1);
+        mesh.add_triangle(index + 1, index + stride, index + 1 + stride);
+    }
+    painter.add(egui::Shape::mesh(mesh));
 }
 
 /// Stroke an arc of a circle.
@@ -761,17 +806,12 @@ fn image_toolbar(app: &mut PlayerApp, ui: &mut Ui, area: &Rect, tokens: &Tokens)
         Vec2::new(bar_width, bar_height),
     );
 
-    ui.painter().rect_filled(
-        rect,
-        egui::CornerRadius::same(radius::MD as u8),
-        tokens.elevated.gamma_multiply(0.92),
-    );
-    ui.painter().rect_stroke(
-        rect,
-        egui::CornerRadius::same(radius::MD as u8),
-        Stroke::new(1.0_f32, tokens.border_strong),
-        egui::StrokeKind::Inside,
-    );
+    // The same surface as every other floating panel in the player: an opaque
+    // `elevated` fill, one hairline, one corner radius. This bar used to be a rectangle
+    // with a hard 1 pt outline drawn inside it, which is the single most unfinished
+    // edge a dark interface can have, and then briefly a sheet of glass — which meant
+    // re-blurring the photograph behind it every frame to draw seven buttons.
+    surface::paint_sheet(ui.painter(), tokens, rect, radius::MD);
 
     let mut child = ui.new_child(
         egui::UiBuilder::new()
@@ -841,10 +881,24 @@ fn image_toolbar(app: &mut PlayerApp, ui: &mut Ui, area: &Rect, tokens: &Tokens)
 }
 
 fn paint_checkerboard(painter: &egui::Painter, rect: Rect, tokens: &Tokens) {
+    /// Cell size in points, before it is snapped to whole pixels.
     const CELL: f32 = 12.0;
+
+    // Both the grid and its origin are snapped to whole *device* pixels first. A
+    // checkerboard whose cell edges fall between pixels gets a grey seam along
+    // every edge, and on a transparent PNG — which is the only thing this is drawn
+    // for — that reads as a fine mesh of scratches ruled over the picture.
+    let scale = painter.ctx().pixels_per_point().max(1.0);
+    let snap = |value: f32| (value * scale).round() / scale;
+    let cell = snap(CELL).max(1.0);
+    let rect = Rect::from_min_max(
+        egui::pos2(snap(rect.min.x), snap(rect.min.y)),
+        egui::pos2(snap(rect.max.x), snap(rect.max.y)),
+    );
+
     painter.rect_filled(rect, egui::CornerRadius::ZERO, Color32::from_gray(28));
-    let cols = (rect.width() / CELL).ceil() as i32;
-    let rows = (rect.height() / CELL).ceil() as i32;
+    let cols = (rect.width() / cell).ceil() as i32;
+    let rows = (rect.height() / cell).ceil() as i32;
     // Cap the number of cells so a wildly zoomed-out image does not generate
     // tens of thousands of rectangles.
     if cols * rows > 4000 {
@@ -855,10 +909,10 @@ fn paint_checkerboard(painter: &egui::Painter, rect: Rect, tokens: &Tokens) {
             if (row + col) % 2 == 0 {
                 continue;
             }
-            let min = rect.min + Vec2::new(col as f32 * CELL, row as f32 * CELL);
-            let cell = Rect::from_min_size(min, Vec2::splat(CELL)).intersect(rect);
-            if cell.width() > 0.5 && cell.height() > 0.5 {
-                painter.rect_filled(cell, egui::CornerRadius::ZERO, Color32::from_gray(36));
+            let min = rect.min + Vec2::new(col as f32 * cell, row as f32 * cell);
+            let square = Rect::from_min_size(min, Vec2::splat(cell)).intersect(rect);
+            if square.width() > 0.5 && square.height() > 0.5 {
+                painter.rect_filled(square, egui::CornerRadius::ZERO, Color32::from_gray(36));
             }
         }
     }

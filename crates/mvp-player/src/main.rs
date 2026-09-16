@@ -27,6 +27,7 @@ mod ui;
 
 use std::path::PathBuf;
 use std::time::Instant;
+use std::sync::Mutex;
 
 use crossbeam_channel::bounded;
 use mvp_platform::single_instance::{send_to_primary, AppInstance, IpcMessage};
@@ -179,47 +180,71 @@ pub fn log_file_path() -> PathBuf {
 /// Keeping stderr as well means `cargo run` and `--help` stay useful during
 /// development.
 fn init_logging() {
+    // Defer opening the on-disk log file until the first write. Opening the
+    // file (and checking its size / rotating) can be slow on some systems
+    // (anti-virus, networked profiles). Instead register a writer that
+    // lazily opens the file on demand while keeping stderr logging.
     let path = log_file_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    // Keep exactly one previous run so the log cannot grow without bound.
-    const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
-    if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > MAX_LOG_BYTES {
-        let _ = std::fs::rename(&path, path.with_extension("log.1"));
-    }
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .ok();
-
     let mut builder = env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("info"),
     );
     builder.format_timestamp_millis();
-    if let Some(file) = file {
-        builder.target(env_logger::Target::Pipe(Box::new(TeeWriter { file })));
-    }
-    // `try_init` rather than `init`: a second call (a test harness, an embedding
-    // host) must not abort the process.
+    builder.target(env_logger::Target::Pipe(Box::new(LazyTeeWriter::new(path))));
     let _ = builder.try_init();
 }
 
 /// Writes every log record to the log file *and* to stderr.
-struct TeeWriter {
-    file: std::fs::File,
+/// Writer that lazily opens the log file on first write and mirrors output to
+/// stderr. This keeps start-up fast while still producing a persisted log.
+struct LazyTeeWriter {
+    path: PathBuf,
+    file: Mutex<Option<std::fs::File>>,
 }
 
-impl std::io::Write for TeeWriter {
+impl LazyTeeWriter {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            file: Mutex::new(None),
+        }
+    }
+}
+
+impl std::io::Write for LazyTeeWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let _ = self.file.write_all(buf);
+        // Try to open the file lazily. If the mutex is poisoned or open
+        // fails, fall back to stderr only so logging never blocks startup.
+        if let Ok(mut guard) = self.file.lock() {
+            if guard.is_none() {
+                if let Some(parent) = self.path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                // Keep exactly one previous run so the log cannot grow.
+                const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
+                if std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0) > MAX_LOG_BYTES {
+                    let _ = std::fs::rename(&self.path, self.path.with_extension("log.1"));
+                }
+                let f = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.path)
+                    .ok();
+                *guard = f;
+            }
+            if let Some(file) = guard.as_mut() {
+                let _ = file.write_all(buf);
+            }
+        }
         let _ = std::io::stderr().write_all(buf);
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        let _ = self.file.flush();
+        if let Ok(mut guard) = self.file.lock() {
+            if let Some(file) = guard.as_mut() {
+                let _ = file.flush();
+            }
+        }
         let _ = std::io::stderr().flush();
         Ok(())
     }

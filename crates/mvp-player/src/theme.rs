@@ -118,7 +118,12 @@ impl Default for Tokens {
             border_strong: rgba(0xFF, 0xFF, 0xFF, 0x2E),
             text: rgb(0xF5, 0xF5, 0xF7),
             text_weak: rgb(0xA1, 0xA7, 0xB3),
-            text_muted: rgb(0x70, 0x75, 0x7F),
+            // 3.7:1 on the panel was not enough for an 11 pt caption, and the
+            // settings page draws every explanation in this colour, where a busy
+            // backdrop makes it worse rather than better. At this value it clears
+            // WCAG AA on the panel and still sits a clear step below `text_weak`, so
+            // the three text levels stay distinguishable.
+            text_muted: rgb(0x7E, 0x83, 0x8D),
             accent: rgb(0x0A, 0x84, 0xFF),
             accent_hover: rgb(0x3D, 0x9B, 0xFF),
             on_accent: rgb(0xFF, 0xFF, 0xFF),
@@ -294,10 +299,21 @@ impl Theme {
             style.spacing.indent = space::LG;
             style.spacing.slider_width = 120.0;
             style.spacing.interact_size = egui::vec2(0.0, 26.0);
-            style.spacing.scroll.bar_width = 9.0;
+            // Scroll bars: thin, always the same quiet grey, and *never on top of a
+            // control*.
+            //
+            // A floating bar with no allocated width — which is what this was — is
+            // drawn over whatever happens to be at the right-hand edge. On the
+            // settings page that is the column of switches and sliders, so the bar
+            // lay across their ends. `floating_allocated_width` makes the content
+            // stop short of the bar, which is the whole point of reserving room for
+            // it; the bar stays floating so it still fades in rather than sitting in
+            // a permanent grey gutter.
+            style.spacing.scroll.bar_width = 10.0;
             style.spacing.scroll.floating = true;
-            style.spacing.scroll.floating_width = 4.0;
-            style.spacing.scroll.bar_inner_margin = 4.0;
+            style.spacing.scroll.floating_width = 5.0;
+            style.spacing.scroll.floating_allocated_width = 10.0;
+            style.spacing.scroll.bar_inner_margin = 2.0;
             style.visuals.striped = true;
 
             // Motion: long enough to be seen, short enough that a click feels
@@ -337,10 +353,10 @@ pub mod shadow {
 
     /// Floating windows and sheets.
     ///
-    /// The reference implementation's `0 16px 32px rgba(0,0,0,.12)`: a *light*
-    /// shadow. The glass is supposed to float, not to sit in a black smear — the
-    /// previous value was half-again as dark and is the other half of why the
-    /// control island looked heavy.
+    /// The one piece of polish left in the interface that costs nothing to draw: a
+    /// window without a shadow does not read as floating, it reads as pasted. Offset
+    /// downwards and kept light — a heavy shadow under a dark panel is a black smear,
+    /// not depth.
     pub fn window() -> Shadow {
         Shadow {
             offset: [0, 16],
@@ -599,6 +615,47 @@ mod tests {
         assert!(ratio(t.text_weak, t.panel) > 4.5, "captions must pass WCAG AA");
         assert!(ratio(t.accent, t.bg) > 3.0, "the accent must be visible");
         assert!(ratio(t.on_accent, t.accent) > 3.5);
+    }
+
+    /// The *third* level of text has to be readable too.
+    ///
+    /// `text_muted` carries the settings page's explanations, the timestamps in the
+    /// playlist, every "共 N 项" caption and the shortcut hints in the menus — all of
+    /// it 11 or 12 pt, all of it meant to be read. At its old value it sat at 3.7:1
+    /// on the panel and about 2.6:1 over the settings sheet, which is not a quiet
+    /// caption but an invisible one. Quiet is a *step down* from the text around it,
+    /// not a step below the contrast floor.
+    #[test]
+    fn the_quietest_text_still_passes_wcag_aa() {
+        let t = Tokens::default();
+        let lum = |c: Color32| {
+            let f = |v: u8| {
+                let v = v as f32 / 255.0;
+                if v <= 0.03928 {
+                    v / 12.92
+                } else {
+                    ((v + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * f(c.r()) + 0.7152 * f(c.g()) + 0.0722 * f(c.b())
+        };
+        let ratio = |a: Color32, b: Color32| {
+            let (la, lb) = (lum(a), lum(b));
+            let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
+            (hi + 0.05) / (lo + 0.05)
+        };
+
+        assert!(
+            ratio(t.text_muted, t.panel) >= 4.5,
+            "the muted colour is used for 11 pt captions"
+        );
+        assert!(
+            ratio(t.text_weak, t.panel) >= 4.5,
+            "and the weak colour for captions on top of it"
+        );
+        // The levels stay distinguishable: a caption must not become body text.
+        assert!(ratio(t.text, t.panel) > ratio(t.text_weak, t.panel));
+        assert!(ratio(t.text_weak, t.panel) > ratio(t.text_muted, t.panel));
     }
 
     #[test]

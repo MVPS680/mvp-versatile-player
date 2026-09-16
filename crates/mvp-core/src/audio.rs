@@ -508,20 +508,33 @@ impl AudioSink {
     }
 
     /// Pause or resume the device.
+    ///
+    /// The device is only touched when the state actually changes. Seeking over
+    /// a file that is sitting at its end restarts it on every request — the
+    /// demuxer pauses the stream as the file ends, and the restart plays it
+    /// again — so without this the driver would get a real `Start`/`Stop` pair
+    /// for every drag of the seek bar, for nothing.
     pub fn set_paused(&self, paused: bool) {
-        if paused {
-            if !self.shared.paused.swap(true, Ordering::Relaxed) {
+        let changed = if paused {
+            let was_playing = !self.shared.paused.swap(true, Ordering::Relaxed);
+            if was_playing {
                 self.shared.paused_at_ns.store(now_ns(), Ordering::Relaxed);
             }
-        } else if self.shared.paused.swap(false, Ordering::Relaxed) {
-            // Move the anchor forward by however long we were paused, so the
-            // clock resumes exactly where it stopped instead of jumping by the
-            // length of the pause.
-            let paused_at = self.shared.paused_at_ns.load(Ordering::Relaxed);
-            let delta = now_ns().saturating_sub(paused_at);
-            self.shared
-                .anchor_ns
-                .fetch_add(delta, Ordering::Relaxed);
+            was_playing
+        } else {
+            let was_paused = self.shared.paused.swap(false, Ordering::Relaxed);
+            if was_paused {
+                // Move the anchor forward by however long we were paused, so the
+                // clock resumes exactly where it stopped instead of jumping by
+                // the length of the pause.
+                let paused_at = self.shared.paused_at_ns.load(Ordering::Relaxed);
+                let delta = now_ns().saturating_sub(paused_at);
+                self.shared.anchor_ns.fetch_add(delta, Ordering::Relaxed);
+            }
+            was_paused
+        };
+        if !changed {
+            return;
         }
 
         // The two `cpal` methods have distinct error types, so normalise them.

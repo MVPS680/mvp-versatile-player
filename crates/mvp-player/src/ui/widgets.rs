@@ -15,92 +15,7 @@ use crate::app::PlayerApp;
 use crate::icons::{self, Icon};
 use crate::state::Toast;
 use crate::theme::{self, font, radius, space, Tokens};
-
-/// A palette-free description of the picture the glass should frost.
-///
-/// `None` when there is nothing to frost — no picture (audio, a still image, an empty
-/// window) or a picture that has been rotated or mirrored. The frost samples the
-/// video texture through the rectangle the frame was drawn into, and those two
-/// transformations break exactly that correspondence; a wrong blur is worse than
-/// none.
-pub fn frost_source(app: &PlayerApp) -> Option<(egui::TextureId, egui::Rect)> {
-    let texture = app.texture.as_ref()?;
-    let rect = app.ui.picture_rect?;
-    if app.settings.rotation != 0 || app.settings.flip_h || app.settings.flip_v {
-        return None;
-    }
-    Some((texture.id(), rect))
-}
-
-/// Reserve the slot the frosted backdrop goes into.
-///
-/// Called *before* the content is laid out: the frost is opaque, so it has to land
-/// under the labels, and a floating surface only knows its rect once they exist.
-pub fn frost_slot(ui: &Ui) -> egui::layers::ShapeIdx {
-    ui.painter().add(egui::Shape::Noop)
-}
-
-/// The same glass for a *window* or an *area*, whose rect is only known once it has
-/// been laid out.
-///
-/// `egui::Window` lays its title bar out inside its own frame and *outside* the `Ui`
-/// the closure is handed, so the rect a closure can measure is the body — the title
-/// bar is not in it. Filled from the body's rect alone, a sheet shows a strip along
-/// its top with no glass on it at all: transparent, taking its colour from whatever
-/// is behind. The window's own rect comes back from `show`, and filling the slot
-/// afterwards is not a hack — the shape list is not consumed until the end of the
-/// frame, which is exactly the mechanism egui uses for the title bar's own
-/// background. The order works out too: the title bar is painted *after* the body, so
-/// the material still lands under the title's text and under the body's widgets. The
-/// whole sheet ends up one colour, with everything still readable on top of it.
-///
-/// `slot` is `None` when the container never ran its closure (a window that is
-/// closed), and then there is nothing to fill.
-pub fn frost_surface(
-    ctx: &egui::Context,
-    app: &PlayerApp,
-    tokens: &crate::theme::Tokens,
-    slot: Option<egui::layers::ShapeIdx>,
-    layer: egui::LayerId,
-    rect: Rect,
-    glass: crate::ui::glass::Glass,
-) {
-    if let Some(slot) = slot {
-        frost_into(&ctx.layer_painter(layer), app, slot, tokens, rect, glass);
-    }
-}
-
-/// The frosted picture plus the material, written into a shape slot.
-///
-/// The order is the whole point. The frost is opaque — it replaces the surface's own
-/// colour with the film's — so the bed has to go *on top of* it, not underneath: a
-/// panel whose colour comes from the video shows one colour where the film is bright
-/// and another where it is dark, which reads as two different panels glued together.
-/// With the bed over the frost the tone stays the surface's own, and the blurred film
-/// only shifts it. When there is nothing to frost, the material is still drawn: a
-/// surface must never be left un-glassed just because the picture is missing.
-fn frost_into(
-    painter: &egui::Painter,
-    app: &PlayerApp,
-    slot: egui::layers::ShapeIdx,
-    tokens: &crate::theme::Tokens,
-    rect: Rect,
-    glass: crate::ui::glass::Glass,
-) {
-    let mut shapes = Vec::new();
-    if let Some((texture, source)) = frost_source(app) {
-        shapes.extend(crate::ui::glass::frost_shapes(
-            texture,
-            rect,
-            source,
-            glass.radius,
-            crate::ui::glass::FROST_RADIUS,
-        ));
-    }
-    // The bed, the wash, the sheen and the rim, in that order, over the frost.
-    shapes.extend(crate::ui::glass::shapes(tokens, rect, glass, 1.0));
-    painter.set(slot, egui::Shape::Vec(shapes));
-}
+use crate::ui::surface;
 
 /// A block-level heading with a hairline underneath.
 ///
@@ -196,10 +111,13 @@ pub fn row(
 
     if !hint.is_empty() {
         ui.add_space(space::XXS);
+        // `text_weak`, not `text_muted`: an explanation is meant to be read, and at
+        // 11 pt the muted colour is a caption under the content while this is a
+        // sentence about it.
         ui.label(
             RichText::new(hint)
                 .size(font::TINY)
-                .color(tokens.text_muted),
+                .color(tokens.text_weak),
         );
     }
     // The air between rows is what keeps a settings page legible; without it
@@ -208,36 +126,111 @@ pub fn row(
     changed
 }
 
-/// A small rounded label, used for state pills and track kinds.
+/// A small capsule label, used for state pills and track kinds.
+///
+/// Two things were wrong with the flat version of this. The label was drawn in
+/// the *same* colour as its own fill, which for the accent meant a saturated blue
+/// on a 20 % blue wash — the one pairing that cannot be read; the text is now
+/// that colour lightened towards white. And the corner radius was a fixed 5 pt,
+/// which on a 19 pt pill is a rounded rectangle rather than a capsule, so the
+/// shape disagreed with every other pill in the interface.
+///
+/// `color` is expected to be one of the opaque state colours from [`Tokens`].
 pub fn chip(ui: &mut Ui, text: &str, color: Color32) -> Response {
     let galley = ui.painter().layout_no_wrap(
         text.to_owned(),
         FontId::proportional(font::TINY),
         color,
     );
-    let size = galley.size() + Vec2::new(12.0, 4.0);
+    let size = galley.size() + Vec2::new(space::SM + space::XS, 5.0);
     let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
-    ui.painter()
-        .rect_filled(rect, CornerRadius::same(radius::SM as u8), color.gamma_multiply(0.2));
+    ui.painter().rect_filled(
+        rect,
+        CornerRadius::same((size.y / 2.0) as u8),
+        color.gamma_multiply(0.16),
+    );
     ui.painter().galley(
         rect.center() - galley.size() / 2.0,
         galley,
-        color,
+        lighten(color, 0.4),
     );
     response
 }
 
+/// A colour mixed `t` of the way towards white.
+///
+/// Only meaningful for an opaque colour: `Color32` keeps its channels
+/// premultiplied, so lightening a translucent one would lift its alpha too.
+fn lighten(color: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let up = |v: u8| {
+        (f32::from(v) + (255.0 - f32::from(v)) * t)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    Color32::from_rgb(up(color.r()), up(color.g()), up(color.b()))
+}
+
 /// A label/value row used by the information panel.
+///
+/// The label column is a fixed width so every value in a panel starts on the same
+/// x. Laid out as one wrapped line — which is what this was — a long value (a
+/// codec string, a file path, the FFmpeg build configuration) wrapped back to the
+/// left edge under its own label, so the column of values had no column in it.
 pub fn key_value(ui: &mut Ui, tokens: &Tokens, label: &str, value: &str) {
-    ui.horizontal_wrapped(|ui| {
+    /// Width of the label column.
+    const LABEL_COLUMN: f32 = 88.0;
+
+    ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = space::SM;
-        ui.label(
-            RichText::new(label)
-                .size(font::SMALL)
-                .color(tokens.text_weak),
+        ui.add_sized(
+            Vec2::new(LABEL_COLUMN, 18.0),
+            egui::Label::new(
+                RichText::new(label)
+                    .size(font::SMALL)
+                    .color(tokens.text_muted),
+            )
+            .truncate(),
         );
-        ui.label(RichText::new(value).size(font::SMALL).color(tokens.text));
+        ui.add(
+            egui::Label::new(RichText::new(value).size(font::SMALL).color(tokens.text))
+                .wrap(),
+        );
     });
+}
+
+/// One line of text, measured and cut with an ellipsis at `max_width`.
+///
+/// The point is the *measurement*. The playlist row kept a title inside its column
+/// by dividing that column by a guessed nine points per character, which is about
+/// right for Latin and short by a third for CJK — so a Chinese file name lost its
+/// tail far too early, while a Latin one still ran under the row's buttons, where
+/// the clip rectangle sliced it through a glyph with no ellipsis at all. `egui`
+/// can answer "how wide is this line" exactly, so it is asked exactly.
+pub fn clipped_line(
+    ui: &Ui,
+    text: &str,
+    font: FontId,
+    color: Color32,
+    max_width: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::single_section(
+        text.to_owned(),
+        egui::TextFormat {
+            font_id: font,
+            color,
+            ..Default::default()
+        },
+    );
+    job.wrap = egui::text::TextWrapping {
+        max_width: max_width.max(1.0),
+        max_rows: 1,
+        // A file name has no spaces to break at, so the break has to be allowed
+        // anywhere — otherwise the line simply overflows instead of shortening.
+        break_anywhere: true,
+        overflow_character: Some('…'),
+    };
+    ui.fonts(|fonts| fonts.layout_job(job))
 }
 
 /// A segmented control: the macOS way to choose one of a few options.
@@ -296,8 +289,18 @@ pub fn segmented(
     let (rect, response) =
         ui.allocate_exact_size(Vec2::new(width + INSET * 2.0, HEIGHT), Sense::click());
     let track = rect.shrink(INSET);
+    // A translucent black well rather than the opaque `sunken` slab: it darkens
+    // whatever it is drawn on, so the same control reads correctly on the panel,
+    // on a card and on a floating window, and the step down from the surrounding
+    // surface is a gentle one instead of a hole.
     ui.painter()
-        .rect_filled(rect, CornerRadius::same(radius::MD as u8), tokens.sunken);
+        .rect_filled(rect, CornerRadius::same(radius::MD as u8), Color32::from_black_alpha(0x46));
+    // The pill's corner has to be the trough's corner minus the gap between them:
+    // a 5 pt radius inside an 8 pt trough with 2 pt of air left the two arcs
+    // off-centre, and a corner that *almost* matches the one it sits inside is
+    // exactly the detail that makes an interface look assembled rather than
+    // designed.
+    let pill = CornerRadius::same((radius::MD - INSET) as u8);
 
     let mut clicked = None;
     let mut x = track.left();
@@ -318,26 +321,25 @@ pub fn segmented(
         if settle > 0.0 {
             // The pill fades in on the segment that was chosen and out on the one
             // that was left, so the selection reads as one object moving.
+            //
+            // It is *raised*, not outlined. The selected segment used to be ringed
+            // with a 1 pt `border_strong` stroke, and at 100 % scaling that draws
+            // as a hard pale line around a fill that is barely lighter than the
+            // well — so the selection read as a boxed-in button. The fill carries
+            // it now, with only the faintest edge to keep it off the well.
             ui.painter().rect_filled(
                 segment,
-                CornerRadius::same(radius::SM as u8),
+                pill,
                 tokens.active.gamma_multiply(settle),
             );
             ui.painter().rect_stroke(
                 segment,
-                CornerRadius::same(radius::SM as u8),
-                Stroke::new(
-                    1.0_f32,
-                    tokens.border_strong.gamma_multiply(settle),
-                ),
+                pill,
+                Stroke::new(1.0_f32, tokens.border.gamma_multiply(settle)),
                 StrokeKind::Inside,
             );
         } else if hovered {
-            ui.painter().rect_filled(
-                segment,
-                CornerRadius::same(radius::SM as u8),
-                tokens.hover,
-            );
+            ui.painter().rect_filled(segment, pill, tokens.hover);
         }
         ui.painter().galley(
             egui::pos2(
@@ -493,10 +495,13 @@ pub fn switch(ui: &mut Ui, tokens: &Tokens, value: &mut bool) -> Response {
         rect.center().y,
     );
     ui.painter().circle_filled(center, KNOB / 2.0, tokens.on_accent);
+    // See `slider`: a white ring on a white knob draws nothing, and this one is
+    // the only thing separating the knob from the accent it sits on when the
+    // switch is on.
     ui.painter().circle_stroke(
         center,
         KNOB / 2.0,
-        Stroke::new(1.0_f32, tokens.border_strong),
+        Stroke::new(1.0_f32, Color32::from_black_alpha(0x30)),
     );
 
     paint_focus(ui, &response, rect, tokens);
@@ -586,8 +591,14 @@ pub fn slider(
     }
     let knob_center = egui::pos2(bar.left() + bar.width() * fraction, bar.center().y);
     ui.painter().circle_filled(knob_center, knob, tokens.on_accent);
-    ui.painter()
-        .circle_stroke(knob_center, knob, Stroke::new(1.0_f32, tokens.border_strong));
+    // Pure black rather than `border_strong`: a white ring drawn on a white knob
+    // is not a ring, and the knob needs its edge only where it sits over the
+    // accent-filled part of the track.
+    ui.painter().circle_stroke(
+        knob_center,
+        knob,
+        Stroke::new(1.0_f32, Color32::from_black_alpha(0x40)),
+    );
     paint_focus(ui, &response, rect, tokens);
 
     if response.hovered() || response.dragged() {
@@ -694,23 +705,28 @@ pub fn seek_bar(
     dragging: Option<f64>,
 ) -> SeekBarOutput {
     let height = 22.0;
+    /// Radius of the handle under the pointer. The ends of the track are inset
+    /// by this much so the handle is always *inside* the bar.
+    const HANDLE_MAX: f32 = 7.5;
     // The caller gives the bar its width; the floor only keeps a degenerate
     // zero-width layout from producing a zero-length drag target.
     let full = ui.available_width().max(24.0);
     let (rect, response) = ui.allocate_exact_size(Vec2::new(full, height), Sense::click_and_drag());
-    let track_height = if response.hovered() || dragging.is_some() {
-        6.0
-    } else {
-        4.0
-    };
-    let track = Rect::from_center_size(
-        rect.center(),
-        Vec2::new(rect.width(), track_height),
+    let active = response.hovered() || dragging.is_some();
+    let track_height = if active { 6.0 } else { 4.0 };
+    // The track stops one handle-radius short of each end. Without that inset the
+    // handle at 0 % and at 100 % was drawn *on* the end of the bar, so half of it
+    // stuck out past the trough into empty space — and at 100 % it also ran into
+    // the duration label. `slider` below has always reserved this room; the seek
+    // bar is the same control and now reserves it the same way.
+    let track = Rect::from_min_max(
+        egui::pos2(rect.left() + HANDLE_MAX, rect.center().y),
+        egui::pos2(rect.right() - HANDLE_MAX, rect.center().y),
     );
+    let bar = Rect::from_center_size(track.center(), Vec2::new(track.width(), track_height));
     let radius = CornerRadius::same((track_height / 2.0) as u8);
 
-    ui.painter()
-        .rect_filled(track, radius, tokens.track);
+    ui.painter().rect_filled(bar, radius, tokens.track);
 
     let fraction = |value: f64| -> f32 {
         if duration > 0.0 {
@@ -727,28 +743,26 @@ pub fn seek_bar(
 
     if progress > 0.0 {
         let filled = Rect::from_min_size(
-            track.min,
-            Vec2::new(track.width() * progress, track.height()),
+            bar.min,
+            Vec2::new(bar.width() * progress, bar.height()),
         );
         ui.painter().rect_filled(filled, radius, tokens.progress);
     }
 
-    // Handle.
+    // Handle: a plain white disc, the way every system this one borrows from
+    // draws it. It used to carry a 2 pt ring of the accent *outside* the white
+    // fill, which put a hard blue outline around a white dot and made the one
+    // moving element on the bar look like a small target rather than a grip.
     let handle_x = track.left() + track.width() * progress;
-    let handle_radius = if response.hovered() || dragging.is_some() {
-        7.0
-    } else {
-        5.0
-    };
-    ui.painter().circle_filled(
-        egui::pos2(handle_x, track.center().y),
-        handle_radius,
-        tokens.on_accent,
-    );
+    let handle_radius = if active { HANDLE_MAX } else { 5.5 };
+    let handle = egui::pos2(handle_x, bar.center().y);
+    ui.painter().circle_filled(handle, handle_radius, tokens.on_accent);
+    // A hairline of pure black rather than `border_strong`: the handle is white,
+    // and a white ring on a white disc is not a ring at all.
     ui.painter().circle_stroke(
-        egui::pos2(handle_x, track.center().y),
+        handle,
         handle_radius,
-        Stroke::new(2.0_f32, tokens.accent),
+        Stroke::new(1.0_f32, Color32::from_black_alpha(0x40)),
     );
 
     let mut output = SeekBarOutput {
@@ -832,32 +846,15 @@ pub fn draw_toast(app: &PlayerApp, ctx: &Context, toast: &Toast) {
         egui::Order::Foreground,
         egui::Id::new("mvp_toast"),
     ));
-    // The HUD is a capsule of glass over the picture. It fades as a whole — the
-    // material is translucent already, so scaling its opacity is enough to keep
-    // the frame behind it visible while the message leaves.
     painter.multiply_opacity(opacity);
     let radius = size.y / 2.0;
-    // The frosted picture goes down first: the HUD slides over the film, and a
-    // blurred copy of what is behind it is what makes the capsule read as glass
-    // rather than as a hole cut in the frame.
-    if let Some((texture, source)) = frost_source(app) {
-        crate::ui::glass::frosted(
-            &painter,
-            texture,
-            rect,
-            source,
-            radius,
-            crate::ui::glass::FROST_RADIUS,
-        );
-    }
-    crate::ui::glass::paint(
-        &painter,
-        tokens,
-        rect,
-        crate::ui::glass::Glass::float(radius),
-    );
-    // The state colour stays a wash *on* the glass, so a warning still reads as a
-    // warning without turning the capsule into a coloured slab.
+    // An opaque capsule. A message has to be legible over a white frame, and it is on
+    // screen for two seconds — there is nothing to be gained by letting the film show
+    // through it, and a blurred backdrop of the film is the most expensive thing the
+    // interface could spend its frame on.
+    surface::paint_sheet(&painter, tokens, rect, radius);
+    // The state colour stays a wash *on* the capsule, so a warning still reads as a
+    // warning without turning it into a coloured slab.
     painter.rect_filled(
         rect,
         CornerRadius::same(radius as u8),
@@ -1004,12 +1001,12 @@ pub fn pill_button(
         response.is_pointer_button_down_on() && enabled,
         0.05,
     );
-    // Liquid feedback: the material compresses under the finger. It is the one
-    // piece of motion Liquid Glass adds to a control, and it is what makes a press
-    // feel like touching a surface rather than toggling a boolean.
+    // The control shrinks a little under the finger. It costs one animation and no
+    // shapes, and it is what makes a press feel like pressing something rather than
+    // toggling a boolean.
     let rect = rect.shrink(press * 1.5);
 
-    let (fill, text, glassy) = match kind {
+    let (fill, text) = match kind {
         ButtonKind::Primary => (
             blend(
                 blend(tokens.accent, tokens.accent_hover, hover),
@@ -1017,12 +1014,10 @@ pub fn pill_button(
                 press,
             ),
             tokens.on_accent,
-            false,
         ),
         ButtonKind::Secondary => (
             blend(tokens.hover, tokens.active, hover.max(press)),
             tokens.text,
-            true,
         ),
     };
     let fill = if enabled {
@@ -1032,27 +1027,13 @@ pub fn pill_button(
     };
     let text = if enabled { text } else { tokens.text_muted };
 
+    // One shape and one radius for both roles. The quiet button used to be a capsule
+    // of glass while the accent one was an 8 pt rounded rectangle, so the two halves
+    // of the welcome screen — 「打开文件…」 and 「打开文件夹…」 — were the same size in two
+    // different shapes. They are both capsules now, which is what the name of this
+    // function has said they are all along.
     let painter = ui.painter();
-    if glassy {
-        // The quiet button is a capsule of *glass*, not a grey rectangle: the
-        // material is the shape, and the tint under the pointer is that material
-        // catching light.
-        crate::ui::glass::paint(
-            painter,
-            tokens,
-            rect,
-            crate::ui::glass::Glass::capsule(rect.height()),
-        );
-        if enabled && hover.max(press) > 0.0 {
-            painter.rect_filled(
-                rect,
-                CornerRadius::same((rect.height() / 2.0) as u8),
-                blend(Color32::TRANSPARENT, tokens.active, hover.max(press)),
-            );
-        }
-    } else {
-        painter.rect_filled(rect, CornerRadius::same(radius::MD as u8), fill);
-    }
+    painter.rect_filled(rect, CornerRadius::same((rect.height() / 2.0) as u8), fill);
     painter.galley(rect.center() - galley.size() / 2.0, galley, text);
 
     paint_focus(ui, &response, rect, tokens);

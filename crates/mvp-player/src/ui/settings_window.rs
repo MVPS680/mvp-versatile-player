@@ -9,7 +9,7 @@ use crate::settings::{AspectMode, EndAction};
 use crate::state::SettingsTab;
 use crate::state::{Overlay, Toast};
 use crate::theme::{font, space, Tokens};
-use crate::ui::glass;
+use crate::ui::surface;
 use crate::ui::widgets;
 
 /// Draw the settings window when it is open.
@@ -32,21 +32,23 @@ pub fn draw(app: &mut PlayerApp, ctx: &Context) {
     let size = crate::layout::Metrics::of(ctx).dialog_size([860.0, 620.0], [620.0, 440.0]);
     let min = [620.0f32.min(size[0]), 440.0f32.min(size[1])];
     let mut open = true;
-    let mut slot = None;
-    let shown = egui::Window::new(RichText::new("设置").size(font::H2).strong())
+    egui::Window::new(RichText::new("设置").size(font::H2).strong())
         .open(&mut open)
         .collapsible(false)
         .resizable(true)
         .default_size(size)
         .min_size(min)
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
-        // Liquid Glass. The sheet is the one surface here that floats over the
-        // picture, so it is the one that gets the full material.
-        .frame(glass::window_shell(glass::sheet_margin(), glass::SHEET_RADIUS))
+        // An opaque sheet. The frame carries the fill, so the title strip is the same
+        // colour as the body with nothing painted into a reserved slot after the fact
+        // — see [`crate::ui::surface`] for what used to happen here and why it does not
+        // any more.
+        .frame(surface::sheet_shell(
+            &tokens,
+            surface::sheet_margin(),
+            surface::SHEET_RADIUS,
+        ))
         .show(ctx, |ui| {
-            // Reserved before the page is laid out: the frosted picture is opaque, so
-            // it has to land underneath everything the sheet draws.
-            slot = Some(widgets::frost_slot(ui));
             ui.horizontal_top(|ui| {
                 // ---- tab rail ------------------------------------------
                 ui.vertical(|ui| {
@@ -118,20 +120,6 @@ pub fn draw(app: &mut PlayerApp, ctx: &Context) {
                     });
             });
         });
-    // The sheet's glass is painted over the *window*, title bar included. Filled from
-    // the body's rect alone it would leave the title strip with no glass on it at all
-    // — a transparent band along the top of the panel.
-    if let Some(shown) = shown {
-        widgets::frost_surface(
-            ctx,
-            app,
-            &tokens,
-            slot,
-            shown.response.layer_id,
-            shown.response.rect,
-            glass::Glass::sheet(glass::SHEET_RADIUS),
-        );
-    }
     if !open {
         app.ui.close_overlay();
     }

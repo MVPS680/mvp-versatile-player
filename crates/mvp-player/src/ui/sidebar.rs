@@ -7,16 +7,16 @@ use crate::icons::Icon;
 use crate::settings::SidebarTab;
 use crate::state::{Mode, Overlay, Toast};
 use crate::theme::{font, space, Tokens};
-use crate::ui::glass;
+use crate::ui::surface;
 use crate::ui::widgets;
 
 /// Draw the docked sidebar.
 pub fn draw(app: &mut PlayerApp, ctx: &Context) {
     let tokens = app.theme.tokens.clone();
-    // Liquid Glass, cut on the left edge — the one that faces the picture.
+    // An opaque panel: the hairline along its left edge — the one facing the picture
+    // — is egui's own panel separator line.
     let margin = egui::Margin::symmetric(space::SM as i8, space::SM as i8);
-    let material = glass::Glass::chrome(glass::Rim::LEFT);
-    let frame = glass::chrome_shell(margin);
+    let frame = surface::bar_shell(&tokens, margin);
 
     // The sidebar is a third of the interface on a wide screen and a nuisance
     // on a narrow one: a fixed 460 pt ceiling would leave a 720 pt window with
@@ -31,7 +31,6 @@ pub fn draw(app: &mut PlayerApp, ctx: &Context) {
         .width_range(min_width..=max_width)
         .resizable(true)
         .show(ctx, |ui| {
-            glass::paint_ui(ui, &tokens, glass::surface_rect(ui, margin), material);
             let tabs: Vec<&str> = SidebarTab::all().iter().map(|t| t.label()).collect();
             let active = SidebarTab::all()
                 .iter()
@@ -62,6 +61,14 @@ fn playlist_tab(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
     /// Space the hover actions (remove, move up, move down) occupy at the right
     /// end of a row, so a title is never painted underneath them.
     const ACTIONS_WIDTH: f32 = 84.0;
+    /// Where the row's text column starts, and how big the kind glyph above it is.
+    ///
+    /// Every x in a row is derived from these two, so the index, the title and the
+    /// kind caption line up down the whole list instead of drifting by the pixel
+    /// or two each version: the kind glyph is aligned with the *first* character
+    /// of the title, which is what makes the two lines read as one entry.
+    const TEXT_X: f32 = 30.0;
+    const SUBTITLE_ICON: f32 = 11.0;
 
     // ---- toolbar ---------------------------------------------------------
     ui.horizontal(|ui| {
@@ -169,16 +176,15 @@ fn playlist_tab(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
             egui::Vec2::splat(14.0),
         );
         if playing {
-            crate::icons::draw(
-                &painter,
-                icon_rect,
-                if app.engine.is_playing() {
-                    Icon::Play
-                } else {
-                    Icon::Pause
-                },
-                tokens.accent,
-            );
+            // A play mark, in the accent, for the entry the player has open.
+            //
+            // This used to be a *pause* mark whenever the file was running, which
+            // turned a state indicator into something that looked like a button —
+            // and then changed its mind the moment playback paused. The row is not
+            // clickable there, so it must not promise an action: it says "this is
+            // the one that is open", and it says it the same way whatever the
+            // transport is doing.
+            crate::icons::draw(&painter, icon_rect, Icon::Play, tokens.accent);
         } else {
             painter.text(
                 icon_rect.center(),
@@ -191,17 +197,31 @@ fn playlist_tab(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
 
         // Title.
         //
-        // Painted, not laid out, so nothing would stop a long name from running
-        // under the hover buttons and out of the panel. The row therefore
-        // truncates by the room it actually has *and* paints inside a clip
-        // rectangle, which is what holds at every sidebar width.
-        let title_room = (rect.right() - ACTIONS_WIDTH) - (rect.left() + 30.0);
-        painter.with_clip_rect(rect.intersect(painter.clip_rect())).text(
-            egui::pos2(rect.left() + 30.0, rect.center().y - 6.0),
-            egui::Align2::LEFT_CENTER,
-            truncate(&title, ((title_room / 9.0).floor() as usize).clamp(6, 40)),
+        // Painted, not laid out, so the ellipsis has to be produced here rather
+        // than by a `Label`: the line is measured against the room the row really
+        // has and shortened with a `…`, and the clip rectangle is only a backstop
+        // for the one case measurement cannot cover — a glyph wider than the whole
+        // column. `clipped_line` is what makes this exact for CJK too: the previous
+        // version divided the column by a guessed nine points per character, so a
+        // Chinese title lost its tail long before it had to.
+        let title_room = ((rect.right() - ACTIONS_WIDTH) - (rect.left() + TEXT_X)).max(8.0);
+        let title_color = if highlighted {
+            tokens.text
+        } else {
+            tokens.text_weak
+        };
+        let title_galley = widgets::clipped_line(
+            ui,
+            &title,
             egui::FontId::proportional(font::BODY),
-            if highlighted { tokens.text } else { tokens.text_weak },
+            title_color,
+            title_room,
+        );
+        let title_offset = title_galley.size().y / 2.0;
+        painter.with_clip_rect(rect.intersect(painter.clip_rect())).galley(
+            egui::pos2(rect.left() + TEXT_X, rect.center().y - 6.0 - title_offset),
+            title_galley,
+            title_color,
         );
 
         // Secondary line: kind icon + kind + duration.
@@ -229,14 +249,17 @@ fn playlist_tab(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
         crate::icons::draw(
             &painter,
             egui::Rect::from_center_size(
-                egui::pos2(rect.left() + 35.0, rect.center().y + 8.0),
-                egui::Vec2::splat(11.0),
+                egui::pos2(rect.left() + TEXT_X + SUBTITLE_ICON / 2.0, rect.center().y + 8.0),
+                egui::Vec2::splat(SUBTITLE_ICON),
             ),
             kind_icon,
             tokens.text_muted,
         );
         painter.with_clip_rect(rect.intersect(painter.clip_rect())).text(
-            egui::pos2(rect.left() + 44.0, rect.center().y + 8.0),
+            egui::pos2(
+                rect.left() + TEXT_X + SUBTITLE_ICON + space::XS,
+                rect.center().y + 8.0,
+            ),
             egui::Align2::LEFT_CENTER,
             subtitle,
             egui::FontId::proportional(font::TINY),
@@ -635,13 +658,4 @@ fn info_tab(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
             widgets::key_value(ui, tokens, label, &value);
         }
     }
-}
-
-fn truncate(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.to_string();
-    }
-    let mut out: String = text.chars().take(max.saturating_sub(1)).collect();
-    out.push('…');
-    out
 }

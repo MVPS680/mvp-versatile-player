@@ -11,22 +11,20 @@ use crate::app::PlayerApp;
 use crate::settings::{AspectMode, EndAction, Settings, SidebarTab};
 use crate::state::{Overlay, Toast};
 use crate::theme::{font, space, Tokens};
-use crate::ui::glass;
+use crate::ui::surface;
 
 /// Render the menu bar.
 pub fn draw(app: &mut PlayerApp, ctx: &Context) {
     let tokens = app.theme.tokens.clone();
-    // Liquid Glass, cut on the bottom edge: the menu bar is flush with the window
-    // frame, so only the edge that faces the picture catches the light.
+    // An opaque panel. The bar is flush with the window frame, so the only edge that
+    // meets anything is the bottom one — which is egui's own panel separator line.
     let margin = egui::Margin::symmetric(space::SM as i8, 2);
-    let material = glass::Glass::chrome(glass::Rim::BOTTOM);
-    let frame = glass::chrome_shell(margin);
+    let frame = surface::bar_shell(&tokens, margin);
 
     egui::TopBottomPanel::top("mvp_menu_bar")
         .frame(frame)
         .exact_height(32.0)
         .show(ctx, |ui| {
-            glass::paint_ui(ui, &tokens, glass::surface_rect(ui, margin), material);
             // A title lights up on its own, exactly the way a button in the transport
             // bar does: nothing at rest, `tokens.hover` under the pointer, `tokens.active`
             // while the mouse is down, radius MD, and no animation of any kind.

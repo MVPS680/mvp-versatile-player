@@ -17,10 +17,10 @@
 
 mod canvas;
 mod dialogs;
-mod glass;
 mod menu;
 mod settings_window;
 mod sidebar;
+mod surface;
 mod transport;
 mod widgets;
 
@@ -48,23 +48,43 @@ pub fn draw(app: &mut PlayerApp, ctx: &Context) {
     handle_pointer_idle(app, ctx);
     app.ui.tick_toast();
 
+    // ---- panel order ----------------------------------------------------
+    //
+    // Every panel has to claim its strip of the window *before* the central
+    // panel asks for what is left, because that is how egui hands out space: the
+    // central panel is whatever remains of the rectangle the panels declared
+    // ahead of it have not taken. Painting the transport bar after the canvas
+    // therefore did not reserve anything for it — the canvas was laid out at the
+    // full window height and the picture was centred on a rectangle whose bottom
+    // third then disappeared behind the bar. On screen that read as a video
+    // sitting low in the frame with a wide black band above it and almost none
+    // below, which is what "the picture is not centred" always is.
+    //
+    // So: top panels, then the side panel, then the bottom bar, then the canvas.
     menu::draw(app, ctx);
 
+    // The banner belongs to the top group: it pushes the canvas down rather than
+    // being drawn across the top of the picture.
+    app.ui.error_banner = error_banner(app, ctx);
+
     // The sidebar takes its width from the central panel, so it is laid out
-    // first. In fullscreen it still docks to the right, over the picture.
+    // before it. In fullscreen it still docks to the right, over the picture.
     if app.ui.sidebar_visible {
         sidebar::draw(app, ctx);
     }
 
-    canvas::draw(app, ctx);
-
     if !app.ui.fullscreen {
         transport::draw(app, ctx);
-    } else if app.ui.controls_visible() {
-        transport::draw_overlay(app, ctx);
     }
 
-    app.ui.error_banner = error_banner(app, ctx);
+    canvas::draw(app, ctx);
+
+    // The floating island is the *only* transport in fullscreen and it is an
+    // `Area`, not a panel: it reserves nothing, so it is painted over the canvas
+    // rather than before it.
+    if app.ui.fullscreen && app.ui.controls_visible() {
+        transport::draw_overlay(app, ctx);
+    }
 
     settings_window::draw(app, ctx);
     dialogs::draw(app, ctx);
