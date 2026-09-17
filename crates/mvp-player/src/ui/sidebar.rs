@@ -170,6 +170,19 @@ fn playlist_tab(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
         let highlighted = selection.map_or(playing, |selected| selected == index);
         let (rect, response, painter) = widgets::list_row(ui, tokens, highlighted, row_height);
 
+        // Off-screen rows reserve their space and nothing else.
+        //
+        // The scroll area needs every row's height to size itself, but the cost of
+        // a row is not its height: it is the title's text shaping, the kind icon,
+        // the duration string and the `classify` call behind it. A playlist of a
+        // few hundred files was paying all of that sixty times a second for rows
+        // nobody could see. `clip_rect` is the visible viewport, so this is the
+        // whole of the saving, and interaction cannot be lost by it — a row that is
+        // not on screen cannot be hovered, clicked or dragged.
+        if !rect.intersects(ui.clip_rect()) {
+            continue;
+        }
+
         // Playing indicator or index.
         let icon_rect = egui::Rect::from_center_size(
             egui::pos2(rect.left() + 16.0, rect.center().y),
@@ -652,6 +665,22 @@ fn info_tab(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
             (
                 "启动耗时",
                 format!("{:.0} 毫秒", app.ui.startup_ms),
+            ),
+            (
+                // The half of the frame this program controls: pulling the frame
+                // from the engine, uploading it and painting the interface. The
+                // number that answers "why does it feel slow" without guessing.
+                "渲染耗时",
+                format!(
+                    "最近 {:.1} · 平均 {:.1} · 最慢 {:.0} 毫秒",
+                    crate::ui::frame_ms(),
+                    crate::ui::average_frame_ms(),
+                    crate::ui::worst_frame_ms()
+                ),
+            ),
+            (
+                "播放列表",
+                format!("{} 项 · 仅可见行参与布局", app.playlist.len()),
             ),
         ];
         for (label, value) in rows {
