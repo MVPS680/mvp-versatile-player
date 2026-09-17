@@ -68,24 +68,32 @@ pub struct ImageDoc {
 }
 
 impl ImageDoc {
-    /// The frame that should be visible given an animation clock.
-    pub fn frame_at(&self, elapsed_ms: u32) -> &ImageFrame {
+    /// Index of the frame that should be visible given an animation clock.
+    ///
+    /// `None` only when the document has no frames at all.
+    pub fn frame_index_at(&self, elapsed_ms: u32) -> Option<usize> {
         if !self.is_animated || self.frames.len() <= 1 {
-            return &self.frames[0];
+            return (!self.frames.is_empty()).then_some(0);
         }
-        let total: u32 = self.frames.iter().map(|f| f.delay_ms.max(10)).sum();
+        let total = self.animation_duration_ms();
         if total == 0 {
-            return &self.frames[0];
+            return Some(0);
         }
         let mut t = elapsed_ms % total;
-        for frame in &self.frames {
+        for (index, frame) in self.frames.iter().enumerate() {
             let delay = frame.delay_ms.max(10);
             if t < delay {
-                return frame;
+                return Some(index);
             }
             t -= delay;
         }
-        self.frames.last().unwrap_or(&self.frames[0])
+        Some(self.frames.len() - 1)
+    }
+
+    /// The frame that should be visible given an animation clock.
+    pub fn frame_at(&self, elapsed_ms: u32) -> &ImageFrame {
+        let index = self.frame_index_at(elapsed_ms).unwrap_or(0);
+        self.frames.get(index).unwrap_or(&self.frames[0])
     }
 
     /// Total animation duration in milliseconds.
@@ -152,6 +160,13 @@ pub struct ImageView {
     pub slideshow_interval: f32,
     /// Seconds since the current slide appeared.
     pub slideshow_elapsed: f32,
+    /// Bumped whenever the document changes, so a caller can tell "the same
+    /// picture" from "a picture with the same dimensions".
+    ///
+    /// The player uses it to avoid handing the same pixels to the GPU again on
+    /// every repaint: for a still image that is the whole cost of drawing it,
+    /// and repaints happen whenever the pointer moves.
+    serial: u64,
 }
 
 impl Default for ImageView {
@@ -170,6 +185,7 @@ impl Default for ImageView {
             slideshow: false,
             slideshow_interval: 5.0,
             slideshow_elapsed: 0.0,
+            serial: 0,
         }
     }
 }
@@ -180,17 +196,36 @@ impl ImageView {
         Self::default()
     }
 
+    /// Identifies the document currently shown.
+    ///
+    /// Changes on every open, install and close, so `(serial, frame index)`
+    /// names exactly one frame of pixels.
+    pub fn serial(&self) -> u64 {
+        self.serial
+    }
+
     /// Decode `path` and display it, replacing whatever was shown.
     pub fn open(&mut self, path: &Path) -> Result<()> {
         let doc = load(path)?;
-        self.doc = Some(doc);
-        self.reset_view();
+        self.install(doc);
         Ok(())
+    }
+
+    /// Display an already-decoded document, replacing whatever was shown.
+    ///
+    /// Exists so a caller that decodes on a background thread (the player,
+    /// for a large image or a slide change) can hand the result over without
+    /// knowing how the viewer stores it.
+    pub fn install(&mut self, doc: ImageDoc) {
+        self.doc = Some(doc);
+        self.serial = self.serial.wrapping_add(1);
+        self.reset_view();
     }
 
     /// Forget the current image.
     pub fn close(&mut self) {
         self.doc = None;
+        self.serial = self.serial.wrapping_add(1);
         self.reset_view();
     }
 
@@ -338,6 +373,14 @@ impl ImageView {
             return None;
         }
         Some(doc.frame_at(self.animation_time_ms))
+    }
+
+    /// Index of the frame that should currently be displayed.
+    ///
+    /// What a caller caching "the frame I last handed to the GPU" should key
+    /// on; the pixels themselves have no identity of their own.
+    pub fn current_frame_index(&self) -> Option<usize> {
+        self.doc.as_ref()?.frame_index_at(self.animation_time_ms)
     }
 
     /// `true` when the viewer needs continuous repaints (animated image or a
@@ -538,15 +581,18 @@ where
             .unwrap_or(100)
             .clamp(10, 10_000);
         let buffer = frame.into_buffer();
+        // Checked before the frame is kept, not after: a 10000x10000 frame is
+        // 400 MB, and accepting it and then noticing would mean the ceiling was
+        // never actually applied to the frame that broke it.
+        if total_bytes + buffer.as_raw().len() > MAX_ANIMATION_BYTES {
+            log::warn!("动画帧过多，已截断");
+            break;
+        }
         total_bytes += buffer.as_raw().len();
         out.push(ImageFrame {
             data: buffer.into_raw(),
             delay_ms,
         });
-        if total_bytes > MAX_ANIMATION_BYTES {
-            log::warn!("动画帧过多，已截断");
-            break;
-        }
     }
     out
 }
@@ -819,6 +865,82 @@ mod tests {
         assert_eq!(doc.frame_at(299).data[0], 2);
         assert_eq!(doc.frame_at(300).data[0], 1, "animation wraps");
         assert_eq!(doc.animation_duration_ms(), 300);
+    }
+
+    #[test]
+    fn the_frame_index_agrees_with_the_frame_the_picture_shows() {
+        // The index is what the player keys its texture cache on, so it has to
+        // name the same frame every time the frame itself is asked for.
+        let doc = ImageDoc {
+            path: PathBuf::from("a.gif"),
+            width: 2,
+            height: 2,
+            frames: vec![
+                ImageFrame {
+                    data: vec![1; 16],
+                    delay_ms: 100,
+                },
+                ImageFrame {
+                    data: vec![2; 16],
+                    delay_ms: 200,
+                },
+            ],
+            is_animated: true,
+            format: "GIF".into(),
+            color_type: "RGBA".into(),
+            file_size: 0,
+            exif_orientation: 1,
+            downscaled: false,
+        };
+        for t in [0u32, 99, 100, 299, 300, 301, 1_000] {
+            let index = doc.frame_index_at(t).expect("an index for every time");
+            assert!(
+                std::ptr::eq(&doc.frames[index], doc.frame_at(t)),
+                "index {index} does not name the frame shown at {t} ms"
+            );
+        }
+
+        // A still image is always frame 0, and an empty document has none.
+        let mut still = doc.clone();
+        still.is_animated = false;
+        assert_eq!(still.frame_index_at(12_345), Some(0));
+        let mut empty = doc.clone();
+        empty.frames.clear();
+        assert_eq!(empty.frame_index_at(0), None);
+    }
+
+    #[test]
+    fn the_viewer_serial_changes_only_when_the_document_does() {
+        // The player uses the serial to tell "the same picture" from "a picture
+        // that happens to look the same". Repaints — zoom, pan, hover, resize —
+        // must not change it, or the texture cache stops working.
+        let mut view = ImageView::new();
+        let opened = view.serial();
+        view.reset_view();
+        view.pan(5.0, 5.0);
+        view.rotate_cw();
+        view.zoom_by(2.0, Some((100.0, 100.0)));
+        assert_eq!(view.serial(), opened, "looking at it is not loading it");
+
+        view.install(ImageDoc {
+            path: PathBuf::from("b.png"),
+            width: 1,
+            height: 1,
+            frames: vec![ImageFrame {
+                data: vec![0; 4],
+                delay_ms: 0,
+            }],
+            is_animated: false,
+            format: "PNG".into(),
+            color_type: "RGBA".into(),
+            file_size: 0,
+            exif_orientation: 1,
+            downscaled: false,
+        });
+        assert_ne!(view.serial(), opened, "a new document is a new identity");
+        let installed = view.serial();
+        view.close();
+        assert_ne!(view.serial(), installed, "closing also changes it");
     }
 
     #[test]

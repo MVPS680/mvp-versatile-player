@@ -632,6 +632,49 @@ fn info_tab(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
             ),
             ("已解码帧", snapshot.decoded_frames.to_string()),
             ("丢弃帧", snapshot.dropped_frames.to_string()),
+            (
+                // Frames the decoder threw away *before* copying and converting
+                // them — the keyframe rewind a seek lands on. The counterpart of
+                // 丢弃帧, which counts frames whose pixels were already paid for.
+                "跳过帧",
+                snapshot.skipped_frames.to_string(),
+            ),
+            (
+                // Decoded, converted, then replaced by a newer frame before the
+                // interface asked for one. Large numbers here with a healthy
+                // presented frame rate mean the source runs faster than the
+                // screen, not that the player is struggling.
+                "呈现丢弃",
+                snapshot.presentation_drops.to_string(),
+            ),
+            (
+                // What the engine decoded against what actually reached the
+                // screen. The gap between the two is the whole diagnosis.
+                "上屏帧",
+                format!(
+                    "{} 帧 · {:.1} fps",
+                    app.ui.present.presented(),
+                    app.ui.present.fps()
+                ),
+            ),
+            (
+                // Where the video thread's time goes, per stage. Split so that a
+                // slow file can be attributed instead of guessed at: the copy out
+                // of GPU memory, the colour conversion and the HDR tone map are
+                // three different problems with three different fixes.
+                "视频耗时",
+                format!(
+                    "下载 {:.1} · 转换 {:.1}（色调 {:.1}）· 等队列 {:.1} 毫秒",
+                    snapshot.download_ms,
+                    snapshot.convert_ms,
+                    snapshot.tone_map_ms,
+                    snapshot.queue_wait_ms
+                ),
+            ),
+            (
+                "取帧耗时",
+                format!("{:.1} 毫秒", app.ui.present.handoff_ms()),
+            ),
             ("队列帧数", snapshot.queued_frames.to_string()),
             (
                 "音频缓冲",

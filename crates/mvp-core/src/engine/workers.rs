@@ -271,6 +271,12 @@ fn demuxer_main(
     let media_info = Arc::new(info::describe(&ictx, &probe_path, kind));
     *shared.duration.lock() = media_info.duration.max(0.0);
     *shared.info.lock() = Some(Arc::clone(&media_info));
+    // How fast the source runs decides how many frames a given number of
+    // seconds of buffer actually is, and the queue's time budget is expressed
+    // in seconds.
+    if let Some(video) = media_info.video.first() {
+        shared.video_queue.lock().set_pacing(video.fps);
+    }
     let _ = shared.event_tx.send(EngineEvent::Opened(Arc::clone(&media_info)));
 
     // ---- pick streams ------------------------------------------------------
@@ -390,6 +396,9 @@ fn demuxer_main(
 
     let mut generation = shared.generation.load(Ordering::SeqCst);
     let mut reached_eof = false;
+    // Per-stream time base and start offset, filled in the first time a packet
+    // of that stream is seen. See the packet loop below.
+    let mut timings: std::collections::HashMap<usize, (f64, f64)> = std::collections::HashMap::new();
     // `true` once the end of the file has been reported. The pipeline is not
     // torn down then, it parks: a restart request is just a seek, so the loop
     // below has to keep running to serve it.
@@ -418,6 +427,7 @@ fn demuxer_main(
         if let Some(target) = pending_seek {
             generation = shared.generation.fetch_add(1, Ordering::SeqCst) + 1;
             shared.video_queue.lock().clear();
+            shared.wake_video();
             shared.clock.seek(target);
             *shared.seek_target.lock() = Some(target);
             shared.dropped_frames.store(0, Ordering::Relaxed);
@@ -522,8 +532,18 @@ fn demuxer_main(
         };
 
         let index = stream.index();
-        let time_base = super::rational_to_f64(stream.time_base());
-        let start_offset = stream_start_offset(&stream, time_base);
+
+        // The time base and the start offset are fixed for the whole file, and
+        // a long one hands over millions of packets: looked up once per stream
+        // instead of once per packet.
+        let (time_base, start_offset) = match timings.entry(index) {
+            std::collections::hash_map::Entry::Occupied(slot) => *slot.get(),
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                let time_base = super::rational_to_f64(stream.time_base());
+                let start_offset = stream_start_offset(&stream, time_base);
+                *slot.insert((time_base, start_offset))
+            }
+        };
 
         if Some(index) == local_video_stream {
             let timestamp = packet.pts().map(|pts| pts as f64 * time_base - start_offset);
@@ -978,6 +998,9 @@ fn reset_video_session(
     );
     decoder.flush();
     shared.video_queue.lock().clear();
+    // The queue just gained all the room there is, and the decoder may be
+    // waiting for some of it.
+    shared.wake_video();
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1056,6 +1079,11 @@ fn drain_video(
         if let Some(target) = *seek_target {
             if pts + 0.02 < target {
                 log::debug!("video frame at {pts:.3}s dropped: before the seek target {target:.3}s");
+                // Counted apart from `dropped_frames`: this one never cost a
+                // copy or a colour conversion, which is the distinction that
+                // says whether the pipeline is spending its time on frames the
+                // screen will show.
+                shared.perf.skipped_frames.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
         }
@@ -1076,7 +1104,13 @@ fn drain_video(
         }
 
         let source: &ffmpeg::frame::Video = if hardware {
-            match download_frame(frame, hw_scratch) {
+            let started = Instant::now();
+            let copied = download_frame(frame, hw_scratch);
+            shared
+                .perf
+                .download_ms
+                .record(started.elapsed().as_secs_f32() * 1000.0);
+            match copied {
                 Ok(()) => hw_scratch,
                 Err(err) => {
                     log::warn!("{err}");
@@ -1099,6 +1133,7 @@ fn drain_video(
         // The preference can change while a file plays, so it is re-read for
         // every frame; the converter only rebuilds its tables when it flips.
         converter.set_tone_map(shared.hdr_tone_map.load(Ordering::Relaxed));
+        let convert_started = Instant::now();
         let data = match converter.convert(source, width, height, &shared.pool) {
             Ok(data) => data,
             Err(err) => {
@@ -1106,6 +1141,11 @@ fn drain_video(
                 continue;
             }
         };
+        let convert_ms = convert_started.elapsed().as_secs_f32() * 1000.0;
+        shared.perf.convert_ms.record(convert_ms);
+        // Reported by the converter itself: the tone map is a per-pixel loop
+        // inside the conversion, so it cannot be timed from out here.
+        shared.perf.tone_map_ms.record(converter.last_tone_map_ms());
 
         *serial = serial.wrapping_add(1);
         let decoded = VideoFrame {
@@ -1127,31 +1167,58 @@ fn drain_video(
         // seeks and rate changes responsive without ever making the picture
         // wait for a frame that has been thrown away.
         //
-        // The wait is short and re-checks the abort flag and pending seek each
-        // time, so a seek is never delayed by more than a few milliseconds.
+        // The wait re-checks the abort flag and a pending seek every time, and
+        // both of those *signal* the queue, so a seek or a stop is acted on at
+        // once rather than up to a poll interval later.
         let decoded = Arc::new(decoded);
+        let wait_started = Instant::now();
+        let mut queue = shared.video_queue.lock();
         loop {
             if shared.video_flush_pending() || shared.abort.load(Ordering::Relaxed) {
                 return;
             }
-            {
-                let mut queue = shared.video_queue.lock();
-                // While paused the clock stands still, so only the queue's own
-                // capacity bounds the decoder — that is what lets frame
-                // stepping walk forward.
-                let playing = shared.state().is_playing();
-                let lead_ok = !playing
-                    || queue.is_empty()
-                    || queue
-                        .back_pts()
-                        .map(|back| back - shared.clock.now() < VIDEO_LEAD)
-                        .unwrap_or(true);
-                if lead_ok && queue.try_push(Arc::clone(&decoded)).is_none() {
-                    break;
-                }
+            // While paused the clock stands still, so only the queue's own
+            // capacity bounds the decoder — that is what lets frame stepping
+            // walk forward.
+            let playing = shared.state().is_playing();
+            let now = shared.clock.now();
+            let back = queue.back_pts();
+            let lead_ok = !playing
+                || queue.is_empty()
+                || back.map(|back| back - now < VIDEO_LEAD).unwrap_or(true);
+            if lead_ok && queue.try_push(Arc::clone(&decoded)).is_none() {
+                break;
             }
-            std::thread::sleep(Duration::from_millis(4));
+            // This used to be a flat four-millisecond sleep, which is 250
+            // wake-ups a second for a wait that ends the instant the interface
+            // takes a frame — and up to four milliseconds of jitter on every
+            // frame that arrived with the queue full.
+            //
+            // How long the wait can possibly be is computable, so wait exactly
+            // that long: a full queue is waiting for the interface (or for a
+            // seek emptying it), and both of those signal; a closed lead window
+            // is waiting for the clock, which nothing can signal but whose
+            // reopening time is known. `CONTROL_POLL` is the ceiling either way,
+            // and doubles as the bound on how late anything unnoticed can be.
+            let sleep = if lead_ok {
+                CONTROL_POLL
+            } else {
+                match back {
+                    Some(back) => {
+                        let seconds = (back - VIDEO_LEAD - now)
+                            .clamp(0.001, CONTROL_POLL.as_secs_f64());
+                        Duration::from_secs_f64(seconds)
+                    }
+                    None => CONTROL_POLL,
+                }
+            };
+            shared.video_ready.wait_for(&mut queue, sleep);
         }
+        drop(queue);
+        shared
+            .perf
+            .queue_wait_ms
+            .record(wait_started.elapsed().as_secs_f32() * 1000.0);
     }
 }
 
@@ -1164,6 +1231,13 @@ const HW_DEVICE_TYPES: &[ffmpeg::ffi::AVHWDeviceType] = &[
     ffmpeg::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA,
     ffmpeg::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_DXVA2,
 ];
+
+/// Surfaces the hardware decoder may hold beyond what the player holds.
+///
+/// Four is enough to bridge the download-and-convert stage without reserving a
+/// noticeable amount of video memory; the point is to stop the pool running dry
+/// on high-resolution, high-frame-rate material.
+const HW_EXTRA_FRAMES: i32 = 4;
 
 thread_local! {
     /// Pixel format the decoder's `get_format` callback should pick.
@@ -1264,6 +1338,21 @@ fn enable_hardware(
 
             if (*ctx).hw_device_ctx.is_null() {
                 continue;
+            }
+            // How many frames the decoder may keep on the GPU beyond what the
+            // caller holds.
+            //
+            // Zero lets libavcodec size the pool by the decoder's own needs
+            // (thread count, reordering depth), which is tuned for *decoding*
+            // and not for a player that holds frames for a while. The picture
+            // is downloaded and converted on one thread here, so at 4K and a
+            // high frame rate the pool drains faster than it refills, and
+            // `avcodec_receive_frame` starts returning EAGAIN on a decoder that
+            // is not actually out of work — which shows up as a stalled picture
+            // rather than as an error. Asking for a handful of extra frames
+            // costs a little VRAM (a few surface slots) and removes the stall.
+            if (*ctx).extra_hw_frames == 0 {
+                (*ctx).extra_hw_frames = HW_EXTRA_FRAMES;
             }
             log::info!("已启用硬件解码: {:?}", device_type);
             return Some(target);

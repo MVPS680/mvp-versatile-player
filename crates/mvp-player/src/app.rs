@@ -92,6 +92,11 @@ pub struct PlayerApp {
     pub uploaded_pts: f64,
     /// Pixel size of the frame currently uploaded.
     pub uploaded_size: (u32, u32),
+    /// Which still-image frame is on the GPU, as `(viewer serial, frame index)`.
+    ///
+    /// The video path has `uploaded_serial` for the same reason: a repaint is
+    /// not a reason to convert and upload pixels that have not changed.
+    pub uploaded_image: Option<(u64, usize)>,
     /// The exact image currently on screen, kept so a snapshot never has to ask
     /// the engine for pixels it has already given away.
     pub displayed: Option<Arc<egui::ColorImage>>,
@@ -217,6 +222,7 @@ impl PlayerApp {
             uploaded_serial: 0,
             uploaded_pts: 0.0,
             uploaded_size: (0, 0),
+            uploaded_image: None,
             displayed: None,
             frame_history: FrameHistory::new(),
             redo_frame: None,
@@ -371,7 +377,12 @@ impl PlayerApp {
                     self.displayed = None;
                     self.uploaded_serial = 0;
                     self.uploaded_pts = 0.0;
+                    self.uploaded_image = None;
                     self.forget_shown_frames();
+                    // The presentation clock belongs to the file that was on
+                    // screen, not to this one: a first frame must not be timed
+                    // against the last frame of the previous file.
+                    self.ui.present.reset_timing();
                     self.engine.stop();
                     self.rebuild_info_rows_image();
                     let doc = self.image.doc.as_ref().map(|d| d.summary()).unwrap_or_default();
@@ -429,7 +440,9 @@ impl PlayerApp {
         self.displayed = None;
         self.uploaded_serial = 0;
         self.uploaded_pts = 0.0;
+        self.uploaded_image = None;
         self.forget_shown_frames();
+        self.ui.present.reset_timing();
         // A seek preview belongs to the file that was open when it was made.
         self.ui.seek_drag = None;
         self.ui.seek_hold = None;
@@ -636,8 +649,23 @@ impl PlayerApp {
     }
 
     /// Upload the current image-viewer frame.
+    ///
+    /// A still image only changes when the *frame* changes, but this runs on
+    /// every repaint — and repaints happen whenever the pointer moves, the
+    /// window is resized, or the controls animate. Converting and re-uploading
+    /// the same picture each time is the single largest cost in the viewer: an
+    /// 8192x8192 photo is 268 MB of pixels per repaint. So the frame that is
+    /// already on the GPU is remembered by identity, exactly as the video path
+    /// remembers its serial, and nothing happens when it has not changed.
     pub fn update_image_texture(&mut self, ctx: &Context) {
         if self.mode != Mode::Image {
+            return;
+        }
+        let Some(frame_index) = self.image.current_frame_index() else {
+            return;
+        };
+        let key = (self.image.serial(), frame_index);
+        if self.uploaded_image == Some(key) && self.texture.is_some() {
             return;
         }
         let Some(frame) = self.image.current_frame() else {
@@ -656,6 +684,7 @@ impl PlayerApp {
         let image = egui::ColorImage::from_rgba_unmultiplied(size, &frame.data[..expected]);
         self.upload_image(ctx, image);
         self.uploaded_size = (width, height);
+        self.uploaded_image = Some(key);
     }
 
     /// Hand a finished image to the GPU and remember it for snapshots.
@@ -674,6 +703,10 @@ impl PlayerApp {
                 ));
             }
         }
+        // A frame is on its way to the screen: this is the clock the presented
+        // frame rate is derived from. The still-image path goes through here
+        // too, and for an animation that is exactly right.
+        self.ui.present.record_presented();
         self.displayed = Some(image);
     }
 
@@ -1750,8 +1783,27 @@ impl eframe::App for PlayerApp {
         self.update_sleep_blocker();
         self.sync_engine();
         self.tick_image(ctx);
-        self.update_frame_texture(ctx);
-        self.update_image_texture(ctx);
+        // A minimized window has no picture to update, and a frame that is
+        // pulled, converted and uploaded anyway is work nobody will ever see —
+        // at 4K that is tens of megabytes a frame, sixty times a second, for a
+        // strip of taskbar. The engine carries on decoding on its own threads
+        // and the sound keeps playing; when the window comes back the next pull
+        // takes the frame that is due then, not the one from before it was
+        // hidden.
+        if !crate::ui::window_hidden(ctx) {
+            // Timed as a pair, and timed around the *whole* hand-off rather than
+            // around `TextureHandle::set`: for a still this is where the pixels
+            // are converted out of RGBA, and that conversion is the expensive
+            // half of showing a large image. The GPU upload itself happens
+            // later, inside egui's paint, and is already covered by the render
+            // timing.
+            let handoff_started = std::time::Instant::now();
+            self.update_frame_texture(ctx);
+            self.update_image_texture(ctx);
+            self.ui
+                .present
+                .record_handoff(handoff_started.elapsed().as_secs_f32() * 1000.0);
+        }
         self.ui(ctx);
         self.update_window_title(ctx);
 

@@ -406,12 +406,92 @@ pub struct UiState {
 
     /// Milliseconds from process start to the first painted frame.
     pub startup_ms: f32,
+    /// What actually reached the screen, as opposed to what was decoded.
+    pub present: PresentStats,
     /// Cached FFmpeg version banner.
     pub ffmpeg_version: String,
     /// Cached FFmpeg build configuration.
     pub ffmpeg_config: String,
     /// Cached snapshot-saved message.
     pub last_snapshot: Option<PathBuf>,
+}
+
+/// A rolling view of the frame pipeline as the interface sees it.
+///
+/// The engine counts what it decodes; this counts what was *shown*, which is the
+/// number that answers "is the player keeping up". The two disagreeing is the
+/// whole diagnosis: many decoded frames and few presented ones means the
+/// pipeline is producing pictures the screen never gets to see.
+#[derive(Debug, Default)]
+pub struct PresentStats {
+    /// When the previous frame was presented, for the presentation interval.
+    last_present: Option<Instant>,
+    /// Time between *presentations*; its reciprocal is the frame rate on
+    /// screen. Measured here rather than per repaint, because a repaint that
+    /// shows the frame already on screen is not a presented frame.
+    interval_ms: mvp_core::util::MsEwma,
+    /// Time spent pulling a frame out of the engine and handing it to egui.
+    handoff_ms: mvp_core::util::MsEwma,
+    /// Frames presented since the player started.
+    presented: u64,
+}
+
+impl PresentStats {
+    /// Record what one frame's hand-off cost, in milliseconds.
+    ///
+    /// Called on every repaint, including the ones that found no new frame, so
+    /// the number reflects the path rather than only its busiest frames.
+    pub fn record_handoff(&mut self, ms: f32) {
+        self.handoff_ms.record(ms);
+    }
+
+    /// Record that a new frame reached the screen.
+    ///
+    /// Only ever called when a frame was actually handed over: this is the
+    /// presentation clock the frame rate is derived from, and counting
+    /// repaints instead would report the interface's idle refresh as playback
+    /// performance.
+    pub fn record_presented(&mut self) {
+        let now = Instant::now();
+        if let Some(previous) = self.last_present.replace(now) {
+            let interval = now.saturating_duration_since(previous).as_secs_f32() * 1000.0;
+            // A pause, a seek or a file change produces a gap that is not a slow
+            // frame; folding one in would hold the reading down for a second or
+            // two of perfectly healthy playback.
+            if interval < 1000.0 {
+                self.interval_ms.record(interval);
+            }
+        }
+        self.presented += 1;
+    }
+
+    /// Frames per second actually reaching the screen (`0.0` before the second
+    /// frame).
+    pub fn fps(&self) -> f32 {
+        let interval = self.interval_ms.get();
+        if interval > 0.01 {
+            1000.0 / interval
+        } else {
+            0.0
+        }
+    }
+
+    /// Average time spent handing one frame to the interface, in milliseconds.
+    pub fn handoff_ms(&self) -> f32 {
+        self.handoff_ms.get()
+    }
+
+    /// Frames presented so far.
+    pub fn presented(&self) -> u64 {
+        self.presented
+    }
+
+    /// Forget the timing history, keeping the lifetime counter.
+    pub fn reset_timing(&mut self) {
+        self.last_present = None;
+        self.interval_ms = mvp_core::util::MsEwma::new();
+        self.handoff_ms = mvp_core::util::MsEwma::new();
+    }
 }
 
 /// How long a requested seek keeps the seek bar where the user put it.
@@ -460,6 +540,7 @@ impl Default for UiState {
             last_reported_fullscreen: None,
             close_requested: false,
             startup_ms: 0.0,
+            present: PresentStats::default(),
             ffmpeg_version: String::new(),
             ffmpeg_config: String::new(),
             last_snapshot: None,

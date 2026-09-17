@@ -128,7 +128,11 @@ pub fn draw(app: &mut PlayerApp, ctx: &Context) {
 const HIDDEN_POLL: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// `true` when the window is minimized, so nothing can be seen.
-fn window_hidden(ctx: &Context) -> bool {
+///
+/// Shared with the frame loop in `PlayerApp::update`: a minimized window must
+/// not pull a frame out of the engine, convert it and hand it to a texture
+/// nobody can look at.
+pub(crate) fn window_hidden(ctx: &Context) -> bool {
     ctx.input(|input| input.viewport().minimized.unwrap_or(false))
 }
 

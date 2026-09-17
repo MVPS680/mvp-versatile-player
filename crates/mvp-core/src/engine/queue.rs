@@ -75,6 +75,12 @@ pub struct VideoQueue {
     frames: VecDeque<Arc<VideoFrame>>,
     bytes: usize,
     budget_bytes: usize,
+    /// How far ahead of the playhead the queue may run, in seconds of media.
+    /// `0.0` means "no time bound", which is what [`VideoQueue::new`] gives.
+    time_budget: f64,
+    /// Source frame rate the time budget is turned into a frame count with.
+    /// `0.0` until [`VideoQueue::set_pacing`] is told.
+    fps: f64,
     min_frames: usize,
     max_frames: usize,
 }
@@ -87,9 +93,57 @@ impl VideoQueue {
             frames: VecDeque::new(),
             bytes: 0,
             budget_bytes: budget_bytes.max(1024 * 1024),
+            time_budget: 0.0,
+            fps: 0.0,
             min_frames: 2,
             max_frames: max_frames.max(3),
         }
+    }
+
+    /// A queue that also refuses to hold more than `seconds` of media.
+    ///
+    /// The byte budget alone describes memory, not *lag*: a 1080p queue will
+    /// happily accept sixteen frames, which is half a second of material the
+    /// decoder has already read and the playhead has not reached. Half a second
+    /// of lead is half a second of delay before a seek, a speed change or a
+    /// pause can take effect, and it is paid for nothing — a queue only ever
+    /// needs to bridge one screen's worth of jitter.
+    ///
+    /// Frame size varies enormously (8 MB at 1080p, 132 MB at 8K), so the frame
+    /// count that fits a given number of seconds is derived from the source's
+    /// frame rate by [`Self::set_pacing`].
+    pub fn with_time_budget(budget_bytes: usize, max_frames: usize, seconds: f64) -> Self {
+        Self {
+            time_budget: if seconds.is_finite() && seconds > 0.0 {
+                seconds
+            } else {
+                0.0
+            },
+            ..Self::new(budget_bytes, max_frames)
+        }
+    }
+
+    /// Tell the queue how fast the source runs, so the time budget can be
+    /// turned into a frame count.
+    pub fn set_pacing(&mut self, fps: f64) {
+        if fps.is_finite() && fps > 0.0 {
+            self.fps = fps;
+        }
+    }
+
+    /// Number of frames this queue may hold, given the time budget and the
+    /// source frame rate.
+    ///
+    /// Never above `max_frames` and never below `min_frames`: a budget that
+    /// rounded down to one frame would not be a buffer at all, and the byte
+    /// budget already has its own floor for the same reason.
+    fn frame_cap(&self) -> usize {
+        if self.time_budget <= 0.0 || self.fps <= 0.0 {
+            return self.max_frames;
+        }
+        let by_time = (self.fps * self.time_budget).ceil();
+        let by_time = by_time.clamp(self.min_frames as f64, self.max_frames as f64);
+        by_time as usize
     }
 
     /// Number of frames waiting.
@@ -109,7 +163,7 @@ impl VideoQueue {
 
     /// `true` when another frame would exceed the budget.
     pub fn is_full(&self) -> bool {
-        self.frames.len() >= self.max_frames
+        self.frames.len() >= self.frame_cap()
             || (self.frames.len() >= self.min_frames && self.bytes >= self.budget_bytes)
     }
 
@@ -162,15 +216,33 @@ impl VideoQueue {
     /// behaviour you want when the decoder has fallen behind: skip ahead rather
     /// than fall further behind.
     pub fn take_ready(&mut self, now: f64, tolerance: f64) -> Option<Arc<VideoFrame>> {
+        self.take_ready_counted(now, tolerance).0
+    }
+
+    /// [`Self::take_ready`], and how many frames it threw away.
+    ///
+    /// The count is what tells "the decoder cannot keep up" apart from "the
+    /// decoder is converting frames the screen was never going to show": at
+    /// 120 fps on a 60 Hz display every other frame is superseded before it can
+    /// be presented. Dropping them silently is why those two cases looked
+    /// identical in the statistics panel.
+    pub fn take_ready_counted(
+        &mut self,
+        now: f64,
+        tolerance: f64,
+    ) -> (Option<Arc<VideoFrame>>, u64) {
         let mut chosen: Option<Arc<VideoFrame>> = None;
+        let mut discarded = 0u64;
         while let Some(front) = self.frames.front() {
-            if front.pts <= now + tolerance {
-                chosen = self.pop_front();
-            } else {
+            if front.pts > now + tolerance {
                 break;
             }
+            if chosen.is_some() {
+                discarded += 1;
+            }
+            chosen = self.pop_front();
         }
-        chosen
+        (chosen, discarded)
     }
 
     /// Seconds until the oldest queued frame should be shown, or `None` when
@@ -221,6 +293,37 @@ mod tests {
     }
 
     #[test]
+    fn take_ready_counts_the_frames_it_supersedes() {
+        // The count is what tells "the decoder cannot keep up" apart from "the
+        // decoder is converting frames a faster-than-screen source produced".
+        // Dropping them silently is why the two looked identical.
+        let mut q = VideoQueue::new(64 * 1024 * 1024, 16);
+        for i in 0..10 {
+            push(&mut q, frame(i as f64 * 0.04, 1024));
+        }
+        let (got, discarded) = q.take_ready_counted(0.10, 0.02);
+        let got = got.expect("a frame must be ready");
+        assert!((got.pts - 0.12).abs() < 1e-9, "got {}", got.pts);
+        assert_eq!(discarded, 3, "three frames were superseded by the one shown");
+        assert_eq!(q.len(), 6);
+    }
+
+    #[test]
+    fn take_ready_counts_nothing_when_only_one_frame_is_due() {
+        let mut q = VideoQueue::new(64 * 1024 * 1024, 16);
+        push(&mut q, frame(0.0, 1024));
+        push(&mut q, frame(1.0, 1024));
+        let (got, discarded) = q.take_ready_counted(0.01, 0.0);
+        assert!(got.is_some());
+        assert_eq!(discarded, 0, "a frame that is shown was not a drop");
+        assert_eq!(q.len(), 1);
+        // And asking again with nothing due reports nothing at all.
+        let (none, discarded) = q.take_ready_counted(0.02, 0.0);
+        assert!(none.is_none());
+        assert_eq!(discarded, 0);
+    }
+
+    #[test]
     fn a_full_queue_hands_the_frame_back_instead_of_eating_an_old_one() {
         // The regression this guards: the queue used to drop its oldest frame
         // to make room, which left it holding nothing but future timestamps —
@@ -267,6 +370,60 @@ mod tests {
         q.clear();
         assert!(q.is_empty());
         assert_eq!(q.bytes(), 0);
+    }
+
+    #[test]
+    fn a_time_budget_bounds_how_far_ahead_the_decoder_may_run() {
+        // Small frames and a generous byte budget: without a time bound the
+        // queue would accept all sixteen. At 24 fps a quarter of a second is
+        // six frames, which is the *lag* limit — bytes alone say nothing about
+        // how much material has been read ahead of the playhead.
+        let mut q = VideoQueue::with_time_budget(64 * 1024 * 1024, 16, 0.25);
+        q.set_pacing(24.0);
+        let mut accepted = 0;
+        for i in 0..32 {
+            if q.try_push(frame(i as f64 * (1.0 / 24.0), 1024)).is_none() {
+                accepted += 1;
+            }
+        }
+        assert_eq!(accepted, 6, "a quarter of a second at 24 fps");
+        assert!(q.is_full());
+    }
+
+    #[test]
+    fn a_time_budget_never_shrinks_the_queue_below_a_usable_buffer() {
+        // One frame is not a buffer: a queue sized by a very high frame rate or
+        // a very short budget must still hold a couple of frames, or playback
+        // would stall on the first hiccup.
+        let mut q = VideoQueue::with_time_budget(64 * 1024 * 1024, 16, 0.0001);
+        q.set_pacing(1000.0);
+        let mut accepted = 0;
+        for i in 0..8 {
+            if q.try_push(frame(i as f64, 1024)).is_none() {
+                accepted += 1;
+            }
+        }
+        assert_eq!(accepted, 2, "the floor is a real buffer, not one frame");
+    }
+
+    #[test]
+    fn an_unpaced_queue_behaves_exactly_as_before() {
+        // `VideoQueue::new` takes no pacing, and a source whose frame rate is
+        // unknown must be treated as \"no time bound\" rather than as zero
+        // frames.
+        let mut q = VideoQueue::new(64 * 1024 * 1024, 4);
+        for i in 0..4 {
+            push(&mut q, frame(i as f64, 1024));
+        }
+        assert!(q.is_full());
+        // A nonsensical frame rate must not change anything either.
+        let mut q = VideoQueue::with_time_budget(64 * 1024 * 1024, 4, 0.25);
+        q.set_pacing(f64::NAN);
+        q.set_pacing(0.0);
+        for i in 0..4 {
+            push(&mut q, frame(i as f64, 1024));
+        }
+        assert!(q.is_full());
     }
 
     #[test]

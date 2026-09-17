@@ -272,9 +272,65 @@ pub fn even((w, h): (u32, u32)) -> (u32, u32) {
     ((w.max(2) & !1), (h.max(2) & !1))
 }
 
+/// An exponentially weighted average of a millisecond measurement, in an
+/// atomic.
+///
+/// The video worker measures the stages of a frame and the interface displays
+/// the result, so the number has to travel between two functions that own
+/// neither of the other's state. Exactly one thread writes a slot and the value
+/// is only ever read to be shown, which is why relaxed loads are enough.
+#[derive(Debug, Default)]
+pub struct MsEwma(std::sync::atomic::AtomicU32);
+
+impl MsEwma {
+    /// An average with no samples yet.
+    pub const fn new() -> Self {
+        Self(std::sync::atomic::AtomicU32::new(0))
+    }
+
+    /// Fold one measurement in.
+    pub fn record(&self, ms: f32) {
+        use std::sync::atomic::Ordering;
+        let previous = f32::from_bits(self.0.load(Ordering::Relaxed));
+        let next = if previous <= 0.0 {
+            ms
+        } else {
+            previous * 0.9 + ms * 0.1
+        };
+        self.0.store(next.to_bits(), Ordering::Relaxed);
+    }
+
+    /// The current average in milliseconds (`0.0` before the first sample).
+    pub fn get(&self) -> f32 {
+        f32::from_bits(self.0.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ms_ewma_starts_empty_then_smooths_towards_the_samples() {
+        let average = MsEwma::new();
+        assert_eq!(average.get(), 0.0, "no samples means no reading");
+        average.record(10.0);
+        assert!(
+            (average.get() - 10.0).abs() < 1e-4,
+            "the first sample is the reading, got {}",
+            average.get()
+        );
+        // A second, much smaller sample must move the average *towards* it, not
+        // replace it: one fast frame in a stream of slow ones is noise.
+        average.record(0.0);
+        let after = average.get();
+        assert!((after - 9.0).abs() < 1e-3, "got {after}");
+        // Repeated small samples converge.
+        for _ in 0..200 {
+            average.record(0.0);
+        }
+        assert!(average.get() < 0.5, "got {}", average.get());
+    }
     use std::path::PathBuf;
 
     #[test]

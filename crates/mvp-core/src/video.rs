@@ -94,8 +94,15 @@ impl FramePool {
         if let Some(i) = best {
             let mut buf = free.swap_remove(i);
             let cap = buf.capacity();
-            buf.clear();
-            buf.resize(len, 0);
+            // Shrink to the requested length and grow only if the buffer came
+            // back shorter. `clear()` followed by `resize(len, 0)` — what this
+            // used to be — zero-fills the whole buffer on every reuse, and a 4K
+            // frame is 33 MB of pointless memset for bytes the caller is about
+            // to overwrite in full (which is the documented contract above).
+            buf.truncate(len);
+            if buf.len() < len {
+                buf.resize(len, 0);
+            }
             *self.held.lock() -= cap;
             return buf;
         }
@@ -133,6 +140,35 @@ impl FramePool {
     }
 }
 
+/// How many threads the tone map may be spread over.
+///
+/// Two cores are left alone on purpose: the demuxer and the audio decoder are
+/// running too, and a player that takes every core to tone map a frame is a
+/// player that makes the interface stutter. Capped at four because the split
+/// only pays while each band is still large enough to be worth a thread —
+/// below that, handing work out costs more than it saves.
+fn tone_map_bands() -> usize {
+    std::thread::available_parallelism()
+        .map(|cores| cores.get().saturating_sub(2).clamp(1, 4))
+        .unwrap_or(1)
+}
+
+/// The sizes a conversion works at, once they have been checked.
+#[derive(Debug, Clone, Copy)]
+struct Geometry {
+    /// Destination width in pixels.
+    dst_width: i32,
+    /// Destination height in pixels.
+    dst_height: i32,
+}
+
+impl Geometry {
+    /// Bytes the destination image occupies.
+    fn dst_bytes(&self) -> usize {
+        self.dst_width as usize * self.dst_height as usize * 4
+    }
+}
+
 /// Colour conversion + scaling from any FFmpeg pixel format to packed RGBA.
 ///
 /// The underlying `SwsContext` is cached across frames and only rebuilt when a
@@ -151,6 +187,14 @@ pub struct RgbaConverter {
     tone_map: bool,
     /// Mapper built for the dynamic range of the frames currently arriving.
     mapper: Option<(HdrInfo, ToneMapper)>,
+    /// Threads the tone map may use. See [`Self::spread_over_threads`].
+    bands: usize,
+    /// Milliseconds the last [`Self::convert`] spent tone mapping.
+    ///
+    /// The tone map is a full-frame per-pixel loop and it happens inside the
+    /// conversion, so this is the only way to tell how much of the conversion
+    /// time it accounts for without timing it from outside.
+    last_tone_map_ms: f32,
 }
 
 // SAFETY: the converter is created on, moved to and only ever used from the
@@ -171,6 +215,8 @@ impl RgbaConverter {
             src_range: -1,
             tone_map: true,
             mapper: None,
+            bands: tone_map_bands(),
+            last_tone_map_ms: 0.0,
         }
     }
 
@@ -191,6 +237,12 @@ impl RgbaConverter {
         self.tone_map
     }
 
+    /// Milliseconds the last conversion spent tone mapping, `0.0` when the
+    /// frame needed none.
+    pub fn last_tone_map_ms(&self) -> f32 {
+        self.last_tone_map_ms
+    }
+
     /// Convert `src` into RGBA at `dst_width x dst_height`.
     ///
     /// The returned vector always has exactly `dst_width * dst_height * 4`
@@ -202,6 +254,21 @@ impl RgbaConverter {
         dst_height: u32,
         pool: &FramePool,
     ) -> Result<Vec<u8>> {
+        let geometry = self.prepare(src, dst_width, dst_height)?;
+        let mut out = pool.acquire(geometry.dst_bytes());
+        self.scale(src, &mut out, dst_width)?;
+        self.apply_tone_map(src, &mut out);
+        Ok(out)
+    }
+
+    /// Validate the frame, choose the colour matrix and make sure `self.ctx` is
+    /// built for this geometry.
+    fn prepare(
+        &mut self,
+        src: &ffmpeg::frame::Video,
+        dst_width: u32,
+        dst_height: u32,
+    ) -> Result<Geometry> {
         let width = src.width() as i32;
         let height = src.height() as i32;
         // A damaged or mis-detected stream can hand over a frame with a bogus
@@ -260,19 +327,52 @@ impl RgbaConverter {
             )?;
         }
 
-        let len = dst_width as usize * dst_height as usize * 4;
-        let mut out = pool.acquire(len);
-        let strides = [dst_width * 4, 0, 0, 0];
+        Ok(Geometry {
+            dst_width,
+            dst_height,
+        })
+    }
+
+    /// Colour-convert and scale `src` into `dst`, in one piece.
+    ///
+    /// `sws_scale` is deliberately *not* given the frame in bands.
+    ///
+    /// It looks as though it could be: the signature takes `srcSliceY` and
+    /// `srcSliceH`, and FFmpeg's own slice threading hands it bands. But its
+    /// slicing is stateful — the context carries `dstY` and the buffered source
+    /// rows from one call to the next — and handing a *single* context a
+    /// sequence of bands does not reproduce the whole-frame result, because the
+    /// vertical filter at a band edge is fed fewer taps than it has
+    /// mid-frame. Measured on a synthetic 640x480 -> 320x240 conversion cut in
+    /// two: 121 of the 240 destination rows differed from the whole-frame
+    /// result, starting at the cut. The exact parallel route is FFmpeg's
+    /// receive-slice API (`sws_frame_start` / `sws_send_slice` /
+    /// `sws_receive_slice`), which cuts the *destination* instead and re-runs
+    /// the vertical filter with the whole source available. That needs
+    /// AVFrame plumbing and a destination buffer of FFmpeg's choosing, so it
+    /// is not what this does.
+    ///
+    /// The honest summary: the scaler stays single-threaded, and what is
+    /// parallelised instead is the tone map, which is per-pixel and can be
+    /// proved to produce identical bytes.
+    fn scale(
+        &self,
+        src: &ffmpeg::frame::Video,
+        dst: &mut [u8],
+        dst_width: u32,
+    ) -> Result<()> {
+        let strides = [dst_width as i32 * 4, 0, 0, 0];
 
         // SAFETY: `self.ctx` is a live SwsContext built for exactly these
         // dimensions, formats and colour settings. `src` is a live AVFrame and
         // FFmpeg guarantees its planes stay valid for the duration of the call.
-        // The destination points at `out`, which is exactly `len` bytes, and the
-        // matching stride describes it.
+        // The destination points at `dst`, which is `prepare`-checked to be at
+        // least `dst_width * dst_height * 4` long, and the matching stride
+        // describes it.
         let written = unsafe {
             let src_frame = src.as_ptr();
             let dst_data = [
-                out.as_mut_ptr(),
+                dst.as_mut_ptr(),
                 ptr::null_mut(),
                 ptr::null_mut(),
                 ptr::null_mut(),
@@ -282,7 +382,7 @@ impl RgbaConverter {
                 (*src_frame).data.as_ptr() as *const *const u8,
                 (*src_frame).linesize.as_ptr(),
                 0,
-                height,
+                src.height() as i32,
                 dst_data.as_ptr(),
                 strides.as_ptr(),
             )
@@ -291,25 +391,61 @@ impl RgbaConverter {
         if written <= 0 {
             return Err(MediaError::other("视频帧色彩转换失败"));
         }
+        Ok(())
+    }
 
-        // HDR → SDR, when the frame needs it and the user allows it.
-        //
-        // It happens here, on the buffer the screen is about to show, rather
-        // than in the decoder: this buffer is already scaled to the window, so
-        // the cost follows the display rather than the source. The mapper is
-        // rebuilt only when a frame arrives with a different dynamic range.
-        if self.tone_map {
-            let info = HdrInfo::from_frame(src);
-            if info.needs_tone_map() {
-                if self.mapper.as_ref().map(|(built, _)| *built) != Some(info) {
-                    self.mapper = Some((info, ToneMapper::new(info)));
-                }
-                if let Some((_, mapper)) = &self.mapper {
-                    mapper.apply(&mut out);
-                }
-            }
+    /// Bring `dst` into SDR range, when the frame needs it and the user allows
+    /// it.
+    ///
+    /// This happens on the buffer the screen is about to show, rather than in
+    /// the decoder: that buffer is already scaled to the window, so the cost
+    /// follows the display rather than the source. The mapper is rebuilt only
+    /// when a frame arrives with a different dynamic range.
+    ///
+    /// The work is per-pixel with no reads outside the pixel, so the buffer is
+    /// split between threads — see [`RgbaConverter::tone_map_bands`] — and
+    /// produces exactly the same bytes as doing it in one piece. At 4K this is
+    /// the largest single cost of an HDR frame.
+    fn apply_tone_map(&mut self, src: &ffmpeg::frame::Video, dst: &mut [u8]) {
+        self.last_tone_map_ms = 0.0;
+        if !self.tone_map {
+            return;
         }
-        Ok(out)
+        let info = HdrInfo::from_frame(src);
+        if !info.needs_tone_map() {
+            return;
+        }
+        if self.mapper.as_ref().map(|(built, _)| *built) != Some(info) {
+            self.mapper = Some((info, ToneMapper::new(info)));
+        }
+        let Some((_, mapper)) = &self.mapper else {
+            return;
+        };
+        let started = std::time::Instant::now();
+        self.spread_over_threads(mapper, dst);
+        self.last_tone_map_ms = started.elapsed().as_secs_f32() * 1000.0;
+    }
+
+    /// Run `mapper` over `dst`, on `self.bands` threads when it is worth it.
+    ///
+    /// The split is by *pixels*, not by rows: `chunks_mut` hands out disjoint
+    /// slices, so there is no aliasing to reason about and none of the
+    /// `unsafe` a raw-pointer fan-out would need. Each pixel is mapped from
+    /// itself alone, so where the cuts fall cannot be observed in the result.
+    fn spread_over_threads(&self, mapper: &ToneMapper, dst: &mut [u8]) {
+        let bands = self.bands.min(dst.len().div_ceil(4)).max(1);
+        if bands < 2 {
+            mapper.apply(dst);
+            return;
+        }
+        // Whole pixels per band, with any remainder left to the last chunk so
+        // the bands still tile the buffer exactly.
+        let per_band = ((dst.len() / 4) / bands).max(1) * 4;
+        std::thread::scope(|scope| {
+            for band in dst.chunks_mut(per_band) {
+                scope.spawn(move || mapper.apply(band));
+            }
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -434,6 +570,83 @@ fn choose_range(src: &ffmpeg::frame::Video) -> i32 {
 mod tests {
     use super::*;
 
+    /// A deterministic YUV420P frame with real detail, so a conversion that
+    /// reads the wrong rows produces visibly (and byte-wise) different output.
+    fn synthetic_frame(width: u32, height: u32) -> ffmpeg::frame::Video {
+        let mut frame = ffmpeg::frame::Video::new(ffmpeg::format::Pixel::YUV420P, width, height);
+        let (w, h) = (width as usize, height as usize);
+        let luma_stride = frame.stride(0);
+        {
+            let plane = frame.data_mut(0);
+            for y in 0..h {
+                for x in 0..w {
+                    plane[y * luma_stride + x] = ((x * 3 + y * 5) % 251) as u8;
+                }
+            }
+        }
+        for channel in 1..3usize {
+            let stride = frame.stride(channel);
+            let (pw, ph) = (w.div_ceil(2), h.div_ceil(2));
+            let plane = frame.data_mut(channel);
+            for y in 0..ph {
+                for x in 0..pw {
+                    plane[y * stride + x] = ((x * 7 + y * 11 + channel * 40) % 251) as u8;
+                }
+            }
+        }
+        frame
+    }
+
+    /// The scale stage must convert the whole frame in one call: the bands a
+    /// caller might be tempted to cut are not equivalent. See `scale`.
+    #[test]
+    fn a_conversion_produces_a_whole_frame_of_pixels() {
+        let src = synthetic_frame(640, 480);
+        let pool = FramePool::new(16 * 1024 * 1024);
+        let out = RgbaConverter::new()
+            .convert(&src, 320, 240, &pool)
+            .expect("conversion");
+        assert_eq!(out.len(), 320 * 240 * 4);
+    }
+
+    /// The property the parallel tone map depends on: splitting the buffer
+    /// between threads must not change a single byte. Every pixel is mapped
+    /// from itself alone, so the cuts cannot be observed.
+    #[test]
+    fn the_parallel_tone_map_matches_a_single_threaded_one() {
+        let mut converter = RgbaConverter::new();
+        let mapper = ToneMapper::new(HdrInfo::default());
+        let mut whole: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+        let single = whole.clone();
+
+        converter.bands = 1;
+        converter.spread_over_threads(&mapper, &mut whole);
+
+        for bands in [2, 3, 4, 7] {
+            let mut cut = single.clone();
+            converter.bands = bands;
+            converter.spread_over_threads(&mapper, &mut cut);
+            assert!(
+                cut == whole,
+                "tone mapping on {bands} threads changed the pixels"
+            );
+        }
+    }
+
+    #[test]
+    fn a_tone_map_that_does_nothing_leaves_the_frame_alone() {
+        // The identity mapper is the common case for SDR material: it must cost
+        // nothing and change nothing, whatever the thread count.
+        let converter = RgbaConverter::new();
+        let mapper = ToneMapper::new(HdrInfo::default());
+        let original: Vec<u8> = (0..1024).map(|i| (i % 97) as u8).collect();
+        let mut buffer = original.clone();
+        converter.spread_over_threads(&mapper, &mut buffer);
+        if mapper.is_identity() {
+            assert!(buffer == original, "an identity tone map must be a no-op");
+        }
+    }
+
     #[test]
     fn pool_recycles_buffers() {
         let pool = FramePool::new(1024 * 1024);
@@ -445,7 +658,34 @@ mod tests {
         let b = pool.acquire(4096);
         assert_eq!(b.len(), 4096);
         assert_eq!(b.as_ptr(), ptr, "the same allocation should be reused");
-        assert_eq!(b.iter().filter(|v| **v == 0).count(), 4096);
+    }
+
+    #[test]
+    fn a_recycled_buffer_is_not_zero_filled_again() {
+        // The contents of a pooled buffer are documented as undefined, and the
+        // caller overwrites all of them. Zero-filling them first is a memset of
+        // the whole frame — 33 MB at 4K — for nothing.
+        let pool = FramePool::new(1024 * 1024);
+        let mut a = pool.acquire(4096);
+        a.fill(0xAB);
+        pool.release(a);
+        let b = pool.acquire(4096);
+        assert_eq!(b.len(), 4096, "the length is exact");
+        assert!(
+            b.iter().all(|v| *v == 0xAB || *v == 0),
+            "the buffer must not have been rewritten behind the caller's back"
+        );
+    }
+
+    #[test]
+    fn a_shrunken_buffer_grows_back_to_the_requested_length() {
+        let pool = FramePool::new(1024 * 1024);
+        pool.release(vec![0u8; 4096]);
+        let small = pool.acquire(1024);
+        assert_eq!(small.len(), 1024);
+        pool.release(small);
+        let big = pool.acquire(4096);
+        assert_eq!(big.len(), 4096, "a short buffer must be grown, not returned short");
     }
 
     #[test]

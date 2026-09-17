@@ -26,11 +26,12 @@ use std::thread::JoinHandle;
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 use ffmpeg_next as ffmpeg;
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 
 use crate::audio::AudioSink;
 use crate::error::{MediaError, Result};
 use crate::info::MediaInfo;
+use crate::util::MsEwma;
 use crate::video::{FramePool, VideoFrame};
 use mvp_subtitle::Subtitle;
 
@@ -167,6 +168,12 @@ pub struct EngineConfig {
     pub frame_queue_bytes: usize,
     /// Upper bound on queued frames regardless of size.
     pub frame_queue_frames: usize,
+    /// Upper bound on queued frames expressed as seconds of media.
+    ///
+    /// Bounds *lag* rather than memory: the decoder may not read and convert
+    /// more material than this ahead of the playhead. `0.0` disables the bound
+    /// and leaves only the byte and frame limits.
+    pub frame_queue_seconds: f64,
     /// Byte budget for the RGB buffer free-list.
     pub buffer_pool_bytes: usize,
     /// Start playing as soon as the file is open.
@@ -186,6 +193,11 @@ impl Default for EngineConfig {
             // 4K, which is plenty of slack without ever being a memory hog.
             frame_queue_bytes: 192 * 1024 * 1024,
             frame_queue_frames: 16,
+            // ...and no more than a quarter of a second of *media*. Bytes alone
+            // bound memory but not latency: at 24 fps the byte budget would let
+            // the decoder sit on ten frames, which is the better part of a
+            // second of material read and converted before anyone asks for it.
+            frame_queue_seconds: 0.25,
             buffer_pool_bytes: 192 * 1024 * 1024,
             autoplay: true,
         }
@@ -225,6 +237,29 @@ pub struct EngineSnapshot {
     pub dropped_frames: u64,
     /// Frames decoded since the file was opened.
     pub decoded_frames: u64,
+    /// Frames thrown away *before* they were downloaded and converted.
+    ///
+    /// A seek lands on the keyframe before the target, and the frames between
+    /// that keyframe and the target are of no interest to anyone; discarding
+    /// them here rather than downstream is the difference between paying for a
+    /// GPU copy and a colour conversion or not paying for it.
+    pub skipped_frames: u64,
+    /// Frames that were decoded and converted and then replaced by a newer
+    /// frame before the interface asked for one.
+    ///
+    /// High-frame-rate material on a slower screen spends its time here: at
+    /// 120 fps on a 60 Hz display every other converted frame is superseded
+    /// before it can be shown. The number is what separates "the decoder cannot
+    /// keep up" from "the decoder is working on frames nobody sees".
+    pub presentation_drops: u64,
+    /// Milliseconds a frame spent being copied out of GPU memory.
+    pub download_ms: f32,
+    /// Milliseconds a frame spent in colour conversion and scaling.
+    pub convert_ms: f32,
+    /// The part of `convert_ms` spent tone mapping HDR into SDR range.
+    pub tone_map_ms: f32,
+    /// Milliseconds the decoder spent waiting for room in the frame queue.
+    pub queue_wait_ms: f32,
     /// Audio chunks dropped because the queue was full.
     pub dropped_audio: u64,
     /// Device underruns since start-up.
@@ -243,6 +278,27 @@ pub struct EngineSnapshot {
     pub audio_ended: bool,
 }
 
+/// Where the video worker's time goes, and how many frames never reach the
+/// screen.
+///
+/// Every field is an atomic that one thread writes and the statistics panel
+/// reads: no lock, no allocation, safe to touch on every frame.
+#[derive(Debug, Default)]
+pub(crate) struct VideoPerf {
+    /// Frames discarded before the copy and the conversion.
+    pub skipped_frames: AtomicU64,
+    /// Frames discarded at presentation time.
+    pub presentation_drops: AtomicU64,
+    /// GPU→CPU copy of a hardware-decoded frame.
+    pub download_ms: MsEwma,
+    /// Colour conversion and scaling.
+    pub convert_ms: MsEwma,
+    /// HDR→SDR tone mapping, a part of `convert_ms`.
+    pub tone_map_ms: MsEwma,
+    /// Waiting for room in the frame queue (the presentation-lead gate).
+    pub queue_wait_ms: MsEwma,
+}
+
 /// Shared state between the UI thread and the workers.
 pub(crate) struct Shared {
     pub state: Mutex<PlaybackState>,
@@ -250,6 +306,10 @@ pub(crate) struct Shared {
     pub duration: Mutex<f64>,
     pub clock: Clock,
     pub video_queue: Mutex<VideoQueue>,
+    /// Signalled whenever the video queue gains room, so the decoder can wait
+    /// for space instead of polling for it.
+    pub video_ready: Condvar,
+    pub perf: VideoPerf,
     pub pool: FramePool,
     pub subtitle: Mutex<Option<Arc<Subtitle>>>,
     pub external_subtitle: Mutex<Option<Arc<Subtitle>>>,
@@ -312,10 +372,13 @@ impl Shared {
             info: Mutex::new(None),
             duration: Mutex::new(0.0),
             clock: Clock::new(),
-            video_queue: Mutex::new(VideoQueue::new(
+            video_queue: Mutex::new(VideoQueue::with_time_budget(
                 config.frame_queue_bytes,
                 config.frame_queue_frames,
+                config.frame_queue_seconds,
             )),
+            video_ready: Condvar::new(),
+            perf: VideoPerf::default(),
             pool: FramePool::new(config.buffer_pool_bytes),
             subtitle: Mutex::new(None),
             external_subtitle: Mutex::new(None),
@@ -375,6 +438,19 @@ impl Shared {
         let request = FlushRequest { generation, target };
         *self.video_flush.lock() = Some(request);
         *self.audio_flush.lock() = Some(request);
+        // The video worker may be parked waiting for room in a queue that this
+        // seek is about to empty. Without this it would sit there until its
+        // safety poll expired, and a seek would feel a poll interval late.
+        self.wake_video();
+    }
+
+    /// Wake the video decoder: room has appeared in the frame queue.
+    ///
+    /// Called wherever frames leave the queue — the interface taking one, a
+    /// seek emptying it, a flush being acted on — because the decoder waits for
+    /// space rather than polling for it.
+    pub fn wake_video(&self) {
+        self.video_ready.notify_all();
     }
 
     /// Take a pending flush request for the video worker.
@@ -515,6 +591,11 @@ impl Engine {
     /// * only then are the threads joined.
     pub fn stop(&self) {
         self.shared.abort.store(true, Ordering::SeqCst);
+        // The video worker may be parked on the frame queue waiting for room
+        // that is not coming. Waking it here is what keeps a stop from waiting
+        // out that worker's safety poll — the whole point of raising the flag
+        // first is that the teardown does not wait for the decoder.
+        self.shared.wake_video();
         if let Some(sink) = self.shared.audio_sink() {
             sink.close();
         }
@@ -989,12 +1070,29 @@ impl Engine {
             if let Some(frame) = frame {
                 self.shared.stepping.fetch_sub(1, Ordering::Relaxed);
                 self.shared.clock.seek(frame.pts);
+                // One frame left the queue: the decoder may be waiting for
+                // exactly that.
+                self.shared.wake_video();
                 return Some(frame);
             }
             return None;
         }
         let tolerance = 0.005;
-        self.shared.video_queue.lock().take_ready(now, tolerance)
+        let (frame, discarded) = self
+            .shared
+            .video_queue
+            .lock()
+            .take_ready_counted(now, tolerance);
+        if discarded > 0 {
+            self.shared
+                .perf
+                .presentation_drops
+                .fetch_add(discarded, Ordering::Relaxed);
+            // Room appeared in the queue: wake the decoder instead of making it
+            // wait out its poll.
+            self.shared.wake_video();
+        }
+        frame
     }
 
     /// The subtitle cue that should be visible at `time` (seconds, already
@@ -1038,6 +1136,12 @@ impl Engine {
             audio_queue_seconds: audio.as_ref().map(|a| a.queued_seconds()).unwrap_or(0.0),
             dropped_frames: self.shared.dropped_frames.load(Ordering::Relaxed),
             decoded_frames: self.shared.decoded_frames.load(Ordering::Relaxed),
+            skipped_frames: self.shared.perf.skipped_frames.load(Ordering::Relaxed),
+            presentation_drops: self.shared.perf.presentation_drops.load(Ordering::Relaxed),
+            download_ms: self.shared.perf.download_ms.get(),
+            convert_ms: self.shared.perf.convert_ms.get(),
+            tone_map_ms: self.shared.perf.tone_map_ms.get(),
+            queue_wait_ms: self.shared.perf.queue_wait_ms.get(),
             dropped_audio: audio.as_ref().map(|a| a.dropped_chunks()).unwrap_or(0),
             underruns: audio.as_ref().map(|a| a.underruns()).unwrap_or(0),
             seeking: self.shared.seek_request.lock().is_some(),

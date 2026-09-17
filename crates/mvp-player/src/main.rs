@@ -194,12 +194,44 @@ fn init_logging() {
     let _ = builder.try_init();
 }
 
+/// The log file and how much has been written to it since it was opened.
+struct LogFile {
+    file: std::fs::File,
+    written: u64,
+}
+
+/// Upper bound on the log file, per run.
+///
+/// Enforced against a counter rather than the file's length because the check
+/// runs on every line and a `stat` per line would be a syscall per line.
+const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Open the log file, rolling the previous one aside first.
+///
+/// `rotate` forces the roll-over (a session that outgrew the bound); without it
+/// the previous *run's* file is rolled aside only if it is oversized, which is
+/// how the log stays bounded across runs.
+fn open_log(path: &std::path::Path, rotate: bool) -> Option<LogFile> {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if rotate || std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) > MAX_LOG_BYTES {
+        let _ = std::fs::rename(path, path.with_extension("log.1"));
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()?;
+    Some(LogFile { file, written: 0 })
+}
+
 /// Writes every log record to the log file *and* to stderr.
 /// Writer that lazily opens the log file on first write and mirrors output to
 /// stderr. This keeps start-up fast while still producing a persisted log.
 struct LazyTeeWriter {
     path: PathBuf,
-    file: Mutex<Option<std::fs::File>>,
+    file: Mutex<Option<LogFile>>,
 }
 
 impl LazyTeeWriter {
@@ -216,24 +248,22 @@ impl std::io::Write for LazyTeeWriter {
         // Try to open the file lazily. If the mutex is poisoned or open
         // fails, fall back to stderr only so logging never blocks startup.
         if let Ok(mut guard) = self.file.lock() {
-            if guard.is_none() {
-                if let Some(parent) = self.path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                // Keep exactly one previous run so the log cannot grow.
-                const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
-                if std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0) > MAX_LOG_BYTES {
-                    let _ = std::fs::rename(&self.path, self.path.with_extension("log.1"));
-                }
-                let f = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&self.path)
-                    .ok();
-                *guard = f;
+            // A player left running overnight, or a damaged file that logs a
+            // warning per frame, must not be able to grow one file without
+            // bound: once this run has written the budget, the file is rolled
+            // aside and a fresh one is started.
+            let open_it = match guard.as_ref() {
+                Some(state) => state.written + buf.len() as u64 > MAX_LOG_BYTES,
+                None => true,
+            };
+            if open_it {
+                let roll_over = guard.is_some();
+                *guard = open_log(&self.path, roll_over);
             }
-            if let Some(file) = guard.as_mut() {
-                let _ = file.write_all(buf);
+            if let Some(state) = guard.as_mut() {
+                if state.file.write_all(buf).is_ok() {
+                    state.written += buf.len() as u64;
+                }
             }
         }
         let _ = std::io::stderr().write_all(buf);
@@ -242,8 +272,8 @@ impl std::io::Write for LazyTeeWriter {
 
     fn flush(&mut self) -> std::io::Result<()> {
         if let Ok(mut guard) = self.file.lock() {
-            if let Some(file) = guard.as_mut() {
-                let _ = file.flush();
+            if let Some(state) = guard.as_mut() {
+                let _ = state.file.flush();
             }
         }
         let _ = std::io::stderr().flush();
