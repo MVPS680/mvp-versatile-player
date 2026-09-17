@@ -84,24 +84,12 @@ fn media_view(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
         );
     }
 
-    // Hover scrub preview line: it marks a position *on the picture*, so it is
-    // only drawn over one.
-    if picture.is_some() {
-        if let Some(time) = app.ui.video_hover_time {
-            let duration = app.engine.duration();
-            if duration > 0.0 {
-                let fraction = (time / duration).clamp(0.0, 1.0) as f32;
-                let x = area.left() + area.width() * fraction;
-                ui.painter().line_segment(
-                    [
-                        egui::pos2(x, area.top()),
-                        egui::pos2(x, area.bottom()),
-                    ],
-                    Stroke::new(1.0_f32, tokens.accent.gamma_multiply(0.5)),
-                );
-            }
-        }
-    }
+    // The hover scrub line used to be drawn here: a one pixel accent stroke down
+    // the whole picture, following the pointer over the seek bar and marking where
+    // a click would land. Over a film it read as a stray hairline travelling with
+    // the cursor rather than as help, and the seek bar already reports the time
+    // under the pointer, so it is gone. `video_hover_time` stays: the timestamp
+    // readout in the transport bar is what the viewer actually needs.
 }
 
 /// Draw the video frame, and report the rectangle it was given.

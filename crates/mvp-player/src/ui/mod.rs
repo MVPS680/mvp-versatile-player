@@ -77,6 +77,19 @@ pub fn draw(app: &mut PlayerApp, ctx: &Context) {
         transport::draw(app, ctx);
     }
 
+    // Minimized: keep the clock, and do none of the expensive work.
+    //
+    // This sits immediately before the canvas because that is where the frame is
+    // pulled from the engine and uploaded to the texture — the two costs that made
+    // a night in the background into a locked-up window (and into a frame that
+    // queues behind thousands nobody saw). Audio carries on regardless: it runs on
+    // its own thread, which is what keeps a minimized player playing.
+    if window_hidden(ctx) {
+        app.ui.tick_toast();
+        ctx.request_repaint_after(HIDDEN_POLL);
+        return;
+    }
+
     canvas::draw(app, ctx);
 
     // The floating island is the *only* transport in fullscreen and it is an
@@ -100,8 +113,27 @@ pub fn draw(app: &mut PlayerApp, ctx: &Context) {
     schedule_repaint(app, ctx);
 }
 
+/// How often the interface wakes up while its window is minimized.
+///
+/// A minimized window still gets frames if anything asks for them, and this player
+/// asks for one every 8 ms while a film is playing. Left in the background
+/// overnight that is a whole night of decoding and texture uploads for a surface
+/// nobody can see. Twice a second is enough to notice the window coming back.
+const HIDDEN_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// `true` when the window is minimized, so nothing can be seen.
+fn window_hidden(ctx: &Context) -> bool {
+    ctx.input(|input| input.viewport().minimized.unwrap_or(false))
+}
+
 /// Ask for another frame at the right moment instead of spinning at 60 fps.
 fn schedule_repaint(app: &PlayerApp, ctx: &Context) {
+    // The same rule the frame loop follows: a hidden window is woken twice a
+    // second, not sixty times, whatever the file is doing.
+    if window_hidden(ctx) {
+        ctx.request_repaint_after(HIDDEN_POLL);
+        return;
+    }
     // An open dialog must not stop the clock: playback continues behind the
     // settings window, and the end of a file still has to advance the playlist.
     match app.mode {
@@ -130,7 +162,12 @@ fn schedule_repaint(app: &PlayerApp, ctx: &Context) {
                 let delay = delay.clamp(0.001, 0.05);
                 ctx.request_repaint_after(std::time::Duration::from_secs_f64(delay));
             } else if app.engine.state().is_active() {
-                ctx.request_repaint_after(std::time::Duration::from_millis(120));
+                // Paused, stopped or stepping: no frames are produced, but the
+                // interface still animates — hover glows, the knob growing under
+                // the pointer, the controls fading out. 120 ms ran all of that at
+                // eight frames a second, which is what "the player feels slow"
+                // is. Thirty frames a second costs nothing while nothing decodes.
+                ctx.request_repaint_after(std::time::Duration::from_millis(33));
             }
         }
         Mode::Image => {

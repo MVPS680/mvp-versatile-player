@@ -26,19 +26,35 @@ pub fn draw(app: &mut PlayerApp, ctx: &Context) {
         app.ui.audio_device_cache = None;
     }
     let tokens = app.theme.tokens.clone();
-    // The window is large by design — seven pages, two columns — which on a
-    // small screen is a window larger than the screen. It opens as big as the
-    // room allows and shrinks from there.
-    let size = crate::layout::Metrics::of(ctx).dialog_size([860.0, 620.0], [620.0, 440.0]);
+    // The window is large by design — seven pages, two columns — so what matters is
+    // that it never asks for more room than the *client area* has. Clamping to the
+    // monitor instead was the bug behind "in windowed mode I cannot see the close
+    // button": a player window 900 pt tall on a 1440 pt screen was handed a 620 pt
+    // sheet anchored to the centre of the *screen*, and the title bar — with the
+    // close button in it — landed outside the player's own frame. The same geometry
+    // is why the controls at the bottom of a page could not be reached.
+    let room = (ctx.screen_rect().size() - egui::vec2(2.0 * space::LG, 2.0 * space::LG))
+        .max(egui::vec2(320.0, 260.0));
+    let mut size = crate::layout::Metrics::of(ctx).dialog_size([860.0, 620.0], [620.0, 440.0]);
+    size[0] = size[0].min(room.x);
+    size[1] = size[1].min(room.y);
     let min = [620.0f32.min(size[0]), 440.0f32.min(size[1])];
+    // Where it opens the first time; after that egui keeps wherever the user
+    // dragged it to, which is the point of dropping the anchor below.
+    let default_pos = ctx.screen_rect().center() - egui::vec2(size[0], size[1]) * 0.5;
     let mut open = true;
     egui::Window::new(RichText::new("设置").size(font::H2).strong())
         .open(&mut open)
         .collapsible(false)
         .resizable(true)
+        // Draggable inside the player. An *anchored* egui window ignores the
+        // pointer by design, which is why this one could not be moved at all.
+        .movable(true)
         .default_size(size)
+        .max_size(size)
         .min_size(min)
-        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .default_pos(default_pos)
+        .constrain_to(ctx.screen_rect())
         // An opaque sheet. The frame carries the fill, so the title strip is the same
         // colour as the body with nothing painted into a reserved slot after the fact
         // — see [`crate::ui::surface`] for what used to happen here and why it does not
@@ -103,6 +119,15 @@ pub fn draw(app: &mut PlayerApp, ctx: &Context) {
                 // sideways in one long band instead of stacking.
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
+                    // Mouse users scroll with the wheel. With egui's default a drag
+                    // that starts on a slider is claimed by the scroll area as soon
+                    // as it moves a few pixels sideways, which is the "the slider
+                    // will not slide" report: the control is fine, it never sees
+                    // the drag. (The scroll bar stays draggable.)
+                    .scroll_source(egui::containers::scroll_area::ScrollSource {
+                        drag: false,
+                        ..Default::default()
+                    })
                     .show(ui, |ui| {
                         ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
                             ui.set_min_width(ui.available_width());
