@@ -78,6 +78,23 @@ pub fn draw(app: &mut PlayerApp, ctx: &Context) {
         transport::draw(app, ctx);
     }
 
+    // Minimized: keep the clock, and do none of the expensive work.
+    //
+    // This sits immediately before the canvas because that is where the frame is
+    // pulled from the engine and uploaded to the texture — the two costs that made
+    // a night in the background into a locked-up window (and into a frame that
+    // queues behind thousands nobody saw). Audio carries on regardless: it runs on
+    // its own thread, which is what keeps a minimized player playing.
+    if window_hidden(ctx) {
+        app.ui.tick_toast();
+        ctx.request_repaint_after(HIDDEN_POLL);
+        return;
+    }
+    // Timed from here, not from the top of the frame: this is the half of the
+    // frame the program controls — pulling the frame from the engine, uploading
+    // it, and painting — and it is the half that answers "why does it feel slow".
+    let render_started = std::time::Instant::now();
+
     canvas::draw(app, ctx);
 
     // The floating island is the *only* transport in fullscreen and it is an
@@ -98,11 +115,96 @@ pub fn draw(app: &mut PlayerApp, ctx: &Context) {
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
 
+    note_frame(render_started.elapsed());
     schedule_repaint(app, ctx);
+}
+
+/// How often the interface wakes up while its window is minimized.
+///
+/// A minimized window still gets frames if anything asks for them, and this player
+/// asks for one every 8 ms while a film is playing. Left in the background
+/// overnight that is a whole night of decoding and texture uploads for a surface
+/// nobody can see. Twice a second is enough to notice the window coming back.
+const HIDDEN_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// `true` when the window is minimized, so nothing can be seen.
+fn window_hidden(ctx: &Context) -> bool {
+    ctx.input(|input| input.viewport().minimized.unwrap_or(false))
+}
+
+/// The half of the frame this program controls, in milliseconds.
+///
+/// Stored as `f32` bits in atomics because the frame loop and the statistics
+/// panel are different functions and neither owns the other; there is exactly one
+/// writer, so relaxed loads are enough to read a number that is only ever read for
+/// display.
+static LAST_FRAME_MS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static AVERAGE_FRAME_MS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static WORST_FRAME_MS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static SLOW_FRAMES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// A frame slower than this is a stall rather than a slow frame.
+const SLOW_FRAME_MS: f32 = 100.0;
+
+/// How long the last frame's render half took, in milliseconds.
+pub fn frame_ms() -> f32 {
+    f32::from_bits(LAST_FRAME_MS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// An exponentially weighted average of the render half, in milliseconds.
+pub fn average_frame_ms() -> f32 {
+    f32::from_bits(AVERAGE_FRAME_MS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// The worst render half since the player started, in milliseconds.
+pub fn worst_frame_ms() -> f32 {
+    f32::from_bits(WORST_FRAME_MS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Record how long the render half of one frame took.
+///
+/// Measurements, not guesses: "the player feels slow" is only worth acting on if
+/// the numbers say where the time goes, and a run of slow frames is logged — every
+/// sixtieth one, so a stalled graphics driver cannot flood the log — because that
+/// is the evidence a freeze report needs.
+fn note_frame(elapsed: std::time::Duration) {
+    use std::sync::atomic::Ordering;
+
+    let ms = elapsed.as_secs_f32() * 1000.0;
+    LAST_FRAME_MS.store(ms.to_bits(), Ordering::Relaxed);
+
+    let previous = average_frame_ms();
+    let average = if previous <= 0.0 {
+        ms
+    } else {
+        previous * 0.9 + ms * 0.1
+    };
+    AVERAGE_FRAME_MS.store(average.to_bits(), Ordering::Relaxed);
+
+    if ms > worst_frame_ms() {
+        WORST_FRAME_MS.store(ms.to_bits(), Ordering::Relaxed);
+    }
+
+    if ms >= SLOW_FRAME_MS {
+        let count = SLOW_FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+        if count % 60 == 0 {
+            log::warn!(
+                "连续 {count} 帧渲染超过 {SLOW_FRAME_MS:.0} 毫秒（最近 {ms:.0} ms，平均 {average:.0} ms）"
+            );
+        }
+    } else {
+        SLOW_FRAMES.store(0, Ordering::Relaxed);
+    }
 }
 
 /// Ask for another frame at the right moment instead of spinning at 60 fps.
 fn schedule_repaint(app: &PlayerApp, ctx: &Context) {
+    // The same rule the frame loop follows: a hidden window is woken twice a
+    // second, not sixty times, whatever the file is doing.
+    if window_hidden(ctx) {
+        ctx.request_repaint_after(HIDDEN_POLL);
+        return;
+    }
     // An open dialog must not stop the clock: playback continues behind the
     // settings window, and the end of a file still has to advance the playlist.
     match app.mode {
@@ -131,7 +233,12 @@ fn schedule_repaint(app: &PlayerApp, ctx: &Context) {
                 let delay = delay.clamp(0.001, 0.05);
                 ctx.request_repaint_after(std::time::Duration::from_secs_f64(delay));
             } else if app.engine.state().is_active() {
-                ctx.request_repaint_after(std::time::Duration::from_millis(120));
+                // Paused, stopped or stepping: no frames are produced, but the
+                // interface still animates — hover glows, the knob growing under
+                // the pointer, the controls fading out. 120 ms ran all of that at
+                // eight frames a second, which is what "the player feels slow"
+                // is. Thirty frames a second costs nothing while nothing decodes.
+                ctx.request_repaint_after(std::time::Duration::from_millis(33));
             }
         }
         Mode::Image => {

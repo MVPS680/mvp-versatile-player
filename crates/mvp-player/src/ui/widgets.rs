@@ -630,11 +630,13 @@ pub fn slider_row(
 ) -> bool {
     /// Width of the value readout column.
     const READOUT: f32 = 56.0;
-    /// Width of the slider itself.
-    const SLIDER: f32 = 168.0;
+    /// Width of the slider when there is room for it.
+    const SLIDER_MAX: f32 = 168.0;
+    /// …and the width below which it stops being usable, so it never shrinks past it.
+    const SLIDER_MIN: f32 = 72.0;
 
     let text = format(*value);
-    row(ui, tokens, label, "", READOUT + space::SM + SLIDER, |ui| {
+    row(ui, tokens, label, "", READOUT + space::SM + SLIDER_MAX, |ui| {
         ui.allocate_ui_with_layout(
             Vec2::new(READOUT, 20.0),
             Layout::right_to_left(Align::Center),
@@ -647,7 +649,14 @@ pub fn slider_row(
                 );
             },
         );
-        match slider(ui, tokens, label, *value, range, SLIDER) {
+        // The slider takes whatever the row actually granted this column. A row
+        // gives its control at most 60 % of the page, so a fixed 168 pt slider
+        // overflows a narrow column and is clipped — and a clipped slider can only
+        // be dragged inside the part that is visible, which reads as one that will
+        // not move at all.
+        let granted = ui.available_width();
+        let width = (granted - READOUT - space::SM).clamp(SLIDER_MIN, SLIDER_MAX);
+        match slider(ui, tokens, label, *value, range, width) {
             Some(new) => {
                 *value = new;
                 true
