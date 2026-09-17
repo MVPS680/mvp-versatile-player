@@ -225,11 +225,16 @@ impl ImageView {
     }
 
     /// Multiply the zoom by `factor`, switching to [`FitMode::Custom`].
+    ///
+    /// The factor is taken against what is *on screen*, not against the image's
+    /// own pixels: while `fit` is [`FitMode::Fit`] or [`FitMode::Fill`] the
+    /// `zoom` field is not in use at all, so multiplying it meant that the first
+    /// notch on the wheel took a 4000 px photograph from the 22 % it was fitted
+    /// at straight to 112 %. A zoom has to start from what the eye can see.
     pub fn zoom_by(&mut self, factor: f32, viewport: Option<(f32, f32)>) {
         let base = match self.fit {
-            FitMode::Original => 1.0,
             FitMode::Custom => self.zoom,
-            _ => 1.0,
+            _ => self.effective_scale(viewport),
         };
         let zoom = (base * factor).clamp(0.02, 64.0);
         self.set_zoom(zoom, viewport);

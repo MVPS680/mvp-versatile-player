@@ -9,6 +9,7 @@ use mvp_core::PlaybackState;
 
 use crate::icons::Icon;
 use crate::settings::SidebarTab;
+use crate::view::{CanvasPicture, CanvasView};
 
 /// What the main area is currently showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -329,10 +330,36 @@ pub struct UiState {
 
     /// Seek preview while the user drags the bar, in seconds.
     pub seek_drag: Option<f64>,
+    /// A position the user asked for, and when, held while the engine catches
+    /// up with it.
+    ///
+    /// A seek is asynchronous: [`mvp_core::Engine::seek`] parks the request and
+    /// the demuxer answers it a moment later, so for the frames in between the
+    /// engine still reports the position the playhead is *leaving*. Drawing the
+    /// bar from that makes a click snap the handle back and then jump forward
+    /// again — which reads as "the click did nothing", and is exactly the
+    /// moment a user clicks a second and a third time. Drawing it from the
+    /// request instead holds the handle where the user put it. The hold is
+    /// dropped as soon as the clock agrees with it ([`SEEK_SETTLED`]), or after
+    /// [`SEEK_HOLD_LIMIT`] so that a seek which never lands cannot freeze the
+    /// bar.
+    pub seek_hold: Option<(f64, Instant)>,
     /// Wheel movement not yet turned into a volume step, in egui points.
     pub wheel_volume: f32,
     /// Wheel movement not yet turned into a seek step, in egui points.
     pub wheel_seek: f32,
+    /// Zoom and pan of the *video* picture on the canvas. Images carry their own
+    /// in [`mvp_core::ImageView`], and the commands that can be given in either
+    /// mode ("适应窗口") reach both through [`crate::app::PlayerApp::reset_zoom`].
+    pub canvas: CanvasView,
+    /// Where the picture was when the canvas last drew one.
+    ///
+    /// Rebuilt every frame, and `None` on any frame that showed no picture: the
+    /// zoom keys and the menu run before the canvas is laid out and have no
+    /// rectangle of their own to measure, so they read what was drawn last —
+    /// measuring the window instead would include the sidebar and the transport
+    /// bar, and `+` would jump the first time it was pressed.
+    pub picture: Option<CanvasPicture>,
     /// Row the user highlighted in the playlist.
     ///
     /// Deliberately *not* the playlist's "current" entry: clicking a row is a
@@ -385,9 +412,23 @@ pub struct UiState {
     pub ffmpeg_config: String,
     /// Cached snapshot-saved message.
     pub last_snapshot: Option<PathBuf>,
-    /// Set while the user is scrubbing with the mouse over the video.
-    pub video_hover_time: Option<f64>,
 }
+
+/// How long a requested seek keeps the seek bar where the user put it.
+///
+/// Long enough to cover a seek that has to read into a container with no usable
+/// index, short enough that a seek which never lands cannot leave the bar
+/// showing a position the engine is not heading for.
+pub const SEEK_HOLD_LIMIT: Duration = Duration::from_millis(600);
+
+/// How close the engine's position has to be to a held request, in seconds,
+/// before the hold is released.
+///
+/// A seek lands on a keyframe, so the clock the engine reports after one is a
+/// little away from the position that was asked for; a third of a second is
+/// inside "the click went where I meant" and outside the jitter of a clock that
+/// is still catching up.
+pub const SEEK_SETTLED: f64 = 0.30;
 
 impl Default for UiState {
     fn default() -> Self {
@@ -397,8 +438,11 @@ impl Default for UiState {
             sidebar_tab: SidebarTab::Playlist,
             info_rows: Vec::new(),
             seek_drag: None,
+            seek_hold: None,
             wheel_volume: 0.0,
             wheel_seek: 0.0,
+            canvas: CanvasView::new(),
+            picture: None,
             playlist_selection: None,
             overlay: Overlay::None,
             settings_tab: SettingsTab::default(),
@@ -419,7 +463,6 @@ impl Default for UiState {
             ffmpeg_version: String::new(),
             ffmpeg_config: String::new(),
             last_snapshot: None,
-            video_hover_time: None,
         }
     }
 }

@@ -364,6 +364,9 @@ impl PlayerApp {
             match self.image.open(path) {
                 Ok(()) => {
                     self.mode = Mode::Image;
+                    // A new file starts fitted: the zoom and the pan of the last
+                    // one belong to that picture, not to this one.
+                    self.reset_zoom();
                     self.texture = None;
                     self.displayed = None;
                     self.uploaded_serial = 0;
@@ -421,11 +424,15 @@ impl PlayerApp {
         }
         self.mode = Mode::Media;
         self.image.close();
+        self.reset_zoom();
         self.texture = None;
         self.displayed = None;
         self.uploaded_serial = 0;
         self.uploaded_pts = 0.0;
         self.forget_shown_frames();
+        // A seek preview belongs to the file that was open when it was made.
+        self.ui.seek_drag = None;
+        self.ui.seek_hold = None;
         self.info_source = None;
         self.last_duration = 0.0;
         self.engine
@@ -1213,10 +1220,23 @@ impl PlayerApp {
     /// Every seek goes through here rather than straight to the engine: a jump
     /// invalidates the frames remembered for single-frame stepping, and a
     /// "previous frame" that showed something from before the jump would be
-    /// worse than one that is simply unavailable.
+    /// worse than one that is simply unavailable. It is also the one place that
+    /// can tell the transport what the user asked for, so that the bar and the
+    /// timestamp show it at once instead of waiting for the demuxer to answer.
     pub fn seek(&mut self, position: f64) {
         self.forget_shown_frames();
         self.engine.seek(position);
+        if self.mode.is_media() {
+            // Clamped like the engine clamps it, so that a click on the very end
+            // of the bar cannot put a position past the duration on screen.
+            let duration = self.engine.duration();
+            let asked = if duration > 0.0 {
+                position.clamp(0.0, duration)
+            } else {
+                position.max(0.0)
+            };
+            self.ui.seek_hold = Some((asked, Instant::now()));
+        }
     }
 
     /// Jump forward or backward by `delta` seconds.
@@ -1397,6 +1417,16 @@ impl PlayerApp {
         }
     }
 
+    /// The rotation the current mode is actually using. See
+    /// [`PlayerApp::flip_h`].
+    pub fn rotation(&self) -> i32 {
+        if self.mode == Mode::Image {
+            self.image.rotation
+        } else {
+            self.settings.rotation
+        }
+    }
+
     /// Turn subtitle display on or off.
     ///
     /// This is a display gate, not a track choice: turning subtitles off and on
@@ -1546,12 +1576,66 @@ impl PlayerApp {
         }
     }
 
-    /// Zoom the image viewer, keeping the pointer anchored if it is over the
-    /// canvas.
-    pub fn zoom_image(&mut self, factor: f32, ctx: &Context) {
-        let viewport = ctx.input(|i| i.screen_rect());
-        self.image
-            .zoom_by(factor, Some((viewport.width(), viewport.height())));
+    /// Zoom whatever is on the canvas, keeping `anchor` where it is.
+    ///
+    /// `anchor` is the point the zoom holds still, in points measured from the
+    /// centre of the canvas: the wheel passes the pointer, which is what makes
+    /// Ctrl+wheel land on the part of the picture the user is looking at, and
+    /// the keyboard and the menu pass `None` to zoom about the middle.
+    ///
+    /// Returns `true` when something actually moved — at either end of the zoom
+    /// range, and with nothing on the canvas at all, it does not.
+    pub fn zoom_media(&mut self, factor: f32, anchor: Option<egui::Vec2>) -> bool {
+        let Some(picture) = self.ui.picture else {
+            return false;
+        };
+        let area = picture.canvas;
+        let anchor = anchor.unwrap_or(egui::Vec2::ZERO);
+        if self.mode.is_image() {
+            let viewport = (area.width(), area.height());
+            let before = self.image.effective_scale(Some(viewport));
+            self.image.zoom_by(factor, Some(viewport));
+            let after = self.image.effective_scale(Some(viewport));
+            if before <= 0.0 {
+                return false;
+            }
+            let applied = after / before;
+            if applied == 1.0 {
+                return false;
+            }
+            // The viewer grows the picture about the middle of the viewport;
+            // move it back so that the point under the pointer is the point
+            // that stays.
+            let offset = egui::Vec2::new(self.image.offset.0, self.image.offset.1);
+            let moved = crate::view::anchored_pan(offset, anchor, applied);
+            let size = picture.rect.size() * applied;
+            self.set_image_pan(moved, size, area);
+        } else {
+            let base = self.ui.canvas.fitted_rect(picture.rect, area);
+            if !self.ui.canvas.zoom_by(factor, anchor, base, area) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Put the image viewer's picture `pan` away from the middle of the canvas,
+    /// clamped so it cannot be dragged out of sight.
+    pub fn set_image_pan(&mut self, pan: egui::Vec2, size: egui::Vec2, area: egui::Rect) {
+        let pan = crate::view::clamp_pan(pan, size, area);
+        self.image.offset = (pan.x, pan.y);
+    }
+
+    /// "适应窗口" for whatever is on the canvas: drop the zoom and the pan.
+    ///
+    /// One command for both modes on purpose. The still viewer and the video
+    /// canvas keep their zoom in different places — a still keeps its fit mode
+    /// and its rotation with it, a video has neither — and a key that only did
+    /// half of that would look broken in the other half.
+    pub fn reset_zoom(&mut self) {
+        self.ui.canvas.reset();
+        self.image.fit = mvp_core::FitMode::Fit;
+        self.image.offset = (0.0, 0.0);
     }
 
     /// Advance the slideshow to the next image in the playlist.

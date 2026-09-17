@@ -32,8 +32,19 @@ pub struct PacketMsg {
 pub enum VideoMsg {
     /// Decode this packet.
     Packet(PacketMsg),
-    /// The container has no more packets.
-    Eof,
+    /// The container has no more packets **for this decode session**.
+    ///
+    /// Tagged like a packet, and for the same reason: a read that a *newer*
+    /// seek interrupts reports the end of the stream exactly like the end of
+    /// the file does, so this message can easily be the last thing in the
+    /// channel when the next session starts. Acting on it after the flush has
+    /// already put the decoder into its new state leaves that decoder drained —
+    /// `send_eof` is answered by every later packet with `AVERROR_EOF` — and the
+    /// picture never comes back, no matter how many times the user seeks.
+    Eof {
+        /// Decode session the end belongs to.
+        generation: u64,
+    },
     /// Stop the worker as soon as possible.
     Stop,
 }
@@ -43,8 +54,12 @@ pub enum VideoMsg {
 pub enum AudioMsg {
     /// Decode this packet.
     Packet(PacketMsg),
-    /// The container has no more packets.
-    Eof,
+    /// The container has no more packets **for this decode session**. See
+    /// [`VideoMsg::Eof`] for why the session is part of the message.
+    Eof {
+        /// Decode session the end belongs to.
+        generation: u64,
+    },
     /// Stop the worker as soon as possible.
     Stop,
 }

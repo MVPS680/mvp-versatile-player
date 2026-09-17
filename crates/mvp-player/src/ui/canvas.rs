@@ -7,11 +7,18 @@ use crate::icons::{self, Icon};
 use crate::settings::AspectMode;
 use crate::state::{Mode, Overlay, Toast};
 use crate::theme::{font, radius, space, Tokens};
+use crate::ui::minimap;
 use crate::ui::surface;
 use crate::ui::widgets;
+use crate::view;
 
 /// Draw the central area.
 pub fn draw(app: &mut PlayerApp, ctx: &Context) {
+    // Whatever is on the canvas is about to be measured again. Anything that
+    // reads the picture without being inside this function — the zoom keys, the
+    // menu, the bird's-eye view — must see "nothing is on the canvas" rather
+    // than last frame's answer on a frame that shows no picture at all.
+    app.ui.picture = None;
     let tokens = app.theme.tokens.clone();
     let frame = egui::Frame::new().fill(tokens.letterbox);
     egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
@@ -59,6 +66,12 @@ fn media_view(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
     } else {
         Some(video_view(app, ui, tokens, area))
     };
+    if let Some(rect) = picture {
+        app.ui.picture = Some(view::CanvasPicture {
+            rect,
+            canvas: area,
+        });
+    }
 
     // ---- subtitles ------------------------------------------------------
     // Over the picture — or, with no picture to be over, along the bottom of
@@ -69,8 +82,16 @@ fn media_view(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
         draw_subtitles(app, ui, &anchor, tokens);
     }
 
+    // ---- bird's-eye view ------------------------------------------------
+    // Measured before the pointer is handled, because a press that lands on the
+    // map travels the picture instead of dragging it.
+    let map = picture.and_then(|rect| minimap::target(app, area, rect));
+    if let (Some(rect), Some(sheet)) = (picture, map) {
+        minimap::draw(app, ui, area, rect, sheet, tokens);
+    }
+
     // ---- interaction ----------------------------------------------------
-    handle_video_interaction(app, ui, &response);
+    handle_video_interaction(app, ui, &response, area, picture, map);
 
     // ---- state banners --------------------------------------------------
     let state = app.engine.state();
@@ -82,25 +103,6 @@ fn media_view(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
             egui::FontId::proportional(font::BODY),
             tokens.danger,
         );
-    }
-
-    // Hover scrub preview line: it marks a position *on the picture*, so it is
-    // only drawn over one.
-    if picture.is_some() {
-        if let Some(time) = app.ui.video_hover_time {
-            let duration = app.engine.duration();
-            if duration > 0.0 {
-                let fraction = (time / duration).clamp(0.0, 1.0) as f32;
-                let x = area.left() + area.width() * fraction;
-                ui.painter().line_segment(
-                    [
-                        egui::pos2(x, area.top()),
-                        egui::pos2(x, area.bottom()),
-                    ],
-                    Stroke::new(1.0_f32, tokens.accent.gamma_multiply(0.5)),
-                );
-            }
-        }
     }
 }
 
@@ -127,12 +129,21 @@ fn video_view(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens, area: Rect) -> 
         .or_else(|| (app.uploaded_size.0 > 1).then_some(app.uploaded_size))
         .unwrap_or((16, 9));
 
-    let rect = destination_rect(area, source, app.settings.aspect, app.settings.rotation);
+    let fitted = destination_rect(area, source, app.settings.aspect, app.settings.rotation);
+    // What the aspect setting decided, scaled and slid by whatever the user has
+    // done to it since with Ctrl+wheel and a drag.
+    let rect = app.ui.canvas.rect(fitted, area);
 
     // Ask the engine to decode at (at most) the size we actually display. A 4K
     // file shown in a 1080p window then costs a quarter of the memory and a
     // quarter of the conversion work. Only do so once the real source size is
     // known — guessing would permanently constrain the decoder.
+    //
+    // The *zoomed* rectangle is the size that matters, not the fitted one: zoom
+    // in on a face in a 4K film and the decoder is asked for the pixels that
+    // zoom puts on screen, up to the source's own size, which is where the
+    // detail comes from. `set_target_size` costs a mutex and a comparison, and
+    // the worker re-reads it per frame, so following the zoom is free.
     if let Some(source) = probed {
         let scale = ui.ctx().pixels_per_point();
         let viewport = (
@@ -188,28 +199,69 @@ fn video_view(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens, area: Rect) -> 
     rect
 }
 
+/// The picture point a press on the bird's-eye view asks to see in the middle of
+/// the canvas, if the press is one and it landed on the map.
+fn map_press(response: &egui::Response, map: Option<Rect>) -> Option<Vec2> {
+    if !(response.dragged() || response.clicked()) {
+        return None;
+    }
+    let sheet = map?;
+    minimap::point_on_map(sheet, response.interact_pointer_pos()?)
+}
+
 /// Clicks, drags and the wheel on the video canvas and the audio screen.
 ///
-/// Nothing here moves the picture. A video is fitted to the canvas — that is what
-/// `destination_rect` decides, from the source size and the aspect setting — so a drag
-/// over it used to do nothing to the video at all while quietly writing to the *image*
-/// viewer's pan, which is a different mode's state: dragging a *still* is the viewer's
-/// job, and it has its own handling for it. What a drag does here is wake the
-/// controls, which is what a click does.
-fn handle_video_interaction(app: &mut PlayerApp, ui: &mut Ui, response: &egui::Response) {
+/// A video is fitted to the canvas — that is what `destination_rect` decides,
+/// from the source size and the aspect setting — and what the user may do to
+/// that is zoom it (Ctrl+wheel, anchored on the pointer) and drag it around
+/// while it is zoomed. Before this, a drag over the video did nothing at all
+/// while quietly writing to the *image* viewer's pan, which is a different
+/// mode's state: dragging a *still* is the viewer's job and has its own handling.
+/// An unzoomed video still has nowhere to go, and a drag on one does what a
+/// click does — wake the controls.
+///
+/// `map` is the bird's-eye view's rectangle, if it is on screen: a drag that
+/// starts on the map is a drag on the map, and must not also move the picture.
+fn handle_video_interaction(
+    app: &mut PlayerApp,
+    ui: &mut Ui,
+    response: &egui::Response,
+    area: Rect,
+    picture: Option<Rect>,
+    map: Option<Rect>,
+) {
     if response.double_clicked() && app.settings.double_click_fullscreen {
         app.toggle_fullscreen(ui.ctx());
+        return;
+    }
+    // A press on the map travels; a press beside it drags the picture.
+    if let Some(point) = map_press(response, map) {
+        if let Some(rect) = picture {
+            let base = app.ui.canvas.fitted_rect(rect, area);
+            let pan = view::pan_for_centre(point, rect.size());
+            app.ui.canvas.set_pan(pan, base, area);
+        }
+        app.ui.wake_controls(3.0);
+        return;
+    }
+    if response.dragged() {
+        if !app.ui.canvas.is_fitted() {
+            if let Some(rect) = picture {
+                let delta = response.drag_delta();
+                let base = app.ui.canvas.fitted_rect(rect, area);
+                app.ui.canvas.pan_by(delta, base, area);
+            }
+        }
+        app.ui.wake_controls(3.0);
         return;
     }
     if response.clicked() {
         app.ui.wake_controls(3.0);
         return;
     }
-    if response.dragged() {
-        app.ui.wake_controls(3.0);
-    }
 
-    // Scroll: volume by default, seek with Ctrl.
+    // Scroll: volume by default, zoom with Ctrl — and, on the audio screen,
+    // where there is no picture to zoom, Ctrl keeps seeking.
     //
     // One notch is one step, whatever the device reports: a notched wheel sends
     // a single 40-point spike per notch while a precision touch-pad sends a
@@ -223,39 +275,24 @@ fn handle_video_interaction(app: &mut PlayerApp, ui: &mut Ui, response: &egui::R
     // volume at the same time.
     let (scroll, modifiers) = ui.ctx().input(|i| (i.raw_scroll_delta.y, i.modifiers));
     if scroll != 0.0 && response.hovered() && !app.ui.has_overlay() {
-        if modifiers.ctrl || !app.settings.wheel_controls_volume {
-            app.ui.wheel_volume = 0.0;
-            app.ui.wheel_seek += scroll;
-            let (steps, leftover) = widgets::wheel_steps(app.ui.wheel_seek, WHEEL_POINTS_PER_NOTCH);
-            app.ui.wheel_seek = leftover;
-            if steps != 0 {
-                app.seek_relative(steps as f64 * app.settings.seek_step);
+        if modifiers.ctrl || modifiers.command {
+            if picture.is_some() {
+                // Continuous rather than stepped: one notch is a tenth of a
+                // step, and a touch-pad's stream of small deltas zooms
+                // smoothly instead of nothing happening for a minute and then
+                // everything happening at once.
+                let factor = (scroll * WHEEL_ZOOM_RATE).exp();
+                let anchor = response.hover_pos().map(|p| p - area.center());
+                if app.zoom_media(factor, anchor) {
+                    app.ui.wake_controls(3.0);
+                }
+            } else {
+                wheel_seek(app, scroll);
             }
+        } else if !app.settings.wheel_controls_volume {
+            wheel_seek(app, scroll);
         } else {
-            app.ui.wheel_seek = 0.0;
-            app.ui.wheel_volume += scroll;
-            let (steps, leftover) =
-                widgets::wheel_steps(app.ui.wheel_volume, WHEEL_POINTS_PER_NOTCH);
-            app.ui.wheel_volume = leftover;
-            if steps != 0 {
-                let volume = app.settings.volume + steps as f32 * WHEEL_VOLUME_STEP;
-                let clamped = volume.clamp(0.0, 2.0);
-                // At either end the leftover must go, or the accumulator keeps
-                // banking steps the user cannot see and the next scroll in the
-                // other direction jumps.
-                if clamped != volume {
-                    app.ui.wheel_volume = 0.0;
-                }
-                app.settings.volume = clamped;
-                if clamped > 0.0 {
-                    app.settings.muted = false;
-                }
-                app.store.mark_dirty();
-                app.toast(Toast::info(format!(
-                    "音量 {}%",
-                    (clamped * 100.0).round() as i32
-                )));
-            }
+            wheel_volume(app, scroll);
         }
     }
 }
@@ -266,6 +303,47 @@ const WHEEL_POINTS_PER_NOTCH: f32 = 40.0;
 
 /// Volume change per wheel notch — the same 5 % the arrow keys use.
 const WHEEL_VOLUME_STEP: f32 = 0.05;
+
+/// Zoom per wheel point. One notch (40 points) is `e^0.1`, about 10 %.
+const WHEEL_ZOOM_RATE: f32 = 0.0025;
+
+/// Turn accumulated wheel movement into whole seek steps.
+fn wheel_seek(app: &mut PlayerApp, scroll: f32) {
+    app.ui.wheel_volume = 0.0;
+    app.ui.wheel_seek += scroll;
+    let (steps, leftover) = widgets::wheel_steps(app.ui.wheel_seek, WHEEL_POINTS_PER_NOTCH);
+    app.ui.wheel_seek = leftover;
+    if steps != 0 {
+        app.seek_relative(steps as f64 * app.settings.seek_step);
+    }
+}
+
+/// Turn accumulated wheel movement into whole volume steps.
+fn wheel_volume(app: &mut PlayerApp, scroll: f32) {
+    app.ui.wheel_seek = 0.0;
+    app.ui.wheel_volume += scroll;
+    let (steps, leftover) = widgets::wheel_steps(app.ui.wheel_volume, WHEEL_POINTS_PER_NOTCH);
+    app.ui.wheel_volume = leftover;
+    if steps != 0 {
+        let volume = app.settings.volume + steps as f32 * WHEEL_VOLUME_STEP;
+        let clamped = volume.clamp(0.0, 2.0);
+        // At either end the leftover must go, or the accumulator keeps
+        // banking steps the user cannot see and the next scroll in the
+        // other direction jumps.
+        if clamped != volume {
+            app.ui.wheel_volume = 0.0;
+        }
+        app.settings.volume = clamped;
+        if clamped > 0.0 {
+            app.settings.muted = false;
+        }
+        app.store.mark_dirty();
+        app.toast(Toast::info(format!(
+            "音量 {}%",
+            (clamped * 100.0).round() as i32
+        )));
+    }
+}
 
 fn draw_subtitles(app: &PlayerApp, ui: &mut Ui, rect: &Rect, tokens: &Tokens) {
     let time = app.engine.display_position() - app.settings.subtitle_delay;
@@ -740,29 +818,71 @@ fn image_view(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens, ctx: &Context) 
         return;
     };
     let response = ui.allocate_rect(area, Sense::click_and_drag());
-    let pointer = response.hover_pos();
 
-    // Scroll to zoom when the pointer is over the canvas.
+    // What the picture is *now*, before this frame's wheel or drag is applied.
+    //
+    // Published straight away, because the wheel is handled below and the zoom
+    // command it calls reads this field to find out what "1.0" means for the
+    // file that is open — and `canvas::draw` clears the field at the top of
+    // every frame, so a view that only published it after handling the pointer
+    // would leave every notch of the wheel with nothing to zoom. It is also what
+    // the bird's-eye view is measured against, for the same reason.
+    let before = view::image_rect(&app.image, area);
+    if let Some(rect) = before {
+        app.ui.picture = Some(view::CanvasPicture {
+            rect,
+            canvas: area,
+        });
+    }
+    let map = before.and_then(|rect| minimap::target(app, area, rect));
+
+    // Scroll to zoom when the pointer is over the canvas. Ctrl+wheel is the
+    // documented gesture, and has to work here because it is what the video
+    // canvas takes; a plain wheel has zoomed a still in this player from the
+    // beginning, and taking that away would break the habit the video canvas
+    // never made anyone form.
     if response.hovered() {
         let scroll = ctx.input(|i| i.raw_scroll_delta.y);
+        // A wheel notch sends 40 points, a touch-pad a stream of small deltas;
+        // the exponential factor handles both without an accumulator.
         if scroll.abs() > 0.5 {
-            let factor = if scroll > 0.0 { 1.12 } else { 1.0 / 1.12 };
-            app.image.zoom_by(factor, Some((area.width(), area.height())));
+            let factor = (scroll * WHEEL_ZOOM_RATE).exp();
+            let anchor = response.hover_pos().map(|p| p - area.center());
+            app.zoom_media(factor, anchor);
         }
     }
 
-    if response.dragged() {
-        app.image.pan(response.drag_delta().x, response.drag_delta().y);
-    }
     if response.double_clicked() && app.settings.double_click_fullscreen {
         app.toggle_fullscreen(ctx);
         return;
     }
 
+    // A press on the map travels; a press beside it moves the picture.
+    if let Some(point) = map_press(&response, map) {
+        if let Some(rect) = before {
+            let pan = view::pan_for_centre(point, rect.size());
+            app.set_image_pan(pan, rect.size(), area);
+        }
+    } else if response.dragged() {
+        let delta = response.drag_delta();
+        app.image.pan(delta.x, delta.y);
+        // A still follows the pointer until its own edge meets the canvas'
+        // edge, exactly like a zoomed video: without this a flick leaves the
+        // photograph half outside the window with nothing to pull it back.
+        if let Some(size) = view::image_rect(&app.image, area).map(|rect| rect.size()) {
+            let offset = Vec2::new(app.image.offset.0, app.image.offset.1);
+            app.set_image_pan(offset, size, area);
+        }
+    }
+
     let scale = app.image.effective_scale(Some((area.width(), area.height())));
     let draw_size = Vec2::new(width as f32 * scale, height as f32 * scale);
-    let center = area.center() + Vec2::new(app.image.offset.0, app.image.offset.1);
-    let rect = Rect::from_center_size(center, draw_size);
+    let rect = view::image_rect(&app.image, area)
+        .unwrap_or_else(|| Rect::from_center_size(area.center(), draw_size));
+    app.ui.picture = Some(view::CanvasPicture {
+        rect,
+        canvas: area,
+    });
 
     // Cheap checkerboard for transparent images.
     paint_checkerboard(ui.painter(), rect, tokens);
@@ -788,7 +908,11 @@ fn image_view(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens, ctx: &Context) 
         egui::FontId::proportional(font::TINY),
         tokens.text_weak,
     );
-    let _ = pointer;
+
+    // ---- bird's-eye view ------------------------------------------------
+    if let Some(sheet) = map {
+        minimap::draw(app, ui, area, rect, sheet, tokens);
+    }
 
     image_toolbar(app, ui, &area, tokens);
 }

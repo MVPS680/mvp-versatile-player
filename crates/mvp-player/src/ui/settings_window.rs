@@ -275,6 +275,14 @@ fn video_page(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
         "在画面底部绘制渐变，让控制栏在明亮的画面上也清晰；\
          全屏时只在控制栏出现时绘制（窗口模式下控制栏本身已是实底）",
     );
+    changed |= widgets::switch_row(
+        ui,
+        tokens,
+        "缩放时显示鸟瞰图",
+        &mut app.settings.minimap,
+        "画面被放大到超出画布时，在画布右下角显示整幅画面的缩略图与取景框，\
+         可拖动取景框移动画面（Ctrl + 滚轮缩放）。全屏且控制栏隐藏时不显示。",
+    );
 
     widgets::section(ui, tokens, "截图");
     let dir = app.settings.snapshot_dir();
@@ -723,9 +731,16 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("Ctrl+W", "退出"),
     ("F1", "快捷键帮助"),
     ("0 / 1", "图片：适应窗口 / 100%"),
-    ("+ / -", "图片：放大 / 缩小"),
-    ("鼠标滚轮", "在画面上滚动：调节音量，每格 5%（Ctrl + 滚轮：快进 / 快退 5 秒）"),
-    ("鼠标拖动画面", "平移图片"),
+    ("+ / -", "放大 / 缩小画面（视频与图片）"),
+    (
+        "Ctrl + 滚轮",
+        "缩放视频 / 图片画面，以指针为中心；右下角出现鸟瞰图，可拖动它定位",
+    ),
+    (
+        "鼠标滚轮",
+        "在画面上滚动：调节音量，每格 5%（设置中可改为快进 / 快退 5 秒）",
+    ),
+    ("鼠标拖动画面", "放大后平移画面（图片始终可平移）"),
 ];
 
 fn about_page(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {

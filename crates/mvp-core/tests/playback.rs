@@ -243,6 +243,17 @@ fn seeking_lands_near_the_requested_position() {
 /// every frame that then came out was still behind the target, and the picture
 /// never came back. The fixture is a four-second transport stream with an
 /// `-output_ts_offset` of 4200s, which is exactly that shape.
+///
+/// It also pins down what the frames are stamped with after a seek. The frames
+/// of a transport stream carry no usable timestamp of their own, and the engine
+/// used to invent one — counting 1/fps on from the position the user asked for.
+/// That reads well in this test but is what took the player apart in practice:
+/// the invented time is offset from the real one by however far the keyframe
+/// before the target was, so the last frames of the file end up stamped past
+/// its own end, nothing in the queue is ever due again, the picture freezes on
+/// the old frame and — with the demuxer blocked handing packets to a decoder
+/// that never comes back for them — the end of the file is never noticed and the
+/// clock runs on past the duration.
 #[test]
 fn seeking_works_when_the_container_timeline_starts_late() {
     let Some(path) = fixture("offset.ts") else {
@@ -291,10 +302,21 @@ fn seeking_works_when_the_container_timeline_starts_late() {
             snapshot.dropped_frames
         );
     };
+    // Where the seek *lands* is the container's business: a transport stream
+    // seeks by binary search over the byte stream and answers on the next
+    // keyframe, a second away in this fixture, so the frame is stamped with the
+    // time it really has rather than with the position that was asked for. What
+    // the engine guarantees is that the picture never comes back *before* that
+    // position — the frames in front of the target are dropped, which is what
+    // this lower bound pins down — and that it comes back inside the media at
+    // all, which is what the offset translation is for.
     assert!(
-        (1.0..=2.8).contains(&frame.pts),
-        "the seek landed at {}s, expected close to 2.0s",
-        frame.pts
+        (1.98..=info.duration).contains(&frame.pts),
+        "the seek landed at {}s in a {}s file that starts at {}s, expected at or \
+         after the requested 2.0s",
+        frame.pts,
+        info.duration,
+        info.start_time
     );
     engine.stop();
 }
@@ -564,6 +586,58 @@ fn play_after_the_end_replays_from_the_start() {
         engine.position()
     );
     engine.stop();
+}
+
+/// The position the interface is *shown* never passes the end of the media.
+///
+/// The master clock is a wall clock, so nothing ties it to the length of the
+/// file: a seek re-anchors it forward, and it keeps running while the demuxer
+/// works out where that seek landed. Clicking the seek bar faster than the
+/// demuxer can answer therefore let the position climb past the duration — a
+/// "0:11" under a "0:09" total, with the progress bar pinned full — and a
+/// positive audio delay put a position past the end of *any* file on screen the
+/// same way, because the delay is added to the position the OSD prints.
+#[test]
+fn the_reported_position_never_passes_the_end_of_the_media() {
+    let Some(path) = fixture("tiny.mp4") else {
+        return;
+    };
+    let engine = silent_engine();
+    engine.open(MediaSource::Path(path)).expect("open");
+    let info = wait_for_open(&engine, Duration::from_secs(15));
+    let duration = info.duration;
+    assert!(duration > 0.0, "got duration {duration}");
+
+    // A delay that, unclamped, pushes the readout well past the end of the file.
+    engine.set_audio_delay(1.5);
+
+    // Click the last of the bar over and over, consuming frames the way the
+    // interface does every frame. Every one of these seeks lands on a file that
+    // has already ended, which is the path a click on a finished file takes.
+    let mut worst = 0.0f64;
+    for _ in 0..120 {
+        engine.seek(duration - 0.05);
+        std::thread::sleep(Duration::from_millis(25));
+        let shown = engine.display_position();
+        worst = worst.max(shown);
+        let _ = engine.take_frame(shown);
+    }
+
+    // Then let it run into the end with nothing seeking at all: a clock left
+    // running past the media is exactly what this guards against.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        let shown = engine.display_position();
+        worst = worst.max(shown);
+        let _ = engine.take_frame(shown);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    engine.stop();
+    assert!(
+        worst <= duration + 1e-6,
+        "the reported position reached {worst:.3}s in a {duration:.3}s file"
+    );
 }
 
 #[test]

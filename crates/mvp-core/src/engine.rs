@@ -931,12 +931,38 @@ impl Engine {
 
     /// Current position in seconds.
     pub fn position(&self) -> f64 {
-        self.shared.clock.now()
+        self.within_media(self.shared.clock.now())
     }
 
     /// Position with the user's audio delay applied (what the OSD shows).
     pub fn display_position(&self) -> f64 {
-        (self.shared.clock.now() + self.audio_delay()).max(0.0)
+        self.within_media((self.shared.clock.now() + self.audio_delay()).max(0.0))
+    }
+
+    /// Hold a reported position inside the media.
+    ///
+    /// The master clock is a *wall* clock and knows nothing about the length of
+    /// the media: a seek re-anchors it forward, and nothing stops it while the
+    /// demuxer works out where that seek landed or how much of the file is left
+    /// after it. A click near the end of a file therefore put a position past
+    /// its own duration in front of the user — "0:11" under a "0:09" total,
+    /// with the progress bar pinned full — and a positive audio delay could do
+    /// the same at the end of any file. Clamping here fixes every reader at
+    /// once: the transport bar, the OSD and the resume bookmark all take their
+    /// position from this one place.
+    ///
+    /// It is deliberately the *reported* position that is clamped, not the
+    /// clock: `handle_eof` and the A–B loop compare the clock against the
+    /// duration to decide when the file has ended, and a clock that could not
+    /// pass the duration could never reach that decision. A live stream has no
+    /// duration to clamp against and is left alone.
+    fn within_media(&self, position: f64) -> f64 {
+        let duration = *self.shared.duration.lock();
+        if duration > 0.0 {
+            position.min(duration)
+        } else {
+            position
+        }
     }
 
     /// Probed information about the open file.

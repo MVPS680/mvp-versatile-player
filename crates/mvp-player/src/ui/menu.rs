@@ -355,18 +355,21 @@ fn video_menu(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
             app.set_flip_v(flip_v);
         }
         separator(ui, tokens);
-        if item(ui, tokens, "适应窗口", "0", app.mode.is_image()) {
-            app.image.fit = mvp_core::FitMode::Fit;
-            app.image.offset = (0.0, 0.0);
+        // Zoom and pan apply to whatever is on the canvas — a still and a video
+        // both — so these four are enabled whenever there is a picture, which is
+        // exactly when `ui.picture` was written by the canvas.
+        let picture = app.ui.picture.is_some();
+        if item(ui, tokens, "适应窗口", "0", picture) {
+            app.reset_zoom();
         }
         if item(ui, tokens, "原始大小 100%", "1", app.mode.is_image()) {
             app.image.zoom_original();
         }
-        if item(ui, tokens, "放大", "+", app.mode.is_image()) {
-            app.image.zoom_by(1.25, None);
+        if item(ui, tokens, "放大", "+", picture) {
+            app.zoom_media(1.25, None);
         }
-        if item(ui, tokens, "缩小", "-", app.mode.is_image()) {
-            app.image.zoom_by(0.8, None);
+        if item(ui, tokens, "缩小", "-", picture) {
+            app.zoom_media(0.8, None);
         }
         separator(ui, tokens);
         if item(ui, tokens, "幻灯片播放", "", app.mode.is_image()) {

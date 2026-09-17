@@ -18,6 +18,7 @@
 mod canvas;
 mod dialogs;
 mod menu;
+mod minimap;
 mod settings_window;
 mod sidebar;
 mod surface;
@@ -351,13 +352,16 @@ fn handle_keyboard(app: &mut PlayerApp, ctx: &Context) {
             }
             (Key::G, false, _) => app.request_open_subtitle(),
             (Key::R, false, _) => app.rotate_media(),
-            (Key::Num0, false, _) => {
-                app.image.fit = mvp_core::FitMode::Fit;
-                app.image.offset = (0.0, 0.0);
-            }
+            (Key::Num0, false, _) => app.reset_zoom(),
             (Key::Num1, false, _) => app.image.zoom_original(),
-            (Key::Plus, false, _) | (Key::Equals, false, _) => app.zoom_image(1.25, ctx),
-            (Key::Minus, false, _) => app.zoom_image(0.8, ctx),
+            // Zoom works on whatever is on the canvas: a still and a video both
+            // answer to these, which is what the menu says they do.
+            (Key::Plus, false, _) | (Key::Equals, false, _) => {
+                app.zoom_media(1.25, None);
+            }
+            (Key::Minus, false, _) => {
+                app.zoom_media(0.8, None);
+            }
             (Key::W, true, _) => {
                 app.save_session();
                 app.ui.close_requested = true;

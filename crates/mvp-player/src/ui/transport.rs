@@ -69,7 +69,8 @@ fn seek_row(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
     let duration = app.engine.duration();
     let position = app.engine.display_position();
     let preview = app.ui.seek_drag;
-    let shown = preview.unwrap_or(position);
+    // The bar leads the clock: see [`crate::state::UiState::seek_hold`] for why.
+    let shown = shown_position(app, position, preview);
 
     let current = mvp_core::util::format_duration(shown);
     let total = if duration > 0.0 {
@@ -115,13 +116,9 @@ fn seek_row(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
         });
 
         let bar = output.inner;
-        if let Some(value) = bar.preview {
-            if active {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                app.ui.video_hover_time = Some(value);
-            }
-        } else {
-            app.ui.video_hover_time = None;
+        // The pointer over the bar is holding its handle.
+        if active && bar.preview.is_some() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
 
         // While dragging, only preview; seek once on release so a slow disk is
@@ -155,6 +152,33 @@ fn seek_row(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
             );
         }
     });
+}
+
+/// What the timestamps and the bar should show this frame.
+///
+/// The user's request outranks the engine's clock while it is outstanding. A
+/// click is answered by the demuxer a moment later, and in that moment the clock
+/// still reads the position the playhead is leaving; showing *that* is what made
+/// a click look like it had been ignored — and made the bar and the timestamp
+/// disagree with the pointer that had just set them.
+///
+/// A drag outranks everything: while the pointer is down, the pointer is the
+/// truth. A readout that started leading the pointer mid-drag would be a bar the
+/// user cannot aim with.
+fn shown_position(app: &mut PlayerApp, engine: f64, drag: Option<f64>) -> f64 {
+    if let Some(value) = drag {
+        return value;
+    }
+    let Some((target, asked_at)) = app.ui.seek_hold else {
+        return engine;
+    };
+    if (engine - target).abs() <= crate::state::SEEK_SETTLED
+        || asked_at.elapsed() >= crate::state::SEEK_HOLD_LIMIT
+    {
+        app.ui.seek_hold = None;
+        return engine;
+    }
+    target
 }
 
 /// Transport buttons, volume, speed and window controls.

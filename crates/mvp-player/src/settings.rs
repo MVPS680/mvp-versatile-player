@@ -179,6 +179,9 @@ pub struct Settings {
     pub flip_v: bool,
     /// Draw a dimming gradient behind the controls so they read over video.
     pub control_scrim: bool,
+    /// Show the bird's-eye view in the corner of the canvas while the picture is
+    /// zoomed in past the edges of the canvas.
+    pub minimap: bool,
     /// Auto-hide the controls in fullscreen after this many seconds (0 = never).
     pub hide_controls_after: f32,
 
@@ -292,6 +295,7 @@ impl Default for Settings {
             flip_h: false,
             flip_v: false,
             control_scrim: true,
+            minimap: true,
             hide_controls_after: 3.0,
 
             subtitles_enabled: true,

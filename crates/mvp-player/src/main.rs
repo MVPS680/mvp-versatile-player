@@ -24,6 +24,7 @@ mod settings;
 mod state;
 mod theme;
 mod ui;
+mod view;
 
 use std::path::PathBuf;
 use std::time::Instant;

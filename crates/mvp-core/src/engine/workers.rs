@@ -512,8 +512,12 @@ fn demuxer_main(
         };
         let Some((stream, packet)) = packet else {
             reached_eof = true;
-            let _ = video_tx.send(VideoMsg::Eof);
-            let _ = audio_tx.send(AudioMsg::Eof);
+            // Tagged with the session they belong to: a read that the *next*
+            // seek interrupts reports the end of the stream too, and by the time
+            // the worker gets round to this message the flush of that seek may
+            // already have run. See [`VideoMsg::Eof`].
+            let _ = video_tx.send(VideoMsg::Eof { generation });
+            let _ = audio_tx.send(AudioMsg::Eof { generation });
             continue;
         };
 
@@ -868,7 +872,19 @@ fn run_video_decoder(
             VideoMsg::Stop => {
                 break;
             }
-            VideoMsg::Eof => {
+            VideoMsg::Eof { generation: ended } => {
+                // An end that belongs to a session the flush has already moved
+                // on from is not an end of anything: the decoder has just been
+                // flushed and is waiting for the first packet of the new
+                // session. Draining it here would answer every one of those
+                // packets with `AVERROR_EOF` and freeze the picture for good.
+                if ended != generation {
+                    log::debug!(
+                        "video worker: ignoring an end-of-stream from generation {ended} \
+                         (at {generation})"
+                    );
+                    continue;
+                }
                 let _ = decoder.send_eof();
                 drain_video(
                     &shared,
@@ -879,6 +895,7 @@ fn run_video_decoder(
                     &mut last_pts,
                     &mut serial,
                     fallback_step,
+                    None,
                     generation,
                     &mut seek_target,
                     hardware_format,
@@ -896,9 +913,9 @@ fn run_video_decoder(
                     continue;
                 }
                 log::debug!("video worker: packet at {:?}", msg.timestamp);
-                if decoder.send_packet(&msg.packet).is_err() {
+                if let Err(err) = decoder.send_packet(&msg.packet) {
                     // A corrupted packet is normal in the wild; keep going.
-                    log::debug!("video worker: the decoder refused a packet");
+                    log::debug!("video worker: the decoder refused a packet: {err}");
                     continue;
                 }
                 packets_fed += 1;
@@ -911,6 +928,7 @@ fn run_video_decoder(
                     &mut last_pts,
                     &mut serial,
                     fallback_step,
+                    msg.timestamp,
                     generation,
                     &mut seek_target,
                     hardware_format,
@@ -972,6 +990,7 @@ fn drain_video(
     last_pts: &mut f64,
     serial: &mut u64,
     fallback_step: f64,
+    packet_pts: Option<f64>,
     generation: u64,
     seek_target: &mut Option<f64>,
     hardware_format: Option<ffmpeg::ffi::AVPixelFormat>,
@@ -988,8 +1007,75 @@ fn drain_video(
         }
 
         // A hardware decoder hands back a frame that lives in GPU memory; the
-        // colour conversion needs it in RAM.
-        let source: &ffmpeg::frame::Video = if is_hardware_frame(frame, hardware_format) {
+        // colour conversion needs it in RAM. Whether that copy is needed at all
+        // is decided below: a frame that is about to be dropped should not be
+        // taken out of the GPU first, and a seek drops every frame in front of
+        // the position that was asked for.
+        let hardware = is_hardware_frame(frame, hardware_format);
+
+        // When does this frame play?
+        //
+        // A hardware decoder hands back frames with no timestamp at all, and the
+        // answer used to be "one frame after the previous one" — counted from
+        // `last_pts`, which a seek seeds with the *target*. That invented a
+        // timeline of its own: after a seek to 8.9s in a 9s file the decoder
+        // starts at the keyframe (say 8.0s) and every frame it produces is
+        // labelled from 8.9s upward, so frames that really play at 8.0s are
+        // queued as 8.94s, 8.98s … 9.9s. Nothing in the queue is ever "due"
+        // again, the picture freezes on the last frame that was, and — because
+        // the demuxer is blocked handing out packets nobody consumes — the end
+        // of the file is never noticed, so the clock runs on and the position
+        // climbs past its own duration for as long as the user lets it.
+        //
+        // The packet knows where the frame is: it was demuxed, timestamped and
+        // sent for exactly this frame. So the decoder is asked first, the packet
+        // second, and only a stream that says nothing about its own timeline
+        // falls back to "one frame on", which is at least bounded by the frame
+        // itself rather than by where the user last clicked.
+        let pts = match frame.pts() {
+            Some(raw) => raw as f64 * time_base - start_offset,
+            None => packet_pts.unwrap_or(*last_pts + fallback_step),
+        };
+        let pts = if pts.is_finite() {
+            pts
+        } else {
+            *last_pts + fallback_step
+        };
+        log::debug!(
+            "video frame at {pts:.3}s (raw {:?}, packet {packet_pts:?}, time_base {time_base:.6}, \
+             offset {start_offset:.3}s)",
+            frame.pts()
+        );
+
+        let now = shared.clock.now();
+        let paused = !shared.state().is_playing();
+
+        // Frames from before the seek target belong to the keyframe we landed
+        // on, not to the position the user asked for. They are dropped here,
+        // before anything has been converted or copied.
+        if let Some(target) = *seek_target {
+            if pts + 0.02 < target {
+                log::debug!("video frame at {pts:.3}s dropped: before the seek target {target:.3}s");
+                continue;
+            }
+        }
+
+        // The presentation queue is read in order and the interface relies on
+        // timestamps that never go backwards, so a frame is stamped with the
+        // last time handed over when a stream's own timestamps disagree.
+        let pts = pts.max(*last_pts);
+        *last_pts = pts;
+
+        // If the decoder has fallen behind, drop rather than fall further
+        // behind — but never while paused, where every frame is precious. Both
+        // drops come before the copy below: a frame that is thrown away has no
+        // business being taken out of the GPU first.
+        if !paused && pts < now - 0.25 && !shared.video_queue.lock().is_empty() {
+            shared.dropped_frames.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+
+        let source: &ffmpeg::frame::Video = if hardware {
             match download_frame(frame, hw_scratch) {
                 Ok(()) => hw_scratch,
                 Err(err) => {
@@ -1000,36 +1086,6 @@ fn drain_video(
         } else {
             frame
         };
-
-        let pts = match source.pts() {
-            Some(raw) => raw as f64 * time_base - start_offset,
-            None => *last_pts + fallback_step,
-        };
-        let pts = if pts.is_finite() { pts } else { *last_pts + fallback_step };
-        *last_pts = pts;
-        log::debug!(
-            "video frame at {pts:.3}s (raw {:?}, time_base {time_base:.6}, offset {start_offset:.3}s)",
-            source.pts()
-        );
-
-        let now = shared.clock.now();
-        let paused = !shared.state().is_playing();
-
-        // Frames from before the seek target belong to the keyframe we landed
-        // on, not to the position the user asked for.
-        if let Some(target) = *seek_target {
-            if pts + 0.02 < target {
-                log::debug!("video frame at {pts:.3}s dropped: before the seek target {target:.3}s");
-                continue;
-            }
-        }
-
-        // If the decoder has fallen behind, drop rather than fall further
-        // behind — but never while paused, where every frame is precious.
-        if !paused && pts < now - 0.25 && !shared.video_queue.lock().is_empty() {
-            shared.dropped_frames.fetch_add(1, Ordering::Relaxed);
-            continue;
-        }
 
         let target = *shared.target_size.lock();
         let (width, height) = match target {
@@ -1416,7 +1472,13 @@ fn run_audio_decoder(
 
         match msg {
             AudioMsg::Stop => break,
-            AudioMsg::Eof => {
+            AudioMsg::Eof { generation: ended } => {
+                // Same guard as the video worker's: see [`VideoMsg::Eof`]. An
+                // audio decoder left drained answers every packet with
+                // `AVERROR_EOF`, which is silence for the rest of the file.
+                if ended != generation {
+                    continue;
+                }
                 let _ = decoder.send_eof();
                 drain_audio(
                     &shared,
