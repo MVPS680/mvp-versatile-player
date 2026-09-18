@@ -131,6 +131,26 @@ pub enum EndAction {
     Hold,
 }
 
+impl EndAction {
+    /// The label shown for this action, in the menu and in the settings page.
+    pub fn label(self) -> &'static str {
+        match self {
+            EndAction::Playlist => "按播放列表继续",
+            EndAction::Hold => "停留在最后一帧",
+            EndAction::Close => "关闭播放器",
+        }
+    }
+
+    /// Every choice, in the order the interfaces offer them.
+    ///
+    /// One list rather than two copies: the tools menu used to spell the three
+    /// labels out again inside a submenu of its own, which is how the menu and the
+    /// settings page could quietly drift apart.
+    pub fn choices() -> [(EndAction, &'static str); 3] {
+        [EndAction::Playlist, EndAction::Hold, EndAction::Close].map(|action| (action, action.label()))
+    }
+}
+
 /// Everything the player remembers between runs.
 ///
 /// Keys that no longer exist are ignored rather than rejected, which is how a
@@ -606,6 +626,39 @@ impl SettingsStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The choices the menu and the settings page offer must be one list.
+    ///
+    /// Both used to spell the labels out themselves, which is how a setting ends
+    /// up described one way in the menu and another way in the settings window —
+    /// and how the menu came to hide them behind a submenu that never opened.
+    #[test]
+    fn the_end_action_choices_cover_every_variant() {
+        use std::collections::HashSet;
+
+        let choices = EndAction::choices();
+        assert_eq!(choices.len(), 3, "there are exactly three end actions");
+
+        let mut labels: HashSet<&str> = HashSet::new();
+        let mut actions: Vec<EndAction> = Vec::new();
+        for (action, label) in choices {
+            assert!(!label.trim().is_empty(), "{action:?} has no label");
+            assert!(labels.insert(label), "two choices share the label {label:?}");
+            assert!(!actions.contains(&action), "{action:?} is offered twice");
+            actions.push(action);
+        }
+        for action in [EndAction::Playlist, EndAction::Hold, EndAction::Close] {
+            assert!(actions.contains(&action), "{action:?} is missing");
+            assert_eq!(
+                Some(action.label()),
+                choices
+                    .iter()
+                    .find(|(candidate, _)| *candidate == action)
+                    .map(|(_, label)| *label),
+                "the label of {action:?} disagrees with the list"
+            );
+        }
+    }
 
     #[test]
     fn defaults_are_sane() {

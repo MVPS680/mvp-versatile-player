@@ -187,11 +187,7 @@ fn general_page(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
         tokens,
         "结束时",
         &mut app.settings.end_action,
-        &[
-            (EndAction::Playlist, "按播放列表继续"),
-            (EndAction::Hold, "停留在最后一帧"),
-            (EndAction::Close, "关闭播放器"),
-        ],
+        &EndAction::choices(),
     );
 
     widgets::section(ui, tokens, "操作");

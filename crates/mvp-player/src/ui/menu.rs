@@ -616,25 +616,32 @@ fn tools_menu(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
             app.ui.settings_tab = crate::state::SettingsTab::Integration;
         }
         separator(ui, tokens);
-        MenuButton::new("播放结束行为").ui(ui, |ui| {
-            for (action, label) in [
-                (EndAction::Playlist, "按播放列表继续"),
-                (EndAction::Hold, "停留在最后一帧"),
-                (EndAction::Close, "关闭播放器"),
-            ] {
-                if ui
-                    .selectable_label(
-                        app.settings.end_action == action,
-                        RichText::new(label).size(font::SMALL),
-                    )
-                    .clicked()
-                {
-                    app.settings.end_action = action;
-                    app.store.mark_dirty();
-                    ui.close();
-                }
+        // Three choices, drawn flat instead of behind a "播放结束行为" submenu: a
+        // nested `MenuButton` never opened here (egui identifies an open submenu by
+        // the auto id of its button, and the submenu closed again the moment it
+        // opened), so the setting could not be reached from the menu bar at all.
+        // Three items do not need a submenu, and the heading keeps them readable
+        // next to the items above.
+        ui.add_space(space::XS);
+        ui.label(
+            RichText::new("播放结束行为")
+                .size(font::TINY)
+                .color(tokens.text_muted),
+        );
+        for (action, label) in EndAction::choices() {
+            if ui
+                .selectable_label(
+                    app.settings.end_action == action,
+                    RichText::new(label).size(font::SMALL),
+                )
+                .clicked()
+            {
+                app.settings.end_action = action;
+                app.store.mark_dirty();
+                ui.close();
             }
-        });
+        }
+        ui.add_space(space::XS);
         if item(ui, tokens, "重置所有设置…", "", true) {
             app.settings = Settings::reset();
             // Replacing the document is only half of it: the values that reach
