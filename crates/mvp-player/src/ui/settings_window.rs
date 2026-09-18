@@ -894,4 +894,89 @@ mod tests {
             "the frame-step keys must be documented"
         );
     }
+
+    /// The page has to scroll inside the sheet instead of being cut off by it.
+    ///
+    /// The bug this guards: a `ScrollArea` inside an `egui::Window` whose height is
+    /// capped with `max_size` still believes it has the *screen's* height to play
+    /// with — the cap applies to the window's own rect, not to the content `Ui` —
+    /// so it lays the page out at its full height and never becomes scrollable.
+    /// The sheet then slices the page off at its bottom edge, and everything below
+    /// that line is unreachable: a page's action buttons, and any switch that
+    /// happens to sit near the edge.
+    ///
+    /// The layout below mirrors the real one in [`draw`] (tab rail, separator, the
+    /// same `ScrollArea` configuration); if that changes, this test has to change
+    /// with it.
+    #[test]
+    fn the_page_scrolls_instead_of_being_clipped_by_the_sheet() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        /// The height the settings window is allowed on a 780 pt screen.
+        const SHEET: f32 = 620.0;
+        /// A page taller than the sheet, which is the whole point.
+        const ROWS: usize = 40;
+
+        let ctx = egui::Context::default();
+        let viewport = Rc::new(Cell::new(0.0f32));
+        let content = Rc::new(Cell::new(0.0f32));
+
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(1280.0, 780.0),
+        ));
+
+        let _ = ctx.run(input, |ctx| {
+            egui::Window::new("设置")
+                .default_size([860.0, SHEET])
+                .max_size([860.0, SHEET])
+                .min_size([620.0, 440.0])
+                .show(ctx, |ui| {
+                    ui.horizontal_top(|ui| {
+                        ui.vertical(|ui| {
+                            ui.set_width(132.0);
+                            for _ in 0..7 {
+                                ui.allocate_exact_size(
+                                    egui::vec2(132.0, 34.0),
+                                    egui::Sense::click(),
+                                );
+                            }
+                        });
+                        ui.separator();
+                        let out = egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .scroll_source(egui::containers::scroll_area::ScrollSource {
+                                drag: false,
+                                ..Default::default()
+                            })
+                            .show(ui, |ui| {
+                                ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                                    ui.set_min_width(ui.available_width());
+                                    for _ in 0..ROWS {
+                                        ui.allocate_space(egui::vec2(ui.available_width(), 26.0));
+                                    }
+                                });
+                            });
+                        viewport.set(out.inner_rect.height());
+                        content.set(out.content_size.y);
+                    });
+                });
+        });
+
+        assert!(viewport.get() > 0.0, "the page must have been laid out");
+        assert!(
+            viewport.get() <= SHEET,
+            "the page viewport is {} pt tall inside a {SHEET} pt sheet: it was handed \
+             the screen's height, so it can never scroll and the sheet clips it",
+            viewport.get()
+        );
+        assert!(
+            content.get() > viewport.get(),
+            "the test page must overflow its viewport ({} vs {})",
+            content.get(),
+            viewport.get()
+        );
+    }
 }

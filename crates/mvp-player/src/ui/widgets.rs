@@ -103,6 +103,16 @@ pub fn row(
     let changed = ui
         .scope_builder(
             egui::UiBuilder::new()
+                // Sibling `Ui`s share one id unless they are given a salt — egui's
+                // own words, and the reason every switch on a page used to move
+                // together: `switch` keys its knob animation on `ui.id()`, so one
+                // shared id meant one shared animation, and toggling any switch
+                // dragged every other knob along with it (the value still flipped,
+                // which is why it read as "the switches are sticky" rather than as
+                // a switch that does nothing). The label is the salt because it is
+                // what identifies a row; it is mixed with the parent's id, so two
+                // pages can safely use the same label.
+                .id_salt(("mvp_settings_row", label))
                 .max_rect(control_rect)
                 .layout(Layout::right_to_left(Align::Center)),
             control,
@@ -1237,6 +1247,146 @@ mod tests {
         // Nonsense in, nothing out.
         assert_eq!(wheel_steps(10.0, 0.0), (0, 0.0));
         assert_eq!(wheel_steps(f32::NAN, 40.0), (0, 0.0));
+    }
+
+    /// Every row must hand its control a `Ui` with its own id.
+    ///
+    /// `switch` keys its knob animation on `ui.id()`, so two rows that came out of
+    /// [`row`] with the same id share one animation: the knob of a switch nobody
+    /// touched travels whenever another one is toggled, and the state a switch
+    /// shows is whatever the last animation left behind. A click still flips the
+    /// value, which is exactly why this reads as "the switches are sticky" rather
+    /// than as a switch that does nothing.
+    #[test]
+    fn every_row_gives_its_control_its_own_id() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let tokens = crate::theme::Theme::default().tokens;
+        let ctx = egui::Context::default();
+        let ids: Rc<RefCell<Vec<egui::Id>>> = Rc::new(RefCell::new(Vec::new()));
+        let sink = Rc::clone(&ids);
+        let mut first = false;
+        let mut second = false;
+
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::Area::new(egui::Id::new("mvp_row_id_test")).show(ctx, |ui| {
+                ui.set_max_width(700.0);
+                row(ui, &tokens, "第一个开关", "", 40.0, |ui| {
+                    sink.borrow_mut().push(ui.id());
+                    switch(ui, &tokens, &mut first).changed()
+                });
+                row(ui, &tokens, "第二个开关", "", 40.0, |ui| {
+                    sink.borrow_mut().push(ui.id());
+                    switch(ui, &tokens, &mut second).changed()
+                });
+            });
+        });
+
+        let ids = ids.borrow();
+        assert_eq!(ids.len(), 2, "both rows must have drawn a control");
+        assert_ne!(
+            ids[0], ids[1],
+            "two rows handed their controls the same id: their switch animations \
+             are one animation"
+        );
+    }
+
+    /// A click inside a row must reach the control drawn there.
+    ///
+    /// The same duplicate-id trap as above, one step further on: the auto-ids
+    /// egui hands to widgets *inside* a child `Ui` are derived from that `Ui`'s
+    /// id, so two rows whose control scopes shared one id also handed the same
+    /// ids to the widgets inside them. Widgets that share an id fight over the
+    /// pointer in egui — no hover highlight, no click — and a button or combo box
+    /// inside a settings row is exactly that case.
+    #[test]
+    fn a_click_inside_a_row_reaches_its_button() {
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+
+        const FRAMES: usize = 5;
+        let tokens = crate::theme::Theme::default().tokens;
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(720.0, 480.0));
+
+        let first_clicked = Rc::new(Cell::new(false));
+        let second_clicked = Rc::new(Cell::new(false));
+        let second_rect: Rc<RefCell<egui::Rect>> = Rc::new(RefCell::new(egui::Rect::NOTHING));
+        let facts: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+
+        // Two frames of warm-up: an `Area` is placed from the *previous* frame's
+        // size, so a rect measured on the first frame is not where the widget will
+        // be when the click arrives. Measure on frame 1 (stable), press on 2,
+        // release on 3, and let frame 4 report.
+        for frame in 0..FRAMES {
+            let point = second_rect.borrow().center();
+            let mut input = egui::RawInput::default();
+            input.screen_rect = Some(screen);
+            input.events = match frame {
+                0 | 1 => Vec::new(),
+                2 => vec![
+                    egui::Event::PointerMoved(point),
+                    egui::Event::PointerButton {
+                        pos: point,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Default::default(),
+                    },
+                ],
+                3 => vec![egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                }],
+                _ => Vec::new(),
+            };
+
+            let first = Rc::clone(&first_clicked);
+            let second = Rc::clone(&second_clicked);
+            let rect = Rc::clone(&second_rect);
+            let log = Rc::clone(&facts);
+            let _ = ctx.run(input, |ctx| {
+                egui::Area::new(egui::Id::new("mvp_row_click_test")).show(ctx, |ui| {
+                    ui.set_max_width(700.0);
+                    row(ui, &tokens, "第一个", "", 190.0, |ui| {
+                        if ui.button("first").clicked() {
+                            first.set(true);
+                        }
+                        false
+                    });
+                    row(ui, &tokens, "第二个", "", 190.0, |ui| {
+                        let response = ui.button("second");
+                        if frame == 1 {
+                            *rect.borrow_mut() = response.rect;
+                        }
+                        if response.clicked() {
+                            second.set(true);
+                        }
+                        log.borrow_mut().push(format!(
+                            "frame {frame}: button={:?} hovered={} down={} clicked={} interact_pos={:?}",
+                            response.rect,
+                            response.hovered(),
+                            response.is_pointer_button_down_on(),
+                            response.clicked(),
+                            ctx.input(|i| i.pointer.interact_pos()),
+                        ));
+                        false
+                    });
+                });
+            });
+        }
+
+        let facts = facts.borrow().join("\n");
+        assert!(
+            !first_clicked.get(),
+            "the click landed on the row above the one it was aimed at\n{facts}"
+        );
+        assert!(
+            second_clicked.get(),
+            "a visible button inside a row did not receive its click\n{facts}"
+        );
     }
 
     /// Every settings row must put its control at the same right-hand edge,

@@ -41,7 +41,15 @@ pub fn draw_overlay(app: &mut PlayerApp, ctx: &Context) {
     let margin = egui::Margin::symmetric(space::LG as i8, space::SM as i8);
     egui::Area::new(egui::Id::new("mvp_transport_overlay"))
         .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -24.0))
-        .order(egui::Order::Foreground)
+        // `Middle`, not `Foreground`. egui resolves a click layer by layer from
+        // the top, so a `Foreground` island wins every overlapping pixel against
+        // the settings window and the dialogs — which are plain `Window`s, and a
+        // `Window` lives in `Middle` (see egui's own note on `Window::order`, which
+        // suggests `Foreground` for *windows* that must stay on top, i.e. the
+        // opposite of what this used to do). The island has to be above the
+        // picture, which is in the `Background` layer, and below the windows; the
+        // toast keeps its `Foreground` painter, so it stays above both.
+        .order(egui::Order::Middle)
         .show(ctx, |ui| {
             surface::sheet_shell(&tokens, margin, OVERLAY_RADIUS).show(ui, |ui| {
                 ui.set_width(width);
