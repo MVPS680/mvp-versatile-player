@@ -1194,6 +1194,75 @@ pub fn scrim_alpha(fraction: f32) -> u8 {
     (MAX * t * t).round() as u8
 }
 
+/// A labelled row with a palette of preset colours and a custom swatch.
+///
+/// Subtitle text is read in a handful of colours — white, off-white, yellow,
+/// cyan — and egui's swatch on its own is a 20 pt square at the end of a row:
+/// it is neither visible as "the place to pick a colour" nor easy to hit, and a
+/// settings page that offers only that reads as having no palette at all. The
+/// presets put the colours people actually use one click away and keep the
+/// swatch for everything else.
+///
+/// Returns `true` when the colour changed, like every other row helper here.
+pub fn color_row(
+    ui: &mut Ui,
+    tokens: &Tokens,
+    label: &str,
+    hint: &str,
+    value: &mut [u8; 3],
+    presets: &[(&str, [u8; 3])],
+) -> bool {
+    /// Side of one preset chip. Large enough to hit without aiming, small enough
+    /// that nine of them still leave room for the swatch in the control column.
+    const CHIP: f32 = 20.0;
+    /// Space between two chips.
+    const CHIP_GAP: f32 = 4.0;
+    /// Room left for the custom swatch.
+    const CUSTOM: f32 = 40.0;
+
+    let width = presets.len() as f32 * (CHIP + CHIP_GAP) + CUSTOM;
+    row(ui, tokens, label, hint, width, |ui| {
+        let mut changed = false;
+        // `row` hands the control a right-to-left layout; a palette reads
+        // left-to-right, so it gets a child of its own.
+        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = CHIP_GAP;
+            for (name, rgb) in presets {
+                let colour = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+                let (rect, response) = ui.allocate_exact_size(Vec2::splat(CHIP), Sense::click());
+                ui.painter()
+                    .rect_filled(rect, CornerRadius::same(radius::SM as u8), colour);
+                if *value == *rgb {
+                    // The chosen chip is ringed rather than boxed: a stroke inside
+                    // the chip would eat into the colour it is showing.
+                    ui.painter().rect_stroke(
+                        rect.expand(2.0),
+                        CornerRadius::same(radius::SM as u8 + 2),
+                        Stroke::new(1.0_f32, tokens.focus_ring),
+                        StrokeKind::Outside,
+                    );
+                }
+                let response = response.on_hover_text(*name);
+                if response.clicked() {
+                    *value = *rgb;
+                    changed = true;
+                }
+                if response.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+            }
+
+            // Anything the presets do not cover, through egui's own picker.
+            let mut custom = *value;
+            if ui.color_edit_button_srgb(&mut custom).changed() {
+                *value = custom;
+                changed = true;
+            }
+        });
+        changed
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1386,6 +1455,84 @@ mod tests {
         assert!(
             second_clicked.get(),
             "a visible button inside a row did not receive its click\n{facts}"
+        );
+    }
+
+    /// A row control that opens a popup must be able to open it.
+    ///
+    /// The subtitle page's text colour is egui's `color_edit_button_srgb`, which
+    /// shows its picker in a `Popup` anchored to the swatch. If that popup never
+    /// opens, the setting offers no palette at all — which is exactly what a
+    /// control that cannot be clicked looks like from the outside.
+    #[test]
+    fn a_control_in_a_row_can_open_its_popup() {
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+
+        const FRAMES: usize = 6;
+        let tokens = crate::theme::Theme::default().tokens;
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(720.0, 480.0));
+
+        let clicked = Rc::new(Cell::new(false));
+        let swatch: Rc<RefCell<egui::Rect>> = Rc::new(RefCell::new(egui::Rect::NOTHING));
+        let popup_open = Rc::new(Cell::new(false));
+        let mut colour = [255u8, 255, 255];
+
+        for frame in 0..FRAMES {
+            let point = swatch.borrow().center();
+            let mut input = egui::RawInput::default();
+            input.screen_rect = Some(screen);
+            input.events = match frame {
+                0 | 1 => Vec::new(),
+                2 => vec![
+                    egui::Event::PointerMoved(point),
+                    egui::Event::PointerButton {
+                        pos: point,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Default::default(),
+                    },
+                ],
+                3 => vec![egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                }],
+                _ => Vec::new(),
+            };
+
+            let was_clicked = Rc::clone(&clicked);
+            let rect = Rc::clone(&swatch);
+            let open = Rc::clone(&popup_open);
+            let _ = ctx.run(input, |ctx| {
+                egui::Area::new(egui::Id::new("mvp_row_popup_test")).show(ctx, |ui| {
+                    ui.set_max_width(700.0);
+                    row(ui, &tokens, "文字颜色", "", 60.0, |ui| {
+                        let response = ui.color_edit_button_srgb(&mut colour);
+                        if frame == 1 {
+                            *rect.borrow_mut() = response.rect;
+                        }
+                        if response.clicked() {
+                            was_clicked.set(true);
+                        }
+                        false
+                    });
+                });
+                if egui::Popup::is_any_open(ctx) {
+                    open.set(true);
+                }
+            });
+        }
+
+        assert!(
+            clicked.get(),
+            "the colour swatch inside a row did not receive its click"
+        );
+        assert!(
+            popup_open.get(),
+            "clicking the swatch opened no popup: there is no palette to pick from"
         );
     }
 

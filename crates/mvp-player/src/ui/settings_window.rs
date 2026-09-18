@@ -496,15 +496,14 @@ fn subtitle_page(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
         "在高亮画面上更容易看清",
     );
 
-    changed |= widgets::row(ui, tokens, "文字颜色", "", 60.0, |ui| {
-        let mut color = app.settings.subtitle_color;
-        if ui.color_edit_button_srgb(&mut color).changed() {
-            app.settings.subtitle_color = color;
-            true
-        } else {
-            false
-        }
-    });
+    changed |= widgets::color_row(
+        ui,
+        tokens,
+        "文字颜色",
+        "点常用色块即可，最右侧的色块可自定义任意颜色",
+        &mut app.settings.subtitle_color,
+        SUBTITLE_COLOURS,
+    );
 
     let mut subtitle_delay = app.settings.subtitle_delay as f32;
     if widgets::slider_row(
@@ -867,6 +866,23 @@ fn about_page(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
     });
 }
 
+/// The colours subtitles are actually read in — white, off-white, yellow, cyan —
+/// plus the outlined black that every player offers. The chip the user picks is
+/// copied straight into `subtitle_color`, so a value that is not in this list
+/// (set by hand in `settings.json`, or through the custom swatch) still shows and
+/// still round-trips.
+pub const SUBTITLE_COLOURS: &[(&str, [u8; 3])] = &[
+    ("白色", [255, 255, 255]),
+    ("奶白", [255, 246, 214]),
+    ("黄色", [255, 214, 10]),
+    ("橙色", [255, 170, 90]),
+    ("青色", [128, 235, 235]),
+    ("绿色", [140, 235, 140]),
+    ("粉色", [255, 150, 190]),
+    ("灰色", [190, 190, 190]),
+    ("黑色", [12, 12, 12]),
+];
+
 #[cfg(test)]
 mod tests {
     use super::SHORTCUTS;
@@ -893,6 +909,33 @@ mod tests {
             SHORTCUTS.iter().any(|(key, _)| key.contains(',')),
             "the frame-step keys must be documented"
         );
+    }
+
+    /// The subtitle palette has to be worth showing.
+    ///
+    /// Before it existed the page offered nothing but egui's custom swatch — a
+    /// 20 pt square with no colours to choose from — which is why the setting read
+    /// as having no palette at all. An empty or duplicated list would quietly put
+    /// the page back in that state.
+    #[test]
+    fn the_subtitle_palette_is_real() {
+        use std::collections::HashSet;
+
+        assert!(
+            super::SUBTITLE_COLOURS.len() >= 6,
+            "a palette needs a few colours to pick from"
+        );
+        assert!(
+            super::SUBTITLE_COLOURS
+                .iter()
+                .any(|(_, rgb)| *rgb == [255, 255, 255]),
+            "white has to be on the palette: it is the default subtitle colour"
+        );
+        let mut seen: HashSet<[u8; 3]> = HashSet::new();
+        for (name, rgb) in super::SUBTITLE_COLOURS {
+            assert!(!name.trim().is_empty(), "a chip has no name: {rgb:?}");
+            assert!(seen.insert(*rgb), "duplicated colour on the palette: {name}");
+        }
     }
 
     /// The page has to scroll inside the sheet instead of being cut off by it.
