@@ -659,13 +659,12 @@ pub fn slider_row(
                 );
             },
         );
-        // The slider takes whatever the row actually granted this column. A row
-        // gives its control at most 60 % of the page, so a fixed 168 pt slider
-        // overflows a narrow column and is clipped — and a clipped slider can only
-        // be dragged inside the part that is visible, which reads as one that will
-        // not move at all.
-        let granted = ui.available_width();
-        let width = (granted - READOUT - space::SM).clamp(SLIDER_MIN, SLIDER_MAX);
+        // The slider takes whatever the row actually granted this column, *after*
+        // the readout has been placed — `available_width` already excludes it, so
+        // subtracting `READOUT` a second time (which this used to do) left every
+        // slider about a third shorter than the column allows. A short slider is a
+        // small target, and a small target is one users report as not responding.
+        let width = ui.available_width().clamp(SLIDER_MIN, SLIDER_MAX);
         match slider(ui, tokens, label, *value, range, width) {
             Some(new) => {
                 *value = new;
@@ -1640,20 +1639,89 @@ mod tests {
         }
     }
 
-    /// A `MenuButton` nested inside another menu must open its submenu.
+    /// A slider in a row must move when it is clicked.
     ///
-    /// The end-of-playback action used to be one of these, and this is the test
-    /// that showed it opening for a single frame and closing again — which is why
-    /// that setting now sits flat in the tools menu instead. The pattern is still
-    /// used elsewhere ("最近打开", "播放速度"), so the reproduction is kept, not
-    /// deleted.
+    /// The subtitle delay is a `slider_row` over a range that straddles zero
+    /// (-10 s..+10 s), and the audio delay has the same shape: a slider that
+    /// ignores clicks leaves both settings impossible to change. The candidates
+    /// sweep the control column and the row line, because where a row lands inside
+    /// an `Area` is not something a test should have to guess.
+    #[test]
+    fn a_slider_in_a_row_answers_a_click() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let tokens = crate::theme::Theme::default().tokens;
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(720.0, 480.0));
+        let mut value = 0.0f32;
+        let moved = Rc::new(Cell::new(false));
+
+        'attempts: for row_line in [16.0f32, 54.0] {
+            for step in 0..9 {
+                let point = egui::pos2(500.0 + step as f32 * 20.0, row_line + 13.0);
+                for frame in 0..4 {
+                    let mut input = egui::RawInput::default();
+                    input.screen_rect = Some(screen);
+                    input.events = match frame {
+                        1 => vec![
+                            egui::Event::PointerMoved(point),
+                            egui::Event::PointerButton {
+                                pos: point,
+                                button: egui::PointerButton::Primary,
+                                pressed: true,
+                                modifiers: Default::default(),
+                            },
+                        ],
+                        2 => vec![egui::Event::PointerButton {
+                            pos: point,
+                            button: egui::PointerButton::Primary,
+                            pressed: false,
+                            modifiers: Default::default(),
+                        }],
+                        _ => Vec::new(),
+                    };
+
+                    let moved_now = Rc::clone(&moved);
+                    let _ = ctx.run(input, |ctx| {
+                        egui::Area::new(egui::Id::new("mvp_slider_row_test")).show(ctx, |ui| {
+                            ui.set_max_width(700.0);
+                            if slider_row(
+                                ui,
+                                &tokens,
+                                "字幕延迟",
+                                &mut value,
+                                -10.0..=10.0,
+                                |v| format!("{v:+.2} 秒"),
+                            ) {
+                                moved_now.set(true);
+                            }
+                        });
+                    });
+                }
+                if moved.get() {
+                    break 'attempts;
+                }
+            }
+        }
+
+        assert!(
+            moved.get(),
+            "clicking the subtitle-delay slider never moved it (value ended at {value:.2})"
+        );
+    }
+
+    /// A `SubMenuButton` nested inside another menu must open, and stay open.
     ///
-    /// Ignored because this harness could not be trusted here: two tests in this
-    /// module failed for nothing but mis-measured synthetic input before, and a
-    /// menu's state machine is far more sensitive to that than a button's. It is
-    /// kept as the reproduction to work from — run it with `--ignored` and a
-    /// human at the real window to decide what the menu actually does.
-    #[ignore = "headless menu input is not trustworthy yet; reproduce in the real window"]
+    /// The end-of-playback action was one of these, and the raw reproduction is the
+    /// reason the whole menu bar was faulty: a nested entry written with
+    /// `MenuButton` (which is for the *bar* titles) does not take part in egui's
+    /// submenu protocol — it opens a plain popup with the enclosing menu's
+    /// close-on-click behaviour, so the menu shut on the same frame the submenu
+    /// appeared. `SubMenuButton` is the API that tracks `MenuState::open_item` and
+    /// opens on hover. The test drives the hover path and holds it, because a
+    /// submenu that only opens on hover, or one that closes the moment the pointer
+    /// settles, both have to be told apart from one that works.
     #[test]
     fn a_nested_menu_button_opens_its_submenu() {
         use std::cell::{Cell, RefCell};
@@ -1669,9 +1737,7 @@ mod tests {
         let chosen = Rc::new(Cell::new(false));
 
         // 0-1: draw and measure. 2-3: click the tools menu. 4-9: point at the
-        // submenu entry and hold there. A submenu that only opens on hover, or one
-        // that closes the moment the pointer settles, both have to be told apart
-        // from one that works.
+        // submenu entry and hold there.
         for frame in 0..FRAMES {
             let point = if frame <= 3 {
                 outer_rect.borrow().center()
@@ -1709,13 +1775,14 @@ mod tests {
                 egui::TopBottomPanel::top("mvp_menu_test").show(ctx, |ui| {
                     egui::containers::menu::MenuBar::new().ui(ui, |ui| {
                         let (tools, _) = egui::containers::menu::MenuButton::new("工具").ui(ui, |ui| {
-                            let (entry, _) = egui::containers::menu::MenuButton::new("播放结束行为")
-                                .ui(ui, |ui| {
-                                    frames.borrow_mut().push(frame);
-                                    if ui.button("按播放列表继续").clicked() {
-                                        picked.set(true);
-                                    }
-                                });
+                            let (entry, _) =
+                                egui::containers::menu::SubMenuButton::new("播放结束行为")
+                                    .ui(ui, |ui| {
+                                        frames.borrow_mut().push(frame);
+                                        if ui.button("按播放列表继续").clicked() {
+                                            picked.set(true);
+                                        }
+                                    });
                             *sub.borrow_mut() = entry.rect;
                         });
                         *outer.borrow_mut() = tools.rect;
@@ -1727,7 +1794,7 @@ mod tests {
         let drawn = submenu_frames.borrow().clone();
         assert!(
             !drawn.is_empty(),
-            "the submenu was never drawn: clicking 播放结束行为 opened nothing"
+            "the submenu was never drawn: pointing at 播放结束行为 opened nothing"
         );
         assert!(
             drawn.iter().any(|f| *f >= 7),
