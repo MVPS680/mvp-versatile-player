@@ -39,6 +39,59 @@ if ($Destination) { $MvpFfmpegRoot = $Destination }
 if ($Version) { $MvpFfmpegVersion = $Version }
 
 # ---------------------------------------------------------------------------
+# Downloading
+# ---------------------------------------------------------------------------
+# `curl.exe` ships with Windows, but it validates the chain through schannel and
+# treats `CERT_TRUST_REVOCATION_STATUS_UNKNOWN` as a hard failure — which is what
+# happens on any network that cannot reach the CA's CRL/OCSP endpoints. The
+# framework's own HTTP stack does not perform that check by default, so the
+# archive is fetched with `Invoke-WebRequest` instead.
+function Save-MvpUrl {
+    param(
+        [Parameter(Mandatory)][string] $Url,
+        [Parameter(Mandatory)][string] $OutFile,
+        [int] $Attempts = 3
+    )
+
+    # An older .NET lets Windows PowerShell 5.1 offer TLS 1.0 to GitHub's CDN,
+    # which the CDN refuses. Only a legacy set is widened — `SystemDefault` (0)
+    # is left alone, because overwriting it would pin the handshake to 1.2 and
+    # give up the OS defaults. PowerShell 7 needs none of this.
+    if ($PSVersionTable.PSVersion.Major -lt 6) {
+        $current = [Net.ServicePointManager]::SecurityProtocol
+        if ($current -ne [Net.SecurityProtocolType]::SystemDefault -and
+            ($current -band [Net.SecurityProtocolType]::Tls12) -eq 0) {
+            [Net.ServicePointManager]::SecurityProtocol = $current -bor [Net.SecurityProtocolType]::Tls12
+        }
+    }
+
+    # The progress bar is what makes `Invoke-WebRequest` slow on a gigabyte —
+    # 5.1 repaints the console for every chunk — so it is silenced for the
+    # transfer and restored afterwards.
+    $progress = $ProgressPreference
+    $ProgressPreference = 'SilentlyContinue'
+    try {
+        for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+            try {
+                # `-UseBasicParsing` skips the Internet Explorer HTML parser,
+                # which a binary download never needs and 5.1 would otherwise
+                # invoke.
+                Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing
+                return
+            } catch {
+                # A half-written archive must not be mistaken for a finished
+                # download by the `Test-Path` above.
+                Remove-Item -Path $OutFile -Force -ErrorAction SilentlyContinue
+                if ($attempt -eq $Attempts) { throw }
+                Write-Host ("下载失败（第 {0}/{1} 次），重试…：{2}" -f $attempt, $Attempts, $_.Exception.Message) -ForegroundColor Yellow
+            }
+        }
+    } finally {
+        $ProgressPreference = $progress
+    }
+}
+
+# ---------------------------------------------------------------------------
 # FFmpeg
 # ---------------------------------------------------------------------------
 # A named kit, or anything already unpacked, beats downloading: the archive is
@@ -76,8 +129,7 @@ if (-not $root) {
     if (-not (Test-Path $zip)) {
         Write-Host "下载 FFmpeg $MvpFfmpegVersion 开发包（约 1 GB）…" -ForegroundColor Cyan
         Write-Host "  $url"
-        & curl.exe -L --retry 3 --retry-delay 2 -o $zip $url
-        if ($LASTEXITCODE -ne 0) { throw "下载失败" }
+        Save-MvpUrl -Url $url -OutFile $zip
     } else {
         Write-Host "已存在 $zip，跳过下载" -ForegroundColor DarkGray
     }

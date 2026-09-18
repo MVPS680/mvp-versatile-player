@@ -424,6 +424,7 @@ $env:RUST_LOG = "mvp_core=debug"   # 需要看内部细节时
 ## 许可证
 
 本项目以 **GPL-3.0-or-later** 发布，完整许可证文本见 [`LICENSE`](LICENSE)。
+解释权归mvpclub.cc所有。
 
 内置的 FFmpeg 为 **GPL 构建**（含 `libx264`、`libx265`、`libaom` 等），
 因此发行二进制必须整体遵循 GPL。若要改为 LGPL，需要换用 LGPL 版 FFmpeg
