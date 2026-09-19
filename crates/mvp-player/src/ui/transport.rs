@@ -309,19 +309,14 @@ fn audio_button_row(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
 }
 
 /// The speed picker, shared by the audio row and the video row.
+///
+/// The button carries its own label — the speed in `1.00x` form — and nothing
+/// else. A speedometer glyph used to be drawn just before it, on a rectangle
+/// that took no clicks of its own (`Sense::hover`): it was pure decoration on a
+/// control that already says what it is, so it is gone rather than bound to the
+/// menu. Every icon left on the bar is a button.
 fn speed_menu(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
     let speed_text = format!("{:.2}x", app.settings.speed);
-    let (speed_icon, _) = ui.allocate_exact_size(egui::vec2(18.0, 20.0), egui::Sense::hover());
-    crate::icons::draw(
-        ui.painter(),
-        speed_icon.shrink(2.0),
-        Icon::Speed,
-        if (app.settings.speed - 1.0).abs() > 1e-3 {
-            tokens.accent
-        } else {
-            tokens.text_weak
-        },
-    );
     MenuButton::new(
         RichText::new(speed_text.as_str())
             .size(font::SMALL)
@@ -360,7 +355,7 @@ fn speed_menu(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
 /// every file change — so a change here is stored and takes effect on the next
 /// start. The menu says so rather than pretending otherwise.
 fn device_menu(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
-    widgets::icon_menu(ui, tokens, Icon::Device, "输出", |ui| {
+    MenuButton::new(RichText::new("输出").size(font::SMALL)).ui(ui, |ui| {
         ui.set_min_width(240.0);
         let devices = mvp_core::audio::output_device_names();
         let default_name = mvp_core::audio::default_output_device_name()
@@ -827,15 +822,21 @@ fn video_button_row(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
             // The sidebar's track page does the same thing, but reaching it
             // means leaving the picture; these menus are for the one thing a
             // viewer actually changes mid-film.
+            //
+            // This one and 「画面」 below are plain menu buttons: the glyph that
+            // used to precede each of them sat in a rectangle of its own that
+            // took no clicks — the menu only ever opened from the text — so the
+            // pair read as a picture of a button beside a button. The label is
+            // the control, and the picture is gone rather than made clickable.
             if budget.tracks {
-                widgets::icon_menu(ui, tokens, Icon::Subtitles, "轨道", |ui| {
+                MenuButton::new(RichText::new("轨道").size(font::SMALL)).ui(ui, |ui| {
                     track_menu(app, ui);
                 });
             }
 
             // ---- fit / rotate / mirror ---------------------------------------
             if budget.pan_scan {
-                widgets::icon_menu(ui, tokens, Icon::FitToWindow, "画面", |ui| {
+                MenuButton::new(RichText::new("画面").size(font::SMALL)).ui(ui, |ui| {
                     pan_scan_menu(app, ui);
                 });
             }

@@ -24,6 +24,29 @@ use mvp_subtitle::model::{Cue, SubFormat, Subtitle};
 
 /// Video packets may queue this deep before the demuxer is throttled.
 const VIDEO_PACKET_QUEUE: usize = 48;
+
+/// Decoded frames waiting to be colour-converted.
+///
+/// The decoder and the converter are separate stages precisely so that neither
+/// waits for the other: the GPU keeps decoding while the CPU downloads and
+/// converts the previous frame. This is the buffer between them, and it only has
+/// to be deep enough to bridge one stage's jitter — two frames each way.
+const VIDEO_SOURCE_QUEUE: usize = 4;
+
+/// One decoded frame on its way from the decoder to the colour converter.
+///
+/// The pixel buffers are reference-counted by `av_frame_ref`, so moving a frame
+/// across the stage boundary is a pointer move rather than a copy. Hardware
+/// frames are downloaded on the decode thread (they are bound to the device
+/// that produced them) and arrive here already in system memory.
+struct SourceFrame {
+    /// The decoded frame, owned through its refcount.
+    frame: ffmpeg::frame::Video,
+    /// Presentation timestamp in seconds.
+    pts: f64,
+    /// Decode session this frame belongs to.
+    generation: u64,
+}
 /// Audio packets may queue this deep before the demuxer is throttled.
 const AUDIO_PACKET_QUEUE: usize = 192;
 /// How often the demuxer re-checks control state while blocked.
@@ -892,13 +915,10 @@ fn run_video_decoder(
         }
     };
 
-    let mut converter = RgbaConverter::new();
     let mut frame = ffmpeg::frame::Video::empty();
-    let mut hw_scratch = ffmpeg::frame::Video::empty();
     let mut generation = shared.generation.load(Ordering::SeqCst);
     let mut seek_target: Option<f64> = None;
     let mut last_pts = 0.0f64;
-    let mut serial = 0u64;
     // A stream that keeps feeding the decoder without ever producing a frame is
     // not playing, it is spinning. A mis-detected container does exactly that —
     // a disc image handed to the MPEG demuxer, say — and it does it forever
@@ -916,6 +936,20 @@ fn run_video_decoder(
         .unwrap_or(25.0);
     let fallback_step = 1.0 / nominal_fps;
     let _ = config;
+
+    // ---- the conversion stage ---------------------------------------------
+    // Decoding and colour conversion used to run one after the other on this
+    // same thread, which meant the decoder sat idle — and a hardware decoder
+    // drained its frame pool — for the whole 20–40 ms a 4K frame spends being
+    // downloaded and converted. Handing the frame over instead lets the two
+    // overlap: output is bounded by the slower stage rather than by their sum.
+    let (source_tx, source_rx) = bounded::<SourceFrame>(VIDEO_SOURCE_QUEUE);
+    {
+        let converter_shared = Arc::clone(&shared);
+        spawn_worker(&shared, "mvp-convert", move |_| {
+            run_video_converter(converter_shared, source_rx, fallback_step);
+        });
+    }
 
     loop {
         // Shutting down: whatever is in the channel belongs to a playback session
@@ -1005,11 +1039,8 @@ fn run_video_decoder(
                 drain_video(
                     &shared,
                     &mut decoder,
-                    &mut converter,
                     &mut frame,
-                    &mut hw_scratch,
                     &mut last_pts,
-                    &mut serial,
                     fallback_step,
                     None,
                     generation,
@@ -1017,6 +1048,7 @@ fn run_video_decoder(
                     hardware_format,
                     time_base,
                     start_offset,
+                    &source_tx,
                 );
             }
             VideoMsg::Packet(msg) => {
@@ -1038,11 +1070,8 @@ fn run_video_decoder(
                 drain_video(
                     &shared,
                     &mut decoder,
-                    &mut converter,
                     &mut frame,
-                    &mut hw_scratch,
                     &mut last_pts,
-                    &mut serial,
                     fallback_step,
                     msg.timestamp,
                     generation,
@@ -1050,6 +1079,7 @@ fn run_video_decoder(
                     hardware_format,
                     time_base,
                     start_offset,
+                    &source_tx,
                 );
             }
         }
@@ -1103,11 +1133,8 @@ fn reset_video_session(
 fn drain_video(
     shared: &Arc<Shared>,
     decoder: &mut ffmpeg::decoder::Video,
-    converter: &mut RgbaConverter,
     frame: &mut ffmpeg::frame::Video,
-    hw_scratch: &mut ffmpeg::frame::Video,
     last_pts: &mut f64,
-    serial: &mut u64,
     fallback_step: f64,
     packet_pts: Option<f64>,
     generation: u64,
@@ -1115,6 +1142,7 @@ fn drain_video(
     hardware_format: Option<ffmpeg::ffi::AVPixelFormat>,
     time_base: f64,
     start_offset: f64,
+    source_tx: &Sender<SourceFrame>,
 ) {
     while decoder.receive_frame(frame).is_ok() {
         // A pending seek invalidates everything still in the pipeline; bail out
@@ -1199,38 +1227,115 @@ fn drain_video(
             continue;
         }
 
-        let source: &ffmpeg::frame::Video = if hardware {
+        // ---- hand the frame to the conversion stage -------------------------
+        //
+        // A hardware frame is pulled into system memory here, on the thread
+        // bound to the device that produced it; a software frame is merely
+        // reference-counted, which costs nothing and keeps the decoder's buffer
+        // alive until the converter is done with it.
+        let mut owned = ffmpeg::frame::Video::empty();
+        if hardware {
             let started = Instant::now();
-            let copied = download_frame(frame, hw_scratch);
+            if let Err(err) = download_frame(frame, &mut owned) {
+                log::warn!("{err}");
+                continue;
+            }
             shared
                 .perf
                 .download_ms
                 .record(started.elapsed().as_secs_f32() * 1000.0);
-            match copied {
-                Ok(()) => hw_scratch,
-                Err(err) => {
-                    log::warn!("{err}");
-                    continue;
+        } else {
+            // SAFETY: `owned` is a fresh, empty AVFrame and `frame` is a live
+            // decoded frame; `av_frame_ref` takes its own references to the
+            // latter's buffers and copies its properties, so the two are fully
+            // independent afterwards.
+            unsafe {
+                ffmpeg::ffi::av_frame_ref(owned.as_mut_ptr(), frame.as_ptr());
+            }
+        }
+
+        if !send_source(source_tx, SourceFrame { frame: owned, pts, generation }, shared) {
+            return;
+        }
+    }
+}
+
+/// Send a decoded frame to the conversion stage, waiting for room but never
+/// forever.
+///
+/// A blocked send here is normal back-pressure: the decoder is faster than the
+/// converter. It has to react to a stop and to a seek all the same, or a flush
+/// would wait behind the very frames it is meant to abandon.
+fn send_source(tx: &Sender<SourceFrame>, mut msg: SourceFrame, shared: &Shared) -> bool {
+    loop {
+        match tx.send_timeout(msg, WORKER_POLL) {
+            Ok(()) => return true,
+            Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => return false,
+            Err(crossbeam_channel::SendTimeoutError::Timeout(returned)) => {
+                msg = returned;
+                if shared.abort.load(Ordering::Relaxed) || shared.video_flush_pending() {
+                    return false;
                 }
             }
-        } else {
-            frame
-        };
+        }
+    }
+}
 
+/// The colour-conversion stage: turn decoded frames into the RGBA buffers the
+/// interface uploads.
+///
+/// This is the half of the old `drain_video` that is pure CPU work, on a thread
+/// of its own so that a 15–40 ms conversion at 4K no longer stops the decoder
+/// from producing — and a hardware decoder from draining — the next frame. It
+/// owns the presentation concerns: the lead gate and the push into the queue,
+/// while the decode thread owns the codec.
+fn run_video_converter(shared: Arc<Shared>, rx: Receiver<SourceFrame>, fallback_step: f64) {
+    let mut converter = RgbaConverter::new();
+    let mut serial = 0u64;
+
+    loop {
+        if shared.abort.load(Ordering::Relaxed) {
+            break;
+        }
+        let source = match rx.recv_timeout(WORKER_POLL) {
+            Ok(source) => source,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        };
+        if shared.abort.load(Ordering::Relaxed) {
+            break;
+        }
+        // A frame from a session a seek has already left behind will never be
+        // shown. Dropping it here is what keeps a seek from paying to convert
+        // the frames the decoder had queued up before it.
+        if source.generation != shared.generation.load(Ordering::SeqCst) {
+            continue;
+        }
+        // The decoder may have been ahead when it handed this over; by now the
+        // playhead can have passed it. Same rule as the decode stage's, and for
+        // the same reason: a frame nobody will see must not be converted.
+        let now = shared.clock.now();
+        let playing = shared.state().is_playing();
+        if playing && source.pts < now - 0.25 && !shared.video_queue.lock().is_empty() {
+            shared.dropped_frames.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+
+        let src: &ffmpeg::frame::Video = &source.frame;
         let target = *shared.target_size.lock();
         let (width, height) = match target {
             Some((tw, th)) => crate::util::fit_inside(
-                (source.width(), source.height()),
+                (src.width(), src.height()),
                 crate::util::even((tw, th)),
             ),
-            None => (source.width(), source.height()),
+            None => (src.width(), src.height()),
         };
 
         // The preference can change while a file plays, so it is re-read for
         // every frame; the converter only rebuilds its tables when it flips.
         converter.set_tone_map(shared.hdr_tone_map.load(Ordering::Relaxed));
         let convert_started = Instant::now();
-        let data = match converter.convert(source, width, height, &shared.pool) {
+        let data = match converter.convert(src, width, height, &shared.pool) {
             Ok(data) => data,
             Err(err) => {
                 log::warn!("视频帧转换失败: {err}");
@@ -1243,22 +1348,22 @@ fn drain_video(
         // inside the conversion, so it cannot be timed from out here.
         shared.perf.tone_map_ms.record(converter.last_tone_map_ms());
 
-        *serial = serial.wrapping_add(1);
+        serial = serial.wrapping_add(1);
         let decoded = VideoFrame {
             width,
             height,
-            pts,
+            pts: source.pts,
             duration: fallback_step,
             data,
-            serial: *serial,
-            generation,
+            serial,
+            generation: source.generation,
         };
         shared.decoded_frames.fetch_add(1, Ordering::Relaxed);
 
         // ---- presentation-lead gate ----------------------------------------
         // The queue is a presentation buffer: the frame the interface needs
         // next is always its *oldest* one, so a full queue has to make the
-        // decoder wait, never drop. The decoder also stops running away from
+        // producer wait, never drop. The converter also stops running away from
         // the playhead: it may stay at most `VIDEO_LEAD` ahead, which keeps
         // seeks and rate changes responsive without ever making the picture
         // wait for a frame that has been thrown away.
@@ -1270,11 +1375,14 @@ fn drain_video(
         let wait_started = Instant::now();
         let mut queue = shared.video_queue.lock();
         loop {
-            if shared.video_flush_pending() || shared.abort.load(Ordering::Relaxed) {
-                return;
+            if shared.video_flush_pending()
+                || shared.abort.load(Ordering::Relaxed)
+                || source.generation != shared.generation.load(Ordering::SeqCst)
+            {
+                break;
             }
             // While paused the clock stands still, so only the queue's own
-            // capacity bounds the decoder — that is what lets frame stepping
+            // capacity bounds the producer — that is what lets frame stepping
             // walk forward.
             let playing = shared.state().is_playing();
             let now = shared.clock.now();
@@ -1316,6 +1424,7 @@ fn drain_video(
             .queue_wait_ms
             .record(wait_started.elapsed().as_secs_f32() * 1000.0);
     }
+    shared.pool.clear();
 }
 
 /// Hardware acceleration backends to try, best first.
@@ -1529,14 +1638,45 @@ fn open_video_decoder(
                     log::warn!("硬件解码器打开失败，回退到软件解码: {err}");
                     // Rebuild from the untouched parameters and open in software.
                     let context = ffmpeg::codec::context::Context::from_parameters(backup)?;
-                    return Ok((context.decoder().open_as(codec)?.video()?, None));
+                    let mut decoder = context.decoder();
+                    // SAFETY: the context is live and has not been opened.
+                    unsafe { enable_software_threads(decoder.as_mut_ptr()) };
+                    return Ok((decoder.open_as(codec)?.video()?, None));
                 }
             }
         }
         log::info!("此文件或显卡不支持硬件解码，使用软件解码");
     }
 
+    // SAFETY: the context is live and has not been opened.
+    unsafe { enable_software_threads(decoder.as_mut_ptr()) };
     Ok((decoder.open_as(codec)?.video()?, None))
+}
+
+/// Let a software decoder use several cores.
+///
+/// `avcodec_alloc_context3` leaves `thread_count` at **one**, which is the
+/// whole reason a 4K stream decodes at a quarter of the speed FFmpeg's own CLI
+/// manages: the CLI passes `-threads auto` and libavcodec then spreads HEVC
+/// frames over the machine, while a context built from a stream's parameters
+/// does not. `0` would mean "one per logical CPU", but the player is not the
+/// only thing running: the colour converter, the demuxer, the audio decoder and
+/// the interface all need a core too, and giving the decoder every one of them
+/// only makes it race the stage it is feeding. The cap is the same one the tone
+/// map uses (`available - 2`, at most 4).
+///
+/// It has to be set before `avcodec_open2`, which is why it happens here rather
+/// than after the decoder is handed back.
+fn enable_software_threads(ctx: *mut ffmpeg::ffi::AVCodecContext) {
+    let threads = std::thread::available_parallelism()
+        .map(|cores| cores.get().saturating_sub(2).clamp(1, 4))
+        .unwrap_or(1) as i32;
+    // SAFETY: `ctx` is an unopened AVCodecContext owned by the caller, and both
+    // fields are plain integers that `avcodec_open2` is documented to read.
+    unsafe {
+        (*ctx).thread_count = threads;
+        (*ctx).thread_type = ffmpeg::ffi::FF_THREAD_FRAME | ffmpeg::ffi::FF_THREAD_SLICE;
+    }
 }
 
 /// Resolve the FFmpeg decoder for a stream's codec id.

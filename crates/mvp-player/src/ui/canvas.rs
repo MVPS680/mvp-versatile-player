@@ -1,5 +1,6 @@
 //! The central canvas: video, still images, and the empty state.
 
+use egui::containers::menu::MenuButton;
 use egui::{Color32, Context, Rect, RichText, Sense, Stroke, Ui, Vec2};
 
 use crate::app::PlayerApp;
@@ -1070,7 +1071,10 @@ fn image_toolbar(app: &mut PlayerApp, ui: &mut Ui, area: &Rect, tokens: &Tokens)
         app.image.fit = mvp_core::FitMode::Fit;
         app.image.offset = (0.0, 0.0);
     }
-    widgets::icon_menu(ui, tokens, Icon::FitToWindow, "适应", |ui| {
+    // Text buttons, not icon-led ones: a glyph in front of a menu opens nothing
+    // when it is clicked (the menu belongs to the label next to it), and a
+    // picture of a button beside a button is worse than no picture at all.
+    MenuButton::new(RichText::new("适应").size(font::SMALL)).ui(ui, |ui| {
         ui.set_min_width(160.0);
         for (mode, label) in [
             (mvp_core::FitMode::Fit, "适应窗口"),
@@ -1119,7 +1123,7 @@ fn image_toolbar(app: &mut PlayerApp, ui: &mut Ui, area: &Rect, tokens: &Tokens)
     }
 
     // ---- background ------------------------------------------------------
-    widgets::icon_menu(ui, tokens, Icon::Palette, "背景", |ui| {
+    MenuButton::new(RichText::new("背景").size(font::SMALL)).ui(ui, |ui| {
         ui.set_min_width(140.0);
         for mode in ImageBackground::all() {
             if ui
@@ -1152,7 +1156,7 @@ fn image_toolbar(app: &mut PlayerApp, ui: &mut Ui, area: &Rect, tokens: &Tokens)
         let on = app.settings.slideshow_active;
         app.toast(Toast::info(if on { "幻灯片已开启" } else { "幻灯片已关闭" }));
     }
-    widgets::icon_menu(ui, tokens, Icon::Timer, "间隔", |ui| {
+    MenuButton::new(RichText::new("间隔").size(font::SMALL)).ui(ui, |ui| {
         ui.set_min_width(150.0);
         for seconds in [2.0f32, 3.0, 5.0, 8.0, 10.0, 15.0] {
             let selected = (app.settings.slideshow_interval - seconds).abs() < 0.1;

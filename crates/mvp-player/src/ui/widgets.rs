@@ -458,23 +458,6 @@ pub fn toggle_tool_button(
 }
 
 /// A labelled switch row for the settings window.
-/// A menu button preceded by an icon.
-///
-/// `egui`'s `MenuButton` takes text and nothing else, but the transport and the
-/// image toolbar are icon-led surfaces; this draws the glyph in the same slot a
-/// tool button would use and hands the menu itself to the caller.
-pub fn icon_menu(
-    ui: &mut Ui,
-    tokens: &Tokens,
-    icon: Icon,
-    text: &str,
-    add: impl FnOnce(&mut Ui),
-) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(16.0, 18.0), Sense::hover());
-    icons::draw(ui.painter(), rect.shrink(1.0), icon, tokens.text_weak);
-    egui::containers::menu::MenuButton::new(RichText::new(text).size(font::SMALL)).ui(ui, add);
-}
-
 pub fn switch_row(ui: &mut Ui, tokens: &Tokens, label: &str, value: &mut bool, hint: &str) -> bool {
     row(ui, tokens, label, hint, 40.0, |ui| {
         switch(ui, tokens, value).changed()

@@ -17,7 +17,7 @@ use crate::theme;
 const GRID: f32 = 24.0;
 
 /// `egui`'s painter has no arc primitive, so icons that need one (speakers,
-/// repeat arrows, the speedometer, the help mark) get it from this extension.
+/// repeat arrows, the help mark) get it from this extension.
 /// Implementing it as a trait keeps every call site reading like the primitive
 /// it stands in for.
 trait ArcExt {
@@ -121,8 +121,6 @@ pub enum Icon {
     Shuffle,
     /// Circular arrow, repeat one.
     RepeatOne,
-    /// Speedometer needle.
-    Speed,
     /// Speech bubble with "cc".
     Subtitles,
     /// Magnifier with a plus.
@@ -171,12 +169,6 @@ pub enum Icon {
     Lyrics,
     /// A small grid of squares, "thumbnail strip".
     Grid,
-    /// A painter's palette, "background".
-    Palette,
-    /// A stopwatch, "slideshow interval".
-    Timer,
-    /// A speaker with a cog, "output device".
-    Device,
 }
 
 /// Draw `icon` inside `rect` using `color`.
@@ -351,23 +343,6 @@ pub fn draw(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             c.line(painter, (9.0, 17.0), (15.0, 7.0), stroke);
             c.line(painter, (15.0, 7.0), (20.0, 7.0), stroke);
             c.poly(painter, &[(18.5, 4.5), (21.5, 7.0), (18.5, 9.5)], color);
-        }
-        Icon::Speed => {
-            // A dial with a needle, not a ruler with ticks.
-            //
-            // This was twenty-eight tick marks across half a circle and then seven,
-            // and neither worked: the glyph is drawn at about 14 pt, where a tick is
-            // under two points long, so however many of them there are the result is
-            // a smudge with a line through it. An arc, a needle and a hub are three
-            // shapes, and all three survive the size.
-            painter.arc(
-                c.p(12.0, 13.0),
-                c.s(8.0),
-                std::f32::consts::PI..std::f32::consts::TAU,
-                stroke,
-            );
-            c.line(painter, (12.0, 13.0), (17.2, 8.6), Stroke::new(w, color));
-            c.circle(painter, (12.0, 13.0), 1.7, color);
         }
         Icon::Subtitles => {
             let r = egui::Rect::from_min_max(c.p(3.0, 5.5), c.p(21.0, 18.5));
@@ -557,31 +532,6 @@ pub fn draw(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
                     painter.rect_filled(square, c.s(1.0), color);
                 }
             }
-        }
-        Icon::Palette => {
-            // A painter's palette: an open outline with three paint dots on it.
-            painter.circle_stroke(c.p(12.0, 12.0), c.s(8.0), stroke);
-            painter.circle_filled(c.p(15.5, 15.0), c.s(2.0), color);
-            for (x, y) in [(8.5f32, 9.0f32), (12.0, 7.2), (15.5, 9.0)] {
-                painter.circle_filled(c.p(x, y), c.s(1.5), color);
-            }
-        }
-        Icon::Timer => {
-            painter.circle_stroke(c.p(12.0, 13.0), c.s(7.0), stroke);
-            c.line(painter, (12.0, 13.0), (12.0, 8.5), stroke);
-            c.line(painter, (12.0, 13.0), (15.5, 13.0), thin);
-            c.line(painter, (9.5, 4.0), (14.5, 4.0), stroke);
-            c.line(painter, (12.0, 4.0), (12.0, 6.0), thin);
-        }
-        Icon::Device => {
-            c.poly(
-                painter,
-                &[(3.0, 9.5), (6.5, 9.5), (10.0, 6.0), (10.0, 18.0), (6.5, 14.5), (3.0, 14.5)],
-                color,
-            );
-            painter.arc(c.p(10.0, 12.0), c.s(4.0), -0.8..0.8, Stroke::new(w, color));
-            painter.circle_stroke(c.p(18.0, 15.0), c.s(3.2), thin);
-            painter.circle_filled(c.p(18.0, 15.0), c.s(1.2), color);
         }
     }
 }

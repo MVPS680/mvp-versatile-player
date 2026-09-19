@@ -27,8 +27,6 @@ const PLAY: f32 = 40.0;
 const VOLUME_SLIDER: f32 = 90.0;
 /// Width reserved for the "100%" readout.
 const VOLUME_PERCENT: f32 = 38.0;
-/// The speed icon shown before the speed menu.
-const SPEED_ICON: f32 = 18.0;
 /// Horizontal padding `egui` adds to a button, both sides together.
 const BUTTON_PADDING: f32 = 24.0;
 /// Space between the transport group and the volume group.
@@ -270,7 +268,9 @@ impl TransportBudget {
             left += VOLUME_PERCENT + GAP;
         }
         if self.speed {
-            left += SPEED_ICON + GAP + speed_label_width + BUTTON_PADDING + GAP;
+            // The button and its label only: the speed menu no longer carries a
+            // decorative glyph in front of it, so there is no icon width here.
+            left += speed_label_width + BUTTON_PADDING + GAP;
         }
 
         // Right group: fullscreen, settings and the sidebar toggle never leave.
