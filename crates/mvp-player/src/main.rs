@@ -18,8 +18,10 @@
 
 mod app;
 mod display;
+mod gl;
 mod icons;
 mod layout;
+mod picture;
 mod settings;
 mod state;
 mod theme;

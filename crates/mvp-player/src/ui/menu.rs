@@ -347,6 +347,15 @@ fn video_menu(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
                 }
             }
         });
+        // Video only, and gated on the video screen specifically rather than on
+        // `has_picture`: the adjustments are drawn by the video canvas, so an entry
+        // that opened the panel over a photograph would offer a panel that does
+        // nothing at all. The same predicate is used by the panel and by the
+        // renderer — see `PlayerApp::picture_applies`.
+        if item(ui, tokens, "画面调节…", "Ctrl+P", app.picture_applies()) {
+            app.ui.picture_panel_open = true;
+            ui.close();
+        }
         if item(ui, tokens, "顺时针旋转 90°", "R", active) {
             app.rotate_media();
         }

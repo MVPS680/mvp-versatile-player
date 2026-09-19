@@ -3,7 +3,10 @@
 use egui::containers::menu::MenuButton;
 use egui::{Color32, Context, Rect, RichText, Sense, Stroke, Ui, Vec2};
 
+use std::sync::Arc;
+
 use crate::app::PlayerApp;
+use crate::gl::picture_pass::{Adjusted, SnapshotJob};
 use crate::icons::{self, Icon};
 use crate::settings::{AspectMode, ImageBackground};
 use crate::state::{Overlay, Toast};
@@ -113,7 +116,19 @@ fn media_view(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
     // map travels the picture instead of dragging it.
     let map = minimap::target(app, area, picture);
     if let Some(sheet) = map {
-        minimap::draw(app, ui, area, picture, sheet, tokens);
+        // The same pass the picture is drawn with, so the miniature cannot disagree
+        // with it about colour any more than it disagrees about rotation. This is the
+        // video canvas, so it is the one place that asks for the adjustment channel at
+        // all — the image canvas below passes `None`.
+        minimap::draw(
+            app,
+            ui,
+            area,
+            picture,
+            sheet,
+            tokens,
+            app.picture_adjusted(),
+        );
     }
 
     // ---- interaction ----------------------------------------------------
@@ -183,18 +198,39 @@ fn video_view(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens, area: Rect) -> 
         }
     }
 
-    match &app.texture {
+    // The texture id is copied out before the match: a snapshot needs `app` mutably,
+    // and a `&TextureHandle` borrowed from `app.texture` would still be alive inside
+    // the arm.
+    match app.texture.as_ref().map(|texture| texture.id()) {
         Some(texture) => {
             let tint = Color32::WHITE;
+            // The adjusted path only exists when there is something to adjust: with the
+            // sliders neutral and the enhancement off, `picture_adjusted` is `None` and
+            // this is the same draw call the player has always made.
+            let adjusted = app.picture_adjusted();
+            // A snapshot that asked to include the adjustments is rendered once more
+            // here — the same quad, the same shader, the same numbers — into a
+            // framebuffer the pass owns, because those pixels otherwise exist only on
+            // the screen. See `PicturePass::render_offscreen`.
+            let snapshot = if adjusted.is_some() {
+                app.take_snapshot_render()
+            } else {
+                None
+            };
+            let offscreen = adjusted.clone().zip(snapshot);
             image_transformed(
                 ui.painter(),
-                texture.id(),
+                texture,
                 rect,
                 app.settings.rotation,
                 app.settings.flip_h,
                 app.settings.flip_v,
                 tint,
+                adjusted,
             );
+            if let Some((adjusted, job)) = offscreen {
+                render_snapshot(ui, rect, texture, adjusted, job);
+            }
         }
         None => {
             // A spinner rather than a static line of text: "preparing" is a state
@@ -527,10 +563,46 @@ fn destination_rect(area: Rect, source: (u32, u32), mode: AspectMode, rotation: 
     }
 }
 
+/// Render the frame once more into a framebuffer the picture pass owns, for a snapshot
+/// that asked to include the picture adjustments.
+///
+/// A paint callback rather than work done after the draw, because the adjusted pixels
+/// exist only inside this pass: the callback is where the GL context is and where the
+/// frame texture has already reached egui's texture map. Drawn at the frame's own
+/// resolution, so the file keeps the shape and the orientation it has always had.
+fn render_snapshot(
+    ui: &egui::Ui,
+    rect: Rect,
+    texture: egui::TextureId,
+    adjusted: Adjusted,
+    job: SnapshotJob,
+) {
+    let callback = eframe::egui_glow::CallbackFn::new(move |info, painter| {
+        adjusted.pass.render_offscreen(
+            painter,
+            texture,
+            adjusted.frame_size,
+            &adjusted.uniforms,
+            [info.screen_size_px[0] as i32, info.screen_size_px[1] as i32],
+            &job,
+        );
+    });
+    ui.painter().add(egui::PaintCallback {
+        rect,
+        callback: Arc::new(callback),
+    });
+}
+
 /// Draw a texture with arbitrary rotation and mirroring.
 ///
 /// `egui`'s `Painter::image` only accepts an axis-aligned rectangle plus a UV
 /// rectangle, which can mirror but not rotate; a four-vertex mesh does both.
+///
+/// `adjusted` is the picture adjustment pass, when the sliders are off their defaults:
+/// the geometry and the texture are the same either way, so the only difference is
+/// which program draws the quad. Rotation and mirroring are already in `uv` by the time
+/// the pass sees them, which is what keeps an adjusted picture in step with the
+/// subtitles, the bird's-eye map and the click coordinates.
 #[allow(clippy::too_many_arguments)]
 pub fn image_transformed(
     painter: &egui::Painter,
@@ -540,6 +612,7 @@ pub fn image_transformed(
     flip_h: bool,
     flip_v: bool,
     tint: Color32,
+    adjusted: Option<Adjusted>,
 ) {
     // UV corners in the order (top-left, top-right, bottom-right, bottom-left),
     // permuted according to the rotation so the image appears rotated.
@@ -584,6 +657,32 @@ pub fn image_transformed(
         rect.right_bottom(),
         rect.left_bottom(),
     ];
+
+    // The adjusted path: the same quad, the same UVs, drawn by the picture pass.
+    if let Some(adjusted) = adjusted {
+        let corners = [
+            [uv[0].x, uv[0].y],
+            [uv[1].x, uv[1].y],
+            [uv[2].x, uv[2].y],
+            [uv[3].x, uv[3].y],
+        ];
+        let callback = eframe::egui_glow::CallbackFn::new(move |info, painter| {
+            adjusted.pass.draw(
+                painter,
+                &info,
+                texture,
+                rect,
+                corners,
+                adjusted.frame_size,
+                &adjusted.uniforms,
+            );
+        });
+        painter.add(egui::PaintCallback {
+            rect,
+            callback: Arc::new(callback),
+        });
+        return;
+    }
 
     let mut mesh = egui::Mesh::with_texture(texture);
     for (position, uv) in positions.iter().zip(uv.iter()) {
@@ -1012,6 +1111,9 @@ fn image_view(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens, ctx: &Context) 
             app.image.flip_h,
             app.image.flip_v,
             Color32::WHITE,
+            // A photograph is not adjustable: the feature is for video, and a still
+            // keeps the colours its author gave it.
+            None,
         );
     }
 
@@ -1027,7 +1129,9 @@ fn image_view(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens, ctx: &Context) 
 
     // ---- bird's-eye view ------------------------------------------------
     if let Some(sheet) = map {
-        minimap::draw(app, ui, area, rect, sheet, tokens);
+        // `None`, like the picture above it: a photograph is not adjustable, and the
+        // map has to agree with the picture it is a map *of*.
+        minimap::draw(app, ui, area, rect, sheet, tokens, None);
     }
 
     image_toolbar(app, ui, &area, tokens);

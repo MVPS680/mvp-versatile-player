@@ -509,6 +509,12 @@ pub struct UiState {
 
     /// Currently open overlay.
     pub overlay: Overlay,
+    /// Whether the picture-adjustment panel is open.
+    ///
+    /// Not an overlay on purpose: the panel must not dim the picture it is used to
+    /// judge, nor take the keyboard away from playback. See
+    /// [`crate::ui::picture_panel`].
+    pub picture_panel_open: bool,
     /// Active settings page.
     pub settings_tab: SettingsTab,
     /// Settings page the other caches were filled for.
@@ -681,6 +687,7 @@ impl Default for UiState {
             subtitle_textures: Vec::new(),
             playlist_selection: None,
             overlay: Overlay::None,
+            picture_panel_open: false,
             settings_tab: SettingsTab::default(),
             cached_settings_tab: None,
             assoc_cache: None,

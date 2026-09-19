@@ -88,6 +88,14 @@ so callers need only depend on `mvp-core`.
   (`mvp-audio`) worker, each 1 MiB stack; plus cpal's realtime callback and
   scoped tone-map threads. **Subtitles have no worker** — they are decoded inline
   in the demuxer loop, despite what the diagram in `engine.rs` suggests.
+- **`mvp-player/src/gl/` is the only module that talks to the driver.** It holds the
+  picture-adjustment pass (`picture_pass.rs`); `picture.rs` decides *what* that pass is
+  told and touches no GL or egui at all, which is what makes the decisions testable
+  without a window. The adjustment channel exists for **video only**:
+  `PlayerApp::picture_applies` is the single predicate the menu, the shortcut, the panel,
+  the per-file key and the renderer all ask, and with the sliders neutral and the
+  enhancement off `picture::uniforms` returns `None`, so the pass is not in the pipeline
+  at all — that, rather than a small alpha, is what "off" means.
 - `mvp-player/src/app.rs` is the only place the engine, playlist, settings and
   UI state are allowed to talk to each other. `state.rs` is transient UI state
   (never persisted); `settings.rs` is the persisted document.
@@ -168,3 +176,12 @@ the screen — so a window covering the player is what gets saved. Check the
 picture, not the exit code. Prefer a test whenever the behaviour is testable;
 treat interactive captures as unreliable when a window or dialog moves by
 itself.
+
+Two more live there for the picture adjustments: `tmp/p1-picture-check.ps1`
+(captures the screen in five settings modes — `neutral` must come back
+pixel-identical to the untouched path) and `tmp/p1-snapshot-check.ps1` (measures
+the mean luma of the PNG a snapshot writes, `raw` versus `baked`). Both drive the
+window, so both must bring it to the foreground **and wait for a window bigger
+than 200x200**: winit keeps a 16x16 helper window around, and a harness that
+takes the first visible window of the process posts its keys into that one and
+then reports, very convincingly, that nothing works.

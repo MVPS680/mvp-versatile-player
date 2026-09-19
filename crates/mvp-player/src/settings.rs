@@ -163,6 +163,154 @@ impl EndAction {
     }
 }
 
+/// How the picture adjustments are remembered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum RememberScope {
+    /// One set of sliders for every file.
+    #[default]
+    Global,
+    /// A set per file, falling back to the globals for a file nobody has tuned.
+    PerFile,
+}
+
+/// The seven sliders of the picture adjustment panel.
+///
+/// Every field's default is the value that means "hands off", so the reset button is
+/// `*self = Self::default()` and a settings file written before this feature existed
+/// keeps showing the picture exactly as it did.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PictureSettings {
+    /// Overall lightness. `0.0` is untouched.
+    pub brightness: f32,
+    /// Distance from mid grey. `0.0` is untouched.
+    pub contrast: f32,
+    /// Colour strength. `0.0` is untouched.
+    pub saturation: f32,
+    /// Blue ↔ orange white balance. `0.0` is untouched.
+    pub temperature: f32,
+    /// Green ↔ magenta. `0.0` is untouched.
+    pub tint: f32,
+    /// Edge enhancement. `0.0` is off.
+    pub sharpness: f32,
+    /// Mid-tone curve. `1.0` is untouched.
+    pub gamma: f32,
+}
+
+impl Default for PictureSettings {
+    fn default() -> Self {
+        Self {
+            brightness: 0.0,
+            contrast: 0.0,
+            saturation: 0.0,
+            temperature: 0.0,
+            tint: 0.0,
+            sharpness: 0.0,
+            gamma: 1.0,
+        }
+    }
+}
+
+impl PictureSettings {
+    /// `true` when every slider is where it started.
+    ///
+    /// This is the zero-channel test: a neutral picture with the enhancement off
+    /// means the renderer takes the path it took before this feature existed, so
+    /// "turning it off changes nothing on screen" is a property of the code rather
+    /// than of the numbers happening to look alike.
+    pub fn is_neutral(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Put every slider back. This is the reset button, and nothing else.
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Pull every slider into the range the shader assumes.
+    ///
+    /// `settings.json` is a text file people edit by hand, and a wild value there
+    /// would reach the shader as a uniform: a `NaN` gamma is a black picture, and a
+    /// brightness of 1e9 is a white one.
+    pub fn clamp(&mut self) {
+        let unit = |v: f32| v.clamp(-1.0, 1.0);
+        self.brightness = unit(self.brightness);
+        self.contrast = unit(self.contrast);
+        self.saturation = unit(self.saturation);
+        self.temperature = unit(self.temperature);
+        self.tint = unit(self.tint);
+        self.sharpness = self.sharpness.clamp(0.0, 2.0);
+        self.gamma = self.gamma.clamp(0.5, 2.5);
+        if !self.gamma.is_finite() {
+            self.gamma = 1.0;
+        }
+    }
+
+    /// `true` when every field is a real number — the guard before anything reaches
+    /// a uniform.
+    pub fn is_finite(&self) -> bool {
+        [
+            self.brightness,
+            self.contrast,
+            self.saturation,
+            self.temperature,
+            self.tint,
+            self.sharpness,
+            self.gamma,
+        ]
+        .iter()
+        .all(|v| v.is_finite())
+    }
+}
+
+/// Real-time picture enhancement: one switch, one strength, and what it may do.
+///
+/// Off by default. A player that quietly changes the picture the first time it is
+/// started is a player whose output nobody can judge, and this is the feature whose
+/// whole job is to change the picture.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EnhanceSettings {
+    /// The master switch. Off means the enhancement is not applied at all.
+    pub enabled: bool,
+    /// How far each sub-effect is allowed to go, `0.0..=1.0`.
+    pub strength: f32,
+    /// Automatic black/white point and shadow lift, from the frame's own histogram.
+    pub auto_levels: bool,
+    /// Pull the colour up when the frame is undersaturated.
+    pub auto_colour: bool,
+    /// Edge-aware smoothing, `0.0..=1.0`. Light by design — see the module docs.
+    pub denoise: f32,
+    /// Block-edge smoothing, `0.0..=1.0`.
+    pub deblock: f32,
+    /// Adaptive sharpening of edges that survive the smoothing, `0.0..=1.0`.
+    pub sharpening: f32,
+}
+
+impl Default for EnhanceSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            strength: 0.6,
+            auto_levels: true,
+            auto_colour: true,
+            denoise: 0.0,
+            deblock: 0.0,
+            sharpening: 0.3,
+        }
+    }
+}
+
+impl EnhanceSettings {
+    /// Pull the strength sliders into range and drop the ones that are not numbers.
+    pub fn clamp(&mut self) {
+        self.strength = self.strength.clamp(0.0, 1.0);
+        self.denoise = self.denoise.clamp(0.0, 1.0);
+        self.deblock = self.deblock.clamp(0.0, 1.0);
+        self.sharpening = self.sharpening.clamp(0.0, 1.0);
+    }
+}
+
 /// What is painted behind a still image.
 ///
 /// A photograph that does not fill the window sits on *something*, and what that
@@ -270,6 +418,20 @@ pub struct Settings {
     /// Auto-hide the controls in fullscreen after this many seconds (0 = never).
     pub hide_controls_after: f32,
 
+    // ---- picture adjustment ---------------------------------------------
+    /// The picture adjustment sliders, as the global default.
+    pub picture: PictureSettings,
+    /// Whether those sliders are remembered globally or per file.
+    pub picture_scope: RememberScope,
+    /// Per-file overrides, most recently used first.
+    ///
+    /// Bounded on purpose and trimmed when written: a settings file that grows
+    /// without limit is one that eventually fails to load, which is the same
+    /// reasoning `recent_files` is capped with.
+    pub per_file_picture: Vec<(String, PictureSettings)>,
+    /// Real-time picture enhancement.
+    pub enhance: EnhanceSettings,
+
     // ---- subtitles -------------------------------------------------------
     /// Show subtitles when the file has them.
     pub subtitles_enabled: bool,
@@ -337,6 +499,12 @@ pub struct Settings {
     pub last_dir: Option<PathBuf>,
     /// Where snapshots are written.
     pub snapshot_dir: Option<PathBuf>,
+    /// Bake the picture adjustments into a saved snapshot.
+    ///
+    /// Off by default, and only ever about video: a snapshot has always been the
+    /// frame the engine produced, and that stays the answer for anyone who has not
+    /// asked for the other one. See [`crate::app::PlayerApp::snapshot_needs_render`].
+    pub snapshot_includes_picture: bool,
     /// Saved positions, keyed by path, for resume-where-you-left-off.
     pub resume_positions: HashMap<String, f64>,
     /// The playlist is restored on start.
@@ -384,6 +552,10 @@ impl Default for Settings {
             control_scrim: true,
             minimap: true,
             hide_controls_after: 3.0,
+            picture: PictureSettings::default(),
+            picture_scope: RememberScope::default(),
+            per_file_picture: Vec::new(),
+            enhance: EnhanceSettings::default(),
 
             subtitles_enabled: true,
             subtitle_size: 22.0,
@@ -418,6 +590,7 @@ impl Default for Settings {
             recent_limit: 15,
             last_dir: None,
             snapshot_dir: None,
+            snapshot_includes_picture: false,
             resume_positions: HashMap::new(),
             restore_playlist: true,
             playlist: Vec::new(),
@@ -589,6 +762,47 @@ impl Settings {
         if let Some(speed) = overrides.speed {
             self.speed = speed;
         }
+    }
+
+    /// How many per-file picture sets are kept before the oldest is dropped.
+    pub const PER_FILE_PICTURE_LIMIT: usize = 200;
+
+    /// The picture sliders that apply to `key` right now.
+    ///
+    /// `key` identifies one file and is the same key the resume position uses, so a
+    /// file that is remembered for playback is remembered for its picture too. A
+    /// file nobody has tuned falls back to the globals — which is what makes "per
+    /// file" safe to switch on for a library that already exists.
+    pub fn picture_for(&self, key: Option<&str>) -> PictureSettings {
+        match (self.picture_scope, key) {
+            (RememberScope::PerFile, Some(key)) => self
+                .per_file_picture
+                .iter()
+                .find(|(stored, _)| stored == key)
+                .map(|(_, picture)| *picture)
+                .unwrap_or(self.picture),
+            _ => self.picture,
+        }
+    }
+
+    /// Store `picture` where the current scope says it belongs.
+    ///
+    /// Per-file entries move to the front on every write, so the cap evicts the
+    /// file that has gone longest without being tuned rather than the one that has
+    /// been in the library longest.
+    pub fn set_picture_for(&mut self, key: Option<&str>, picture: PictureSettings) {
+        if let (RememberScope::PerFile, Some(key)) = (self.picture_scope, key) {
+            self.per_file_picture.retain(|(stored, _)| stored != key);
+            self.per_file_picture.insert(0, (key.to_owned(), picture));
+            self.per_file_picture.truncate(Self::PER_FILE_PICTURE_LIMIT);
+            return;
+        }
+        self.picture = picture;
+    }
+
+    /// Forget every per-file picture, keeping the globals.
+    pub fn clear_per_file_pictures(&mut self) {
+        self.per_file_picture.clear();
     }
 
     /// The document that should be written to `settings.json`.
@@ -915,5 +1129,186 @@ mod tests {
             !saved.contains("autoplay"),
             "the retired key must not come back: {saved}"
         );
+    }
+
+    /// The picture sliders remember where they belong: globally, or per file with the
+    /// globals as the fallback for a file nobody has tuned.
+    #[test]
+    fn picture_memory_follows_the_scope() {
+        let mut settings = Settings::default();
+        let tuned = PictureSettings {
+            brightness: 0.5,
+            ..Default::default()
+        };
+
+        // Global writes one place and answers for every file.
+        settings.set_picture_for(Some("a.mkv"), tuned);
+        assert_eq!(settings.picture_for(Some("a.mkv")), tuned);
+        assert_eq!(settings.picture_for(Some("b.mkv")), tuned);
+        assert!(
+            settings.per_file_picture.is_empty(),
+            "a global write does not touch the per-file list"
+        );
+
+        // Per file answers for the tuned file, and falls back for anything else.
+        settings.picture_scope = RememberScope::PerFile;
+        settings.picture = PictureSettings::default();
+        settings.set_picture_for(Some("a.mkv"), tuned);
+        assert_eq!(settings.picture_for(Some("a.mkv")), tuned);
+        assert_eq!(
+            settings.picture_for(Some("b.mkv")),
+            PictureSettings::default(),
+            "an untuned file falls back to the globals"
+        );
+        assert_eq!(
+            settings.picture_for(None),
+            PictureSettings::default(),
+            "with no file open there is nothing to override"
+        );
+
+        settings.clear_per_file_pictures();
+        assert!(settings.per_file_picture.is_empty());
+        assert_eq!(settings.picture_for(Some("a.mkv")), settings.picture);
+    }
+
+    /// The per-file list is bounded, and it drops the file that has gone longest
+    /// without being tuned — a settings file that grows without limit is one that
+    /// eventually fails to load.
+    #[test]
+    fn per_file_picture_memory_is_bounded_and_evicts_the_oldest() {
+        let mut settings = Settings {
+            picture_scope: RememberScope::PerFile,
+            ..Default::default()
+        };
+        let tuned = PictureSettings {
+            contrast: 0.25,
+            ..Default::default()
+        };
+        for index in 0..(Settings::PER_FILE_PICTURE_LIMIT + 10) {
+            settings.set_picture_for(Some(&format!("file-{index}.mkv")), tuned);
+        }
+        assert_eq!(
+            settings.per_file_picture.len(),
+            Settings::PER_FILE_PICTURE_LIMIT,
+            "the list is capped"
+        );
+        assert_eq!(
+            settings.per_file_picture[0].0, "file-209.mkv",
+            "the most recent write is first"
+        );
+        assert!(
+            !settings
+                .per_file_picture
+                .iter()
+                .any(|(key, _)| key == "file-0.mkv"),
+            "the first file to be tuned is the first to go"
+        );
+
+        // Re-tuning a file that is already there moves it to the front rather than
+        // adding a second entry for it.
+        settings.set_picture_for(Some("file-209.mkv"), tuned);
+        assert_eq!(settings.per_file_picture.len(), Settings::PER_FILE_PICTURE_LIMIT);
+        assert_eq!(
+            settings
+                .per_file_picture
+                .iter()
+                .filter(|(key, _)| key == "file-209.mkv")
+                .count(),
+            1,
+            "no duplicates"
+        );
+    }
+
+    /// The reset button is `reset()`, and it has to give back exactly the defaults —
+    /// including `gamma`, whose default is the identity rather than zero.
+    #[test]
+    fn the_reset_button_gives_back_the_defaults() {
+        let mut picture = PictureSettings {
+            brightness: -0.4,
+            gamma: 1.8,
+            sharpness: 1.2,
+            ..Default::default()
+        };
+        assert!(!picture.is_neutral());
+        picture.reset();
+        assert!(picture.is_neutral());
+        assert_eq!(picture.gamma, 1.0, "gamma's default is 1.0, not 0.0");
+    }
+
+    #[test]
+    fn the_enhancement_sliders_are_clamped_on_the_way_in() {
+        let mut enhance = EnhanceSettings {
+            strength: 4.0,
+            denoise: -3.0,
+            deblock: 0.5,
+            ..Default::default()
+        };
+        enhance.clamp();
+        assert_eq!(enhance.strength, 1.0);
+        assert_eq!(enhance.denoise, 0.0);
+        assert_eq!(enhance.deblock, 0.5, "a value already in range is left alone");
+        assert!(
+            !enhance.enabled,
+            "the enhancement starts switched off, so the picture starts untouched"
+        );
+    }
+
+    /// A hand-edited settings file that mentions only the slider the user cares about
+    /// must not cost them everything else.
+    ///
+    /// This block is the one part of the document people are invited to edit, so
+    /// `{"picture":{"brightness":0.5}}` is a perfectly reasonable thing to write. Without
+    /// `#[serde(default)]` on the block itself serde rejects the *whole* document over the
+    /// missing neighbours: the player announces 设置文件损坏, every preference silently
+    /// goes back to its default, and the slider the user set does nothing. That is not a
+    /// theory — it is what the first end-to-end capture of this feature measured, as a
+    /// "changed" run coming back byte-identical to the baseline.
+    #[test]
+    fn a_partial_picture_block_keeps_the_rest_of_the_document() {
+        let json = r#"{
+            "volume": 0.4,
+            "picture_scope": "PerFile",
+            "picture": { "brightness": 0.5 },
+            "enhance": { "enabled": true },
+            "per_file_picture": [["a.mkv", { "sharpness": 0.7 }]]
+        }"#;
+        let settings: Settings = serde_json::from_str(json).expect("a partial block still parses");
+        assert_eq!(settings.volume, 0.4, "the rest of the document survived");
+        assert_eq!(settings.picture.brightness, 0.5);
+        assert_eq!(settings.picture.gamma, 1.0, "gamma falls back to the identity");
+        assert_eq!(settings.picture.saturation, 0.0);
+
+        let expected = EnhanceSettings {
+            enabled: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            settings.enhance, expected,
+            "an unmentioned switch keeps its default rather than taking the block down"
+        );
+        assert_eq!(
+            settings.picture_for(Some("a.mkv")).sharpness,
+            0.7,
+            "a per-file entry is partial too"
+        );
+    }
+
+    /// The switch that decides whether a snapshot is the frame the engine produced
+    /// or the picture as it is on screen.
+    #[test]
+    fn a_snapshot_keeps_the_raw_frame_unless_the_setting_asks_for_the_other() {
+        assert!(
+            !Settings::default().snapshot_includes_picture,
+            "off, so a snapshot stays what it has always been"
+        );
+
+        // A document written before this existed has no such field; `serde(default)`
+        // fills it in and the user's snapshots do not change.
+        let old: Settings = serde_json::from_str(r#"{"volume": 0.4}"#).expect("parses");
+        assert!(!old.snapshot_includes_picture);
+
+        let asked: Settings =
+            serde_json::from_str(r#"{"snapshot_includes_picture": true}"#).expect("parses");
+        assert!(asked.snapshot_includes_picture);
     }
 }

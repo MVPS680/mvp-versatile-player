@@ -332,6 +332,15 @@ fn video_page(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
             changed
         },
     );
+    changed |= widgets::switch_row(
+        ui,
+        tokens,
+        "截图包含画面调节",
+        &mut app.settings.snapshot_includes_picture,
+        "只对视频生效：按当前的亮度、对比度等设置把同一帧重新渲染一次再保存，\
+         因此截图与画面一致（仍不含字幕与界面）。关闭时保存解码出的原始帧，\
+         与开启本功能之前逐字节相同。",
+    );
 
     widgets::section(ui, tokens, "图片");
     changed |= widgets::slider_row(
@@ -742,6 +751,7 @@ pub const SHORTCUTS: &[(&str, &str)] = &[
     ("G", "加载字幕文件"),
     ("Z", "切换画面比例"),
     ("R", "旋转 90°"),
+    ("Ctrl+P", "画面调节（仅视频）"),
     ("A", "窗口置顶"),
     ("T / Ctrl+L", "显示 / 隐藏侧边栏"),
     ("Ctrl+O", "打开文件"),

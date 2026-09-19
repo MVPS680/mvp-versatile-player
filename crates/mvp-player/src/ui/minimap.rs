@@ -16,6 +16,7 @@
 use egui::{Color32, CornerRadius, Rect, Stroke, StrokeKind, Vec2};
 
 use crate::app::PlayerApp;
+use crate::gl::picture_pass::Adjusted;
 use crate::theme::{radius, space, Tokens};
 use crate::ui::canvas::image_transformed;
 use crate::ui::surface;
@@ -109,6 +110,12 @@ pub fn point_on_map(sheet: Rect, position: egui::Pos2) -> Option<Vec2> {
 /// Paint the map: the whole picture in miniature, with the part the canvas is
 /// showing marked on it.
 ///
+/// `adjusted` is the picture adjustment pass, and it is a **parameter** rather than
+/// something this module asks `app` for: the map is drawn for a still image as well,
+/// and a photograph is not adjustable. When this asked the app directly, opening an
+/// image with the sliders off their defaults coloured the miniature while the
+/// picture beside it stayed as its author left it.
+///
 /// It is not interactive — see [`point_on_map`] for the press that steers it.
 pub fn draw(
     app: &PlayerApp,
@@ -117,6 +124,7 @@ pub fn draw(
     picture: Rect,
     sheet: Rect,
     tokens: &Tokens,
+    adjusted: Option<Adjusted>,
 ) {
     let inner = sheet.shrink(INSET);
     let hovered = ui
@@ -138,6 +146,11 @@ pub fn draw(
             app.flip_h(),
             app.flip_v(),
             Color32::WHITE,
+            // The same pass the canvas passes in, so the miniature and the picture
+            // cannot disagree about colour any more than they disagree about
+            // rotation — and so that "only video is adjustable" is decided in one
+            // place, by the canvas, instead of twice with two different answers.
+            adjusted,
         );
     }
 

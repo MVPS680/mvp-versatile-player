@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use egui::{Context, TextureHandle, TextureOptions};
 use mvp_core::engine::{EngineConfig, EngineEvent, MediaSource, PlaybackState};
@@ -15,7 +15,9 @@ use mvp_platform::power::SleepBlocker;
 use mvp_platform::single_instance::{AppInstance, IpcMessage};
 use mvp_subtitle::Subtitle;
 
-use crate::settings::{LaunchOverrides, Settings, SettingsStore};
+use crate::gl::picture_pass::{self, Adjusted, PicturePass, SnapshotJob, SnapshotSender};
+use crate::picture::{self, EnhanceState, PictureUniforms};
+use crate::settings::{LaunchOverrides, PictureSettings, Settings, SettingsStore};
 use crate::state::{
     FrameHistory, InfoRow, Mode, Overlay, SettingsTab, ShownFrame, ThumbCache, Toast, ToastKind,
     UiState,
@@ -77,6 +79,33 @@ pub struct PlayerApp {
     pub store: SettingsStore,
     /// Visual tokens.
     pub theme: Theme,
+    /// The picture adjustment pass, once there is a GL context to build it in.
+    ///
+    /// `None` on a backend without one, and the pass itself carries a `failed` flag
+    /// for a driver that refuses the shader; either way the picture is drawn the way
+    /// it always was.
+    pub picture_pass: Option<Arc<PicturePass>>,
+    /// The smoothed enhancement, refreshed a few times a second from the frame's own
+    /// statistics. `None` while the enhancement is switched off.
+    pub picture_state: Option<EnhanceState>,
+    /// When the enhancement was last re-analysed.
+    picture_state_at: Option<Instant>,
+    /// The file the smoothed enhancement belongs to.
+    ///
+    /// A file change has to be a *first* frame rather than a fade: without this, the
+    /// state of the film before is the starting point for the next one, and the first
+    /// second of every following film ramps towards its own statistics instead of
+    /// arriving at them.
+    picture_state_key: Option<String>,
+    /// A snapshot waiting for the canvas to render it off screen.
+    ///
+    /// See [`PlayerApp::snapshot_needs_render`]: the adjustments are a GPU effect, so
+    /// a snapshot that includes them has to be drawn once more into a framebuffer this
+    /// player owns and read back a frame later.
+    pending_snapshot: Option<PathBuf>,
+    /// Both ends of that readback; the canvas is handed the sender.
+    snapshot_tx: SnapshotSender,
+    snapshot_rx: crossbeam_channel::Receiver<picture_pass::SnapshotResult>,
 
     /// The playlist.
     pub playlist: Playlist,
@@ -212,6 +241,7 @@ impl PlayerApp {
         playlist.set_shuffle(settings.shuffle);
 
         let hwnd = window_handle_from(cc);
+        let (snapshot_tx, snapshot_rx) = crossbeam_channel::unbounded();
 
         let mut app = Self {
             engine,
@@ -220,6 +250,15 @@ impl PlayerApp {
             launch,
             store: SettingsStore::default(),
             theme,
+            // Built once, here: the shader is compiled at start-up, not the first time
+            // somebody moves a slider.
+            picture_pass: cc.gl.clone().map(|gl| Arc::new(PicturePass::new(gl))),
+            picture_state: None,
+            picture_state_at: None,
+            picture_state_key: None,
+            pending_snapshot: None,
+            snapshot_tx,
+            snapshot_rx,
             playlist,
             image: ImageView::new(),
             mode: Mode::Empty,
@@ -926,7 +965,69 @@ impl PlayerApp {
         let stamp = timestamp_for_filename();
         let path = dir.join(format!("MVP_{stamp}.png"));
 
-        match self.write_snapshot(&path) {
+        // A snapshot that includes the picture adjustments cannot be read out of
+        // `displayed`: that is the frame from *before* them, because they are applied
+        // by the picture pass on the way to the screen. The canvas renders the frame
+        // once more into a framebuffer this player owns, and the pixels come back on a
+        // channel a frame later — see [`PlayerApp::take_snapshot_render`].
+        if self.snapshot_needs_render() {
+            self.pending_snapshot = Some(path);
+            return;
+        }
+
+        let result = self.write_snapshot(&path);
+        self.report_snapshot(path, result);
+    }
+
+    /// `true` when the next snapshot has to go through the picture pass.
+    ///
+    /// Only while there is something to apply: with the sliders neutral and the
+    /// enhancement off, `picture_adjusted` is `None`, the renderer never enters the
+    /// adjustment path, and the pixels in `displayed` are already what the screen
+    /// shows — so "off" keeps meaning byte for byte what this player produced before
+    /// the feature existed. Video only, because a photograph is not adjustable.
+    ///
+    /// A frame has to be on the GPU as well: the canvas can only run the offscreen
+    /// render in the branch that has a texture, so asking for one before the first
+    /// frame arrives would leave the job outstanding — and the request for a repaint
+    /// that goes with it — for as long as the player waited for a picture.
+    pub fn snapshot_needs_render(&self) -> bool {
+        self.settings.snapshot_includes_picture
+            && self.texture.is_some()
+            && self.picture_adjusted().is_some()
+    }
+
+    /// The one-off offscreen render the canvas has to run this frame, if any.
+    ///
+    /// Handed out once: the canvas draws it into a framebuffer of its own and sends
+    /// the pixels back on this channel, which [`PlayerApp::collect_snapshot`] picks up
+    /// on a later frame.
+    pub fn take_snapshot_render(&mut self) -> Option<SnapshotJob> {
+        let path = self.pending_snapshot.take()?;
+        Some(SnapshotJob {
+            path,
+            sender: self.snapshot_tx.clone(),
+        })
+    }
+
+    /// Write a snapshot the canvas has finished rendering, if one has arrived.
+    fn collect_snapshot(&mut self) {
+        let Ok((path, frame)) = self.snapshot_rx.try_recv() else {
+            return;
+        };
+        let result = match frame {
+            Some(frame) => Self::write_png(&path, frame.width, frame.height, frame.rgba),
+            // The render could not be done at all: no texture for the frame, or a
+            // framebuffer the driver refused. Saying so beats a key press that does
+            // nothing, and the raw frame is one setting away.
+            None => Err(mvp_core::MediaError::other("无法在离屏渲染中读回画面")),
+        };
+        self.report_snapshot(path, result);
+    }
+
+    /// Announce a finished snapshot: the toast, the last-snapshot path, or the error.
+    fn report_snapshot(&mut self, path: PathBuf, result: Result<(), mvp_core::MediaError>) {
+        match result {
             Ok(()) => {
                 self.ui.last_snapshot = Some(path.clone());
                 self.toast(
@@ -938,12 +1039,16 @@ impl PlayerApp {
         }
     }
 
-    /// Write the picture currently on screen to `path` as a PNG.
+    /// Write the frame the engine produced to `path` as a PNG.
     ///
-    /// Both paths snapshot what the user is actually looking at, including the
-    /// scaling the engine applied to fit the window — which is why this reads
-    /// the uploaded image rather than asking the engine for a frame it has
-    /// deliberately already handed over.
+    /// Both paths snapshot the frame the engine produced, including the scaling it
+    /// applied to fit the window — which is why this reads the uploaded image rather
+    /// than asking the engine for a frame it has deliberately already handed over.
+    ///
+    /// It is the frame *before* the picture adjustments: those happen on the GPU, on
+    /// the way to the screen. This is therefore what a snapshot has always been, and
+    /// what it stays unless the 截图包含画面调节 setting asks for the other one, which
+    /// the canvas renders instead — see [`PlayerApp::snapshot_needs_render`].
     fn write_snapshot(&self, path: &Path) -> Result<(), mvp_core::MediaError> {
         let (width, height, rgba): (u32, u32, Vec<u8>) = if self.mode == Mode::Image {
             let doc = self
@@ -970,6 +1075,16 @@ impl PlayerApp {
             (width, height, bytes)
         };
 
+        Self::write_png(path, width, height, rgba)
+    }
+
+    /// Write one RGBA buffer as a PNG, creating the folder if it is not there.
+    fn write_png(
+        path: &Path,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+    ) -> Result<(), mvp_core::MediaError> {
         let image = image::RgbaImage::from_raw(width, height, rgba)
             .ok_or_else(|| mvp_core::MediaError::other("画面数据不完整"))?;
         if let Some(parent) = path.parent() {
@@ -1548,6 +1663,122 @@ impl PlayerApp {
         self.ui.settings_tab = tab;
     }
 
+    /// How often the picture is re-analysed while the enhancement is on.
+    ///
+    /// Ten times a second is plenty for brightness and colour statistics, and it keeps
+    /// the cost off the frame budget: the analysis is one pass over a copy that is at
+    /// most [`picture::ANALYSIS_SIDE`] pixels on its long side.
+    const PICTURE_ANALYSIS: Duration = Duration::from_millis(100);
+
+    /// Whether the picture adjustments apply to whatever is open right now.
+    ///
+    /// Video only, and deliberately one function: the menu entry, the shortcut, the
+    /// panel, the per-file key and the renderer all ask this, so they cannot disagree
+    /// about whether the channel exists. A still image is not adjustable — its pixels
+    /// are the author's — and an audio file has no picture at all.
+    pub fn picture_applies(&self) -> bool {
+        picture_channel_applies(self.mode)
+    }
+
+    /// The key the picture settings are remembered under, for the file that is open.
+    ///
+    /// The same key the resume position uses, so a file remembered for playback is
+    /// remembered for its picture too and there is only one idea of "this file" in the
+    /// settings document.
+    ///
+    /// `None` unless a video is on screen. This key decides which per-file entry a
+    /// slider writes to, and `engine.info()` still names the last video probed after a
+    /// still image or a song has been opened: without the gate, dragging a slider while
+    /// a photograph was up wrote the values into *that video's* entry — or, when no
+    /// video had ever been opened, into the globals, where the next film took them.
+    pub fn picture_key(&self) -> Option<String> {
+        if !self.picture_applies() {
+            return None;
+        }
+        self.engine
+            .info()
+            .map(|info| info.path.to_string_lossy().into_owned())
+    }
+
+    /// The picture sliders that apply right now.
+    pub fn picture_settings(&self) -> PictureSettings {
+        let key = self.picture_key();
+        self.settings.picture_for(key.as_deref())
+    }
+
+    /// Re-analyse the picture and smooth the enhancement, at most ten times a second.
+    ///
+    /// Called once per frame by the interface, and it does nothing at all while the
+    /// enhancement is switched off or while what is open is not a video — which is how
+    /// it ships. Reading a photograph's pixels to build a histogram of them would be
+    /// work nothing ever drew, and it would leave a state behind that the next video
+    /// would inherit.
+    pub fn update_picture_state(&mut self) {
+        if !self.settings.enhance.enabled || !self.picture_applies() {
+            self.picture_state = None;
+            self.picture_state_at = None;
+            self.picture_state_key = None;
+            return;
+        }
+        let due = self
+            .picture_state_at
+            .is_none_or(|at| at.elapsed() >= Self::PICTURE_ANALYSIS);
+        if !due {
+            return;
+        }
+        self.picture_state_at = Some(Instant::now());
+        let Some(image) = self.displayed.as_ref() else {
+            return;
+        };
+        let key = self.picture_key();
+        // A different file is a different picture, and the first frame of it arrives at
+        // its own statistics rather than fading in from the film before it: the dead
+        // zone keeps a still shot still, but a *cut* between two files is not a wobble
+        // to be smoothed away.
+        let previous = if self.picture_state_key == key {
+            self.picture_state
+        } else {
+            None
+        };
+        let [width, height] = image.size;
+        let bytes: &[u8] = bytemuck::cast_slice(image.pixels.as_slice());
+        let stats = picture::analyse(bytes, width, height, picture::ANALYSIS_SIDE);
+        let target = picture::target_state(&stats, &self.settings.enhance);
+        self.picture_state = Some(picture::smooth(previous.as_ref(), target, picture::SMOOTHING));
+        self.picture_state_key = key;
+    }
+
+    /// The uniforms for the picture being drawn, or `None` for the untouched path.
+    pub fn picture_uniforms(&self) -> Option<PictureUniforms> {
+        picture::uniforms(
+            &self.picture_settings(),
+            &self.settings.enhance,
+            self.picture_state.unwrap_or_default(),
+        )
+    }
+
+    /// The pass to draw the picture through, when one is usable.
+    pub fn picture_pass(&self) -> Option<&Arc<PicturePass>> {
+        self.picture_pass.as_ref().filter(|pass| !pass.failed)
+    }
+
+    /// Everything an adjusted draw of the picture needs, or `None` for the untouched
+    /// path.
+    ///
+    /// One place, because two views draw the same frame — the canvas and the
+    /// bird's-eye map — and if only one of them went through the shader the map would
+    /// disagree with the territory about colour, which is the same kind of lie it
+    /// already avoids about rotation.
+    pub fn picture_adjusted(&self) -> Option<Adjusted> {
+        let pass = self.picture_pass()?;
+        let uniforms = self.picture_uniforms()?;
+        Some(Adjusted {
+            pass: Arc::clone(pass),
+            uniforms,
+            frame_size: [self.uploaded_size.0 as f32, self.uploaded_size.1 as f32],
+        })
+    }
+
     /// Turn subtitle display on or off.
     ///
     /// This is a display gate, not a track choice: turning subtitles off and on
@@ -1884,6 +2115,13 @@ impl eframe::App for PlayerApp {
         self.update_sleep_blocker();
         self.sync_engine();
         self.tick_image(ctx);
+        // A snapshot that asked for the picture adjustments: the canvas picks the job
+        // up on the next paint, so this frame has to happen even while the player sits
+        // paused on a still frame, and the pixels are written when they arrive.
+        self.collect_snapshot();
+        if self.pending_snapshot.is_some() {
+            ctx.request_repaint();
+        }
         // A minimized window has no picture to update, and a frame that is
         // pulled, converted and uploaded anyway is work nobody will ever see —
         // at 4K that is tens of megabytes a frame, sixty times a second, for a
@@ -1944,9 +2182,30 @@ impl eframe::App for PlayerApp {
     }
 }
 
+/// The picture channel is a video-only feature.
+///
+/// One predicate for the menu entry, the shortcut, the panel, the per-file key and the
+/// renderer, so they cannot disagree about whether the channel exists: a still image is
+/// not adjustable — its pixels are the author's — and an audio file has no picture.
+fn picture_channel_applies(mode: Mode) -> bool {
+    mode == Mode::Video
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The screens that have no video frame must answer "no". A panel that opened over
+    /// a photograph, a snapshot rendered through the shader for a still, and a per-file
+    /// key taken from the last video while a song played are all bugs this predicate
+    /// exists to stop.
+    #[test]
+    fn the_picture_channel_is_video_only() {
+        assert!(picture_channel_applies(Mode::Video));
+        assert!(!picture_channel_applies(Mode::Audio));
+        assert!(!picture_channel_applies(Mode::Image));
+        assert!(!picture_channel_applies(Mode::Empty));
+    }
 
     #[test]
     fn civil_dates_match_known_values() {

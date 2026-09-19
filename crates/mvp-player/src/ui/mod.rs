@@ -19,6 +19,7 @@ mod canvas;
 mod dialogs;
 mod menu;
 mod minimap;
+mod picture_panel;
 mod screens;
 mod settings_window;
 mod sidebar;
@@ -91,12 +92,22 @@ pub fn draw(app: &mut PlayerApp, ctx: &Context) {
     // that makes it work: sidebar, then its own bottom strip, then the canvas.
     screens::draw(app, ctx);
 
+    // The enhancement's statistics, at most ten times a second. Off unless the setting
+    // is on, and then it reads the frame the upload path already holds: no extra
+    // decode, no second copy of the picture.
+    app.update_picture_state();
+
     // The floating island is the *only* transport in fullscreen and it is an
     // `Area`, not a panel: it reserves nothing, so it is painted over the canvas
     // rather than before it.
     if app.ui.fullscreen && app.ui.controls_visible() {
         screens::draw_overlay(app, ctx);
     }
+
+    // The picture panel is a window, not an overlay: it must not dim the frame it is
+    // being used to judge, so it is painted with the settings window, after the
+    // picture, and it never takes the keyboard.
+    picture_panel::draw(app, ctx);
 
     settings_window::draw(app, ctx);
     dialogs::draw(app, ctx);
@@ -378,6 +389,16 @@ fn handle_keyboard(app: &mut PlayerApp, ctx: &Context) {
             }
             (Key::S, false, _) => app.save_snapshot(),
             (Key::N, false, _) | (Key::PageDown, false, _) => app.next_media(false),
+            (Key::P, true, _) => {
+                if app.picture_applies() {
+                    app.ui.picture_panel_open = !app.ui.picture_panel_open;
+                } else {
+                    // Said out loud rather than doing nothing: a key that works on a
+                    // video and not on a song is otherwise indistinguishable from a
+                    // key that is broken.
+                    app.toast(crate::state::Toast::info("画面调节只对视频生效"));
+                }
+            }
             (Key::P, false, _) | (Key::PageUp, false, _) => app.prev_media(),
             (Key::O, true, false) => app.request_open_file(),
             (Key::O, true, true) => app.request_open_folder(),
