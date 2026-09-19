@@ -389,16 +389,7 @@ fn handle_keyboard(app: &mut PlayerApp, ctx: &Context) {
             }
             (Key::S, false, _) => app.save_snapshot(),
             (Key::N, false, _) | (Key::PageDown, false, _) => app.next_media(false),
-            (Key::P, true, _) => {
-                if app.picture_applies() {
-                    app.ui.picture_panel_open = !app.ui.picture_panel_open;
-                } else {
-                    // Said out loud rather than doing nothing: a key that works on a
-                    // video and not on a song is otherwise indistinguishable from a
-                    // key that is broken.
-                    app.toast(crate::state::Toast::info("画面调节只对视频生效"));
-                }
-            }
+            (Key::P, true, _) => app.open_picture_panel(),
             (Key::P, false, _) | (Key::PageUp, false, _) => app.prev_media(),
             (Key::O, true, false) => app.request_open_file(),
             (Key::O, true, true) => app.request_open_folder(),

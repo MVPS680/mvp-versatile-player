@@ -1670,6 +1670,19 @@ impl PlayerApp {
     /// most [`picture::ANALYSIS_SIDE`] pixels on its long side.
     const PICTURE_ANALYSIS: Duration = Duration::from_millis(100);
 
+    /// Open the picture panel, or say why it does not apply.
+    ///
+    /// The menu entry, the bottom bar's 画面 menu, the shortcut, the settings page and the
+    /// panel itself all land here, so the five cannot give five different answers about a
+    /// photograph or a song. The gate itself is [`PlayerApp::picture_applies`].
+    pub fn open_picture_panel(&mut self) {
+        if self.picture_applies() {
+            self.ui.picture_panel_open = true;
+        } else {
+            self.toast(Toast::info("画面调节只对视频生效"));
+        }
+    }
+
     /// Whether the picture adjustments apply to whatever is open right now.
     ///
     /// Video only, and deliberately one function: the menu entry, the shortcut, the

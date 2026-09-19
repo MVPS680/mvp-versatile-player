@@ -982,6 +982,16 @@ fn pan_scan_menu(app: &mut PlayerApp, ui: &mut Ui) {
     use crate::settings::AspectMode;
 
     ui.set_min_width(170.0);
+    // First in the list, because it is the one entry here that is not about geometry: the
+    // menu is already where people look for "make the picture look different".
+    if ui
+        .button(RichText::new("画面调节…").size(font::SMALL))
+        .clicked()
+    {
+        app.open_picture_panel();
+        ui.close();
+    }
+    ui.separator();
     for mode in AspectMode::all() {
         if ui
             .selectable_label(

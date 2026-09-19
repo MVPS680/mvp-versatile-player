@@ -347,13 +347,12 @@ fn video_menu(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
                 }
             }
         });
-        // Video only, and gated on the video screen specifically rather than on
-        // `has_picture`: the adjustments are drawn by the video canvas, so an entry
-        // that opened the panel over a photograph would offer a panel that does
-        // nothing at all. The same predicate is used by the panel and by the
-        // renderer — see `PlayerApp::picture_applies`.
-        if item(ui, tokens, "画面调节…", "Ctrl+P", app.picture_applies()) {
-            app.ui.picture_panel_open = true;
+        // Offered even when there is nothing to adjust — a greyed-out entry reads as "this
+        // player does not have that feature", and the click answers for itself with the
+        // same sentence the shortcut gives. The panel still refuses to open for a
+        // photograph or a song; see `PlayerApp::open_picture_panel`.
+        if item(ui, tokens, "画面调节…", "Ctrl+P", true) {
+            app.open_picture_panel();
             ui.close();
         }
         if item(ui, tokens, "顺时针旋转 90°", "R", active) {

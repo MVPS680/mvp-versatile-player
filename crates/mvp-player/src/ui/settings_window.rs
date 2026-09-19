@@ -274,6 +274,30 @@ fn video_page(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
          若显示器本身支持 HDR，建议关闭。",
     );
 
+    widgets::section(ui, tokens, "画面调节");
+    if widgets::secondary_button(ui, tokens, "打开画面调节面板…", 200.0) {
+        app.open_picture_panel();
+    }
+    changed |= widgets::switch_row(
+        ui,
+        tokens,
+        "画质增强",
+        &mut app.settings.enhance.enabled,
+        "按每帧自己的直方图做轻微校正：暗部抬升、色彩补足、边缘平滑。\
+         只对视频生效；关闭后立即失效，不留残影。自动色阶、色彩、降噪、去块与\
+         锐化等细项在画面调节面板里。",
+    );
+    if app.settings.enhance.enabled {
+        changed |= widgets::slider_row(
+            ui,
+            tokens,
+            "增强强度",
+            &mut app.settings.enhance.strength,
+            0.0..=1.0,
+            |v| format!("{:.0}%", v * 100.0),
+        );
+    }
+
     widgets::section(ui, tokens, "画面");
     changed |= widgets::combo_row(
         ui,
