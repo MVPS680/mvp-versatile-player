@@ -16,7 +16,7 @@ use mvp_platform::single_instance::{AppInstance, IpcMessage};
 use mvp_subtitle::Subtitle;
 
 use crate::settings::{LaunchOverrides, Settings, SettingsStore};
-use crate::state::{FrameHistory, InfoRow, Mode, ShownFrame, Toast, ToastKind, UiState};
+use crate::state::{FrameHistory, InfoRow, Mode, Overlay, SettingsTab, ShownFrame, Toast, ToastKind, UiState};
 use crate::theme::Theme;
 
 /// Options the player was started with.
@@ -1458,6 +1458,18 @@ impl PlayerApp {
         } else {
             self.settings.rotation
         }
+    }
+
+    /// Open the settings window on a named page.
+    ///
+    /// The overlay on its own is not enough for an entry that names a page
+    /// ("字幕延迟…", "音频输出设置…"): the window then opens on whichever page was
+    /// visited last, and the click reads as having done nothing. Every entry that
+    /// means a page goes through here, so the pair can never be half-done — which
+    /// is the shape of bug this method exists to prevent.
+    pub fn open_settings(&mut self, tab: SettingsTab) {
+        self.ui.open_overlay(Overlay::Settings);
+        self.ui.settings_tab = tab;
     }
 
     /// Turn subtitle display on or off.

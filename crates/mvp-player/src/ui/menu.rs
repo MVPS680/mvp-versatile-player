@@ -3,13 +3,23 @@
 //! A menu bar is not the most modern pattern, but it is what users of VLC,
 //! PotPlayer and MPC-HC reach for, it exposes every command without hunting for
 //! an icon, and it documents the keyboard shortcut next to each action.
+//!
+//! **Titles use `MenuButton`; anything nested uses `SubMenuButton`.** The two are
+//! visually identical and take the same arguments, which is what made this a
+//! silent trap: `MenuButton` is for the bar itself, and inside a menu it merely
+//! opens a popup carrying the *enclosing* menu's close-on-click behaviour — so the
+//! parent menu shut on the very frame the submenu appeared, and a nested entry
+//! could not be reached at all (no submenu ever stayed open, in the report's
+//! words, "点了没反应"). `SubMenuButton` is the one that registers an open
+//! submenu in egui's `MenuState`, ignores nearby clicks and opens on hover. Every
+//! nested list here was written with `MenuButton` once; do not go back.
 
-use egui::containers::menu::{MenuBar, MenuButton};
+use egui::containers::menu::{MenuBar, MenuButton, SubMenuButton};
 use egui::{Align, Context, Layout, RichText, Ui};
 
 use crate::app::PlayerApp;
 use crate::settings::{AspectMode, EndAction, Settings, SidebarTab};
-use crate::state::{Overlay, Toast};
+use crate::state::{Overlay, SettingsTab, Toast};
 use crate::theme::{font, space, Tokens};
 use crate::ui::surface;
 
@@ -157,7 +167,7 @@ fn file_menu(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
 }
 
 fn submenu_recent(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
-    MenuButton::new("最近打开").ui(ui, |ui| {
+    SubMenuButton::new("最近打开").ui(ui, |ui| {
         app.settings.prune_recent();
         if app.settings.recent_files.is_empty() {
             ui.add_enabled(
@@ -250,7 +260,7 @@ fn playback_menu(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
         }
         separator(ui, tokens);
         // Speed submenu.
-        MenuButton::new("播放速度").ui(ui, |ui| {
+        SubMenuButton::new("播放速度").ui(ui, |ui| {
             for speed in [0.25f64, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 3.0, 4.0] {
                 let selected = (app.settings.speed - speed).abs() < 1e-3;
                 if ui
@@ -266,7 +276,7 @@ fn playback_menu(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
                 }
             }
         });
-        MenuButton::new("循环模式").ui(ui, |ui| {
+        SubMenuButton::new("循环模式").ui(ui, |ui| {
             use mvp_core::playlist::RepeatMode;
             for (mode, label) in [
                 (RepeatMode::Off, "不循环"),
@@ -322,7 +332,7 @@ fn video_menu(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
         // audio screen has neither — what is left in this menu is the encoding
         // and the window, which are just as real there.
         let active = app.has_picture();
-        MenuButton::new("画面比例").ui(ui, |ui| {
+        SubMenuButton::new("画面比例").ui(ui, |ui| {
             for mode in AspectMode::all() {
                 if ui
                     .selectable_label(
@@ -470,7 +480,7 @@ fn audio_menu(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
             app.store.mark_dirty();
         }
         separator(ui, tokens);
-        MenuButton::new("音频延迟").ui(ui, |ui| {
+        SubMenuButton::new("音频延迟").ui(ui, |ui| {
             for delta in [-1.0f64, -0.5, -0.1, 0.0, 0.1, 0.5, 1.0] {
                 let label = if delta == 0.0 {
                     "0 秒（同步）".to_string()
@@ -492,8 +502,7 @@ fn audio_menu(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
         });
         separator(ui, tokens);
         if item(ui, tokens, "音频输出设置…", "", true) {
-            app.ui.open_overlay(Overlay::Settings);
-            app.ui.settings_tab = crate::state::SettingsTab::Audio;
+            app.open_settings(SettingsTab::Audio);
         }
     });
 }
@@ -549,30 +558,25 @@ fn subtitle_menu(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
             app.remove_external_subtitle();
         }
         separator(ui, tokens);
-        MenuButton::new("字幕延迟").ui(ui, |ui| {
-            for delta in [-2.0f64, -1.0, -0.5, -0.1, 0.0, 0.1, 0.5, 1.0, 2.0] {
-                let label = if delta == 0.0 {
-                    "0 秒".to_string()
-                } else {
-                    format!("{delta:+.1} 秒")
-                };
-                if ui
-                    .selectable_label(
-                        (app.settings.subtitle_delay - delta).abs() < 1e-6,
-                        RichText::new(label).size(font::SMALL),
-                    )
-                    .clicked()
-                {
-                    app.settings.subtitle_delay = delta;
-                    app.store.mark_dirty();
-                    ui.close();
-                }
-            }
-        });
-        separator(ui, tokens);
+        // A jump to the page, not the preset submenu that used to sit here. A
+        // nested `MenuButton` never opens in this menu bar (egui identifies an open
+        // submenu by the auto id of its own button, and it closed again the instant
+        // it opened — see the note on the end-of-playback heading in the tools
+        // menu), so all nine presets were unreachable from the UI. They were also
+        // never the whole story: the page carries a -10…+10 s slider, and it is the
+        // only place the delay can be set to anything a preset did not cover. The
+        // value on the right keeps the menu answering "what is it now?".
+        if item(
+            ui,
+            tokens,
+            "字幕延迟…",
+            &delay_hint(app.settings.subtitle_delay),
+            true,
+        ) {
+            app.open_settings(SettingsTab::Subtitles);
+        }
         if item(ui, tokens, "字幕样式设置…", "", true) {
-            app.ui.open_overlay(Overlay::Settings);
-            app.ui.settings_tab = crate::state::SettingsTab::Subtitles;
+            app.open_settings(SettingsTab::Subtitles);
         }
     });
 }
@@ -583,7 +587,7 @@ fn tools_menu(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
             app.ui.sidebar_visible = !app.ui.sidebar_visible;
             app.store.mark_dirty();
         }
-        MenuButton::new("侧边栏标签页").ui(ui, |ui| {
+        SubMenuButton::new("侧边栏标签页").ui(ui, |ui| {
             for tab in SidebarTab::all() {
                 if ui
                     .selectable_label(
@@ -612,35 +616,30 @@ fn tools_menu(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
             app.ui.open_overlay(Overlay::Settings);
         }
         if item(ui, tokens, "文件关联…", "", true) {
-            app.ui.open_overlay(Overlay::Settings);
-            app.ui.settings_tab = crate::state::SettingsTab::Integration;
+            app.open_settings(SettingsTab::Integration);
         }
         separator(ui, tokens);
-        // Three choices, drawn flat instead of behind a "播放结束行为" submenu: a
-        // nested `MenuButton` never opened here (egui identifies an open submenu by
-        // the auto id of its button, and the submenu closed again the moment it
-        // opened), so the setting could not be reached from the menu bar at all.
-        // Three items do not need a submenu, and the heading keeps them readable
-        // next to the items above.
-        ui.add_space(space::XS);
-        ui.label(
-            RichText::new("播放结束行为")
-                .size(font::TINY)
-                .color(tokens.text_muted),
-        );
-        for (action, label) in EndAction::choices() {
-            if ui
-                .selectable_label(
-                    app.settings.end_action == action,
-                    RichText::new(label).size(font::SMALL),
-                )
-                .clicked()
-            {
-                app.settings.end_action = action;
-                app.store.mark_dirty();
-                ui.close();
+        // A `SubMenuButton`, not a `MenuButton`. The two look alike in a menu, but
+        // only the first is a submenu: `MenuButton` merely opens a `Popup::menu`
+        // with the enclosing menu's close behaviour, so clicking it closed the whole
+        // menu on the same frame the submenu appeared — and the entry (like every
+        // other nested list in the bar) could not be reached at all. `SubMenuButton`
+        // is the one that tracks an open submenu in `MenuState` and opens on hover.
+        SubMenuButton::new("播放结束行为").ui(ui, |ui| {
+            for (action, label) in EndAction::choices() {
+                if ui
+                    .selectable_label(
+                        app.settings.end_action == action,
+                        RichText::new(label).size(font::SMALL),
+                    )
+                    .clicked()
+                {
+                    app.settings.end_action = action;
+                    app.store.mark_dirty();
+                    ui.close();
+                }
             }
-        }
+        });
         ui.add_space(space::XS);
         if item(ui, tokens, "重置所有设置…", "", true) {
             app.settings = Settings::reset();
@@ -681,6 +680,20 @@ fn help_menu(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
             );
         }
     });
+}
+
+/// Right-hand readout for the "字幕延迟…" entry.
+///
+/// `0` reads as "0 秒" rather than "+0.00 秒": it is the value that means "off",
+/// and a sign on it says nothing. Everything else uses the same two decimals the
+/// settings slider prints, so the menu and the page never disagree about what is
+/// set.
+fn delay_hint(seconds: f64) -> String {
+    if seconds.abs() < 5e-3 {
+        "0 秒".to_string()
+    } else {
+        format!("{seconds:+.2} 秒")
+    }
 }
 
 /// One menu entry with an optional shortcut hint on the right.
@@ -763,4 +776,13 @@ mod tests {
         assert_eq!(text.chars().count(), 4);
     }
 
+    /// The menu's delay readout and the settings slider's readout are the same
+    /// number in the same shape — two decimals, except that zero has no sign.
+    #[test]
+    fn the_delay_readout_matches_what_the_slider_prints() {
+        assert_eq!(delay_hint(0.0), "0 秒");
+        assert_eq!(delay_hint(-0.004), "0 秒");
+        assert_eq!(delay_hint(0.5), "+0.50 秒");
+        assert_eq!(delay_hint(-1.25), "-1.25 秒");
+    }
 }
