@@ -546,13 +546,13 @@ fn tracks_tab(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
             // Display can be off while a track stays selected, so the row has to
             // be highlighted only when it is both chosen *and* shown.
             let selected = app.settings.subtitles_enabled && current == Some(subtitle.index);
-            let suffix = if subtitle.is_text {
+            let suffix = if subtitle.is_renderable() {
                 ""
             } else {
-                "（图形字幕，暂不支持）"
+                "（暂不支持）"
             };
             if ui
-                .add_enabled_ui(subtitle.is_text, |ui| {
+                .add_enabled_ui(subtitle.is_renderable(), |ui| {
                     ui.selectable_label(
                         selected,
                         RichText::new(format!(

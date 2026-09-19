@@ -447,7 +447,10 @@ impl std::fmt::Debug for ThumbCache {
 }
 
 /// Transient UI state.
-#[derive(Debug)]
+///
+/// `Debug` is implemented by hand because the graphical-subtitle texture cache
+/// holds `egui::TextureHandle`s, which are not `Debug` and would otherwise make
+/// the whole struct unusable in a `{:?}`.
 pub struct UiState {
     /// Sidebar visibility.
     pub sidebar_visible: bool,
@@ -491,6 +494,12 @@ pub struct UiState {
     /// Cue index the lyrics page highlighted last frame, so the view scrolls
     /// only when the highlighted line changes rather than every frame.
     pub last_lyric: Option<usize>,
+    /// The graphical subtitle cue the textures below were built for, and the
+    /// textures themselves (one per rectangle). Rebuilt only when the cue
+    /// changes, not on every frame.
+    pub subtitle_key: Option<(u64, usize)>,
+    /// Uploaded textures for the current graphical subtitle cue.
+    pub subtitle_textures: Vec<egui::TextureHandle>,
     /// Row the user highlighted in the playlist.
     ///
     /// Deliberately *not* the playlist's "current" entry: clicking a row is a
@@ -545,6 +554,19 @@ pub struct UiState {
     pub ffmpeg_config: String,
     /// Cached snapshot-saved message.
     pub last_snapshot: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for UiState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Not every field: several are large or not `Debug` (textures), and the
+        // only use of this impl is a convenient label in diagnostics.
+        f.debug_struct("UiState")
+            .field("sidebar_visible", &self.sidebar_visible)
+            .field("sidebar_tab", &self.sidebar_tab)
+            .field("overlay", &self.overlay)
+            .field("fullscreen", &self.fullscreen)
+            .finish_non_exhaustive()
+    }
 }
 
 /// A rolling view of the frame pipeline as the interface sees it.
@@ -655,6 +677,8 @@ impl Default for UiState {
             canvas: CanvasView::new(),
             picture: None,
             last_lyric: None,
+            subtitle_key: None,
+            subtitle_textures: Vec::new(),
             playlist_selection: None,
             overlay: Overlay::None,
             settings_tab: SettingsTab::default(),

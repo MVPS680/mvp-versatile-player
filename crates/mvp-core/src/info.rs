@@ -100,6 +100,9 @@ pub struct SubtitleStreamInfo {
     pub title: Option<String>,
     /// `true` for text subtitle codecs we can render as text.
     pub is_text: bool,
+    /// `true` for graphical subtitle codecs (PGS/VobSub/DVB) we can render as a
+    /// bitmap overlay.
+    pub is_bitmap: bool,
     /// `true` when FFmpeg flags this as the container's default track.
     pub is_default: bool,
     /// `true` for tracks that are forced (only shown for foreign dialogue).
@@ -107,6 +110,15 @@ pub struct SubtitleStreamInfo {
 }
 
 impl SubtitleStreamInfo {
+    /// `true` when the player can actually draw this track.
+    ///
+    /// Text tracks are rendered as text; graphical ones are decoded to bitmaps
+    /// and drawn as an overlay. Anything else (for example a teletext codec
+    /// with no bitmap decoder) is listed but cannot be selected.
+    pub fn is_renderable(&self) -> bool {
+        self.is_text || self.is_bitmap
+    }
+
     /// Menu label for this track.
     pub fn display_name(&self) -> String {
         match (&self.title, &self.language) {
@@ -400,6 +412,7 @@ pub fn describe(ictx: &ffmpeg::format::context::Input, path: &Path, kind: MediaK
                     language,
                     title,
                     is_text: is_text_subtitle_codec(codec_id),
+                    is_bitmap: is_bitmap_subtitle_codec(codec_id),
                     is_default: stream.disposition().contains(Disposition::DEFAULT),
                     is_forced: stream.disposition().contains(Disposition::FORCED),
                 });
@@ -492,6 +505,22 @@ pub fn is_text_subtitle_codec(id: ffmpeg::codec::Id) -> bool {
             return false;
         }
         ((*desc).props & ffmpeg::ffi::AV_CODEC_PROP_TEXT_SUB) != 0
+    }
+}
+
+/// `true` when FFmpeg decodes this codec into a bitmap we can draw directly.
+///
+/// PGS, VobSub, DVB and XSUB live here. No OCR is involved: the decoded
+/// rectangles are painted over the picture as they are.
+pub fn is_bitmap_subtitle_codec(id: ffmpeg::codec::Id) -> bool {
+    // SAFETY: `avcodec_descriptor_get` returns a pointer into a static table
+    // (or NULL) and never retains the argument.
+    unsafe {
+        let desc = ffmpeg::ffi::avcodec_descriptor_get(id.into());
+        if desc.is_null() {
+            return false;
+        }
+        ((*desc).props & ffmpeg::ffi::AV_CODEC_PROP_BITMAP_SUB) != 0
     }
 }
 

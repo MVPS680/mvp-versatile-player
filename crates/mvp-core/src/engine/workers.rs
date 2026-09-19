@@ -15,6 +15,7 @@ use ffmpeg_next as ffmpeg;
 use super::queue::{AudioMsg, PacketMsg, VideoMsg};
 use super::{EngineConfig, EngineEvent, FlushRequest, MediaSource, PlaybackState, Shared};
 use crate::audio::AudioSink;
+use crate::bitmap_subtitle::{self, BitmapCue, BitmapSubtitle};
 use crate::dsp::TimeStretcher;
 use crate::info;
 use crate::util::MediaKind;
@@ -74,6 +75,19 @@ const RESYNC_LAG: f64 = 0.25;
 /// Covers the resampler's own filter delay plus one source frame, so a rate
 /// conversion never has to buffer audio it could have handed over right away.
 const RESAMPLE_MARGIN: usize = 4096;
+
+/// How far behind the playhead a graphical subtitle cue is kept.
+///
+/// The decoder runs a little ahead of the clock, so a cue that just ended is
+/// still needed to answer "what was on screen a moment ago"; anything older
+/// than this is only taking up memory.
+const BITMAP_WINDOW_BEHIND: f64 = 2.0;
+
+/// Hard ceiling on palette-index bytes held by the graphical subtitle window.
+const BITMAP_WINDOW_BYTES: usize = 32 * 1024 * 1024;
+
+/// Hard ceiling on cues held by the graphical subtitle window.
+const BITMAP_WINDOW_CUES: usize = 64;
 
 /// Entry point for the demuxer thread. Spawns the decoder threads.
 pub(super) fn run_demuxer(shared: Arc<Shared>, source: MediaSource, config: EngineConfig) {
@@ -135,14 +149,7 @@ fn input_options(source: &MediaSource) -> ffmpeg::Dictionary {
 
 /// Owned copy of a stream's codec parameters, safe to move to another thread.
 fn own_parameters<'a>(stream: &ffmpeg::Stream<'a>) -> ffmpeg::codec::Parameters {
-    let mut params = ffmpeg::codec::Parameters::new();
-    // SAFETY: `params` is a freshly allocated AVCodecParameters and the source
-    // pointer belongs to a live stream of a live format context. The copy makes
-    // the destination fully independent, including its extradata.
-    unsafe {
-        ffmpeg::ffi::avcodec_parameters_copy(params.as_mut_ptr(), stream.parameters().as_ptr());
-    }
-    params
+    bitmap_subtitle::own_parameters(stream)
 }
 
 /// `true` when the demuxer must give up what it is doing right now.
@@ -364,27 +371,36 @@ fn demuxer_main(
     }
 
     // ---- embedded subtitle decoder ----------------------------------------
+    //
+    // Text and graphical subtitle codecs share one decoder; they differ only in
+    // how the decoded subtitle is turned into something the interface can draw.
+    // The third tuple slot remembers which of the two this track is.
     let mut subtitle_decoder = match subtitle_stream {
-        Some(index) if info::is_text_subtitle_codec(stream_codec_id(&ictx, index)) => {
-            match open_subtitle_decoder(&ictx, index) {
-                Ok(decoder) => Some((index, decoder)),
-                Err(err) => {
-                    log::warn!("无法打开内嵌字幕解码器: {err}");
-                    None
-                }
+        Some(index) => match open_subtitle_decoder(&ictx, index) {
+            Ok(decoder) => Some((
+                index,
+                decoder,
+                !info::is_text_subtitle_codec(stream_codec_id(&ictx, index)),
+            )),
+            Err(err) => {
+                log::warn!("无法打开内嵌字幕解码器: {err}");
+                None
             }
-        }
-        Some(_) => {
-            let _ = shared.event_tx.send(EngineEvent::Error(
-                "该字幕为图形字幕（如 PGS/DVD），暂不支持显示".into(),
-            ));
-            None
-        }
+        },
         None => None,
     };
     let mut local_subtitle_request = shared.subtitle_track.load(Ordering::Relaxed);
     let mut embedded_cues: Vec<Cue> = Vec::new();
     let mut last_published = 0usize;
+    // Graphical cues are pruned as they pass instead of being accumulated whole:
+    // a feature film can carry a couple of thousand bitmaps, and only the one on
+    // screen (plus its immediate neighbours) is ever needed.
+    let mut embedded_bitmaps: Vec<BitmapCue> = Vec::new();
+    let mut bitmap_canvas: Option<(u32, u32)> = subtitle_stream.and_then(|index| {
+        ictx.streams()
+            .find(|stream| stream.index() == index)
+            .and_then(|stream| bitmap_subtitle::stream_size(&stream))
+    });
 
     // ---- main demux loop ---------------------------------------------------
     if config.autoplay {
@@ -435,6 +451,24 @@ fn demuxer_main(
             // may hold a second's worth of stale data, and waiting for a slot in
             // them would stall the seek behind it.
             shared.request_flush(generation, target);
+            // The audio worker resets this when it acts on the flush, but the
+            // demuxer can reach the end of the file and consult `handle_eof`
+            // before that happens — a stale `true` from the previous run would
+            // then end playback the instant a seek landed. Clear it where the
+            // seek is published, so "ended" can never survive a seek.
+            shared.audio_ended.store(false, Ordering::Relaxed);
+            // Graphical cues belong to the position being left and the window is
+            // bounded, so they are dropped and decoded again from the new one.
+            // Text cues are accumulated whole and can stay. The subtitle decoder
+            // is flushed with them: PGS carries a palette and object table from
+            // one composition to the next, and those belong to the old position.
+            if shared.external_bitmap.lock().is_none() {
+                embedded_bitmaps.clear();
+                *shared.bitmap_subtitle.lock() = None;
+            }
+            if let Some((_, decoder, _)) = subtitle_decoder.as_mut() {
+                decoder.flush();
+            }
             // A seek that fails because a *newer* one arrived is not a broken
             // file: the interrupt callback returns as soon as another request is
             // in the slot, which is what fast scrubbing looks like from inside
@@ -493,17 +527,28 @@ fn demuxer_main(
             local_subtitle_request = wanted_sub;
             let new_index = pick_subtitle(wanted_sub, &media_info.subtitles);
             subtitle_decoder = new_index.and_then(|index| {
-                if info::is_text_subtitle_codec(stream_codec_id(&ictx, index)) {
-                    open_subtitle_decoder(&ictx, index)
-                        .map_err(|e| log::warn!("字幕解码器打开失败: {e}"))
-                        .ok()
-                        .map(|d| (index, d))
-                } else {
-                    None
-                }
+                open_subtitle_decoder(&ictx, index)
+                    .map_err(|e| log::warn!("字幕解码器打开失败: {e}"))
+                    .ok()
+                    .map(|decoder| {
+                        (
+                            index,
+                            decoder,
+                            !info::is_text_subtitle_codec(stream_codec_id(&ictx, index)),
+                        )
+                    })
+            });
+            bitmap_canvas = new_index.and_then(|index| {
+                ictx.streams()
+                    .find(|stream| stream.index() == index)
+                    .and_then(|stream| bitmap_subtitle::stream_size(&stream))
             });
             embedded_cues.clear();
+            embedded_bitmaps.clear();
             last_published = 0;
+            if shared.external_bitmap.lock().is_none() {
+                *shared.bitmap_subtitle.lock() = None;
+            }
             publish_subtitles(shared, &embedded_cues, &mut last_published, true);
             continue;
         }
@@ -567,9 +612,20 @@ fn demuxer_main(
                     continue;
                 }
             }
-        } else if let Some((sub_index, decoder)) = subtitle_decoder.as_mut() {
+        } else if let Some((sub_index, decoder, is_bitmap)) = subtitle_decoder.as_mut() {
             if index == *sub_index {
-                if let Some(cue) = decode_subtitle_packet(decoder, &packet, time_base, start_offset)
+                if *is_bitmap {
+                    if let Some(cue) =
+                        bitmap_subtitle::decode_packet(decoder, &packet, time_base, start_offset)
+                    {
+                        push_bitmap_cue(&mut embedded_bitmaps, cue);
+                        let floor = shared.clock.now() - BITMAP_WINDOW_BEHIND;
+                        bitmap_subtitle::prune(&mut embedded_bitmaps, floor);
+                        cap_bitmap_window(&mut embedded_bitmaps);
+                        publish_bitmap_subtitles(shared, &embedded_bitmaps, bitmap_canvas);
+                    }
+                } else if let Some(cue) =
+                    decode_subtitle_packet(decoder, &packet, time_base, start_offset)
                 {
                     embedded_cues.push(cue);
                     publish_subtitles(shared, &embedded_cues, &mut last_published, false);
@@ -636,12 +692,15 @@ fn handle_eof(
     let duration = *shared.duration.lock();
     let now = shared.clock.now();
     let video_idle = shared.video_queue.lock().is_empty();
-    let pending_frames = shared
-        .info
-        .lock()
-        .as_ref()
-        .map(|i| i.video.first().map(|v| v.frames).unwrap_or(0))
-        .unwrap_or(0);
+    let (pending_frames, audio_only) = {
+        let info = shared.info.lock();
+        let pending = info
+            .as_ref()
+            .map(|i| i.video.first().map(|v| v.frames).unwrap_or(0))
+            .unwrap_or(0);
+        let audio_only = info.as_ref().map(|i| i.video.is_empty()).unwrap_or(false);
+        (pending, audio_only)
+    };
     let audio_idle = shared
         .audio
         .lock()
@@ -650,7 +709,23 @@ fn handle_eof(
         .unwrap_or(true);
 
     let finished = if duration > 0.0 {
-        now >= duration - 0.10 || (video_idle && audio_idle && now >= duration - 1.0)
+        if audio_only {
+            // A sound file is over when its audio has actually been played out,
+            // not when the wall clock reaches the file's nominal length. The
+            // clock is wall time and knows nothing about the samples: a seek
+            // that lands late, or metadata that runs past the last sample,
+            // would otherwise keep the bar moving through silence after the
+            // sound had already stopped. Draining the queue *and* the decoder
+            // sitting at EOF is what "the sound is finished" means, and the bar
+            // then stops where the sound stopped.
+            match shared.audio.lock().as_ref() {
+                Some(a) => shared.audio_ended.load(Ordering::Relaxed) && a.queued_chunks() == 0,
+                // No device: nothing will ever play, so fall back to the clock.
+                None => now >= duration - 0.10,
+            }
+        } else {
+            now >= duration - 0.10
+        }
     } else {
         // Live streams have no duration; only stop when the stream really ended.
         video_idle && audio_idle && pending_frames == 0
@@ -745,10 +820,13 @@ fn seek_container(
          ({:.3}s in the container)",
         timestamp as f64 / f64::from(ffmpeg::ffi::AV_TIME_BASE)
     );
+    // No `avformat_flush` here. It looks harmless — "discard the read-ahead" —
+    // but on a plain MP3 it rewinds the demuxer to the *start of the file*:
+    // `avformat_seek_file` followed by a read hands back the packet at 160s,
+    // while the same seek followed by `avformat_flush` hands back the packet at
+    // 0s. The seek is all that is needed; the demuxer has already dropped the
+    // buffers that belonged to the old position.
     ictx.seek(timestamp, ..timestamp)?;
-    // SAFETY: `ictx` owns a live AVFormatContext; avformat_flush only discards
-    // the demuxer's internal read-ahead buffer.
-    unsafe { ffmpeg::ffi::avformat_flush(ictx.as_mut_ptr()) };
     Ok(())
 }
 
@@ -1494,6 +1572,12 @@ fn run_audio_decoder(
     let mut frame = ffmpeg::frame::Audio::empty();
     let mut generation = shared.generation.load(Ordering::SeqCst);
     let mut last_pts = 0.0f64;
+    // Position a flush moved the playhead to. Like the video decoder, the audio
+    // decoder has to throw away the samples that belong before it: the container
+    // seek snaps back to an earlier point — for some formats, to the beginning of
+    // the file — and without this the sound would replay from there while the
+    // clock and the picture are already at the target.
+    let mut seek_target: Option<f64> = None;
     let mut scratch: Vec<f32> = Vec::new();
 
     loop {
@@ -1527,6 +1611,7 @@ fn run_audio_decoder(
                 &mut last_pts,
                 &mut resampler,
                 &mut stretcher,
+                &mut seek_target,
                 request,
             );
         }
@@ -1555,6 +1640,7 @@ fn run_audio_decoder(
                 &mut last_pts,
                 &mut resampler,
                 &mut stretcher,
+                &mut seek_target,
                 request,
             );
         }
@@ -1582,6 +1668,7 @@ fn run_audio_decoder(
                     device_rate,
                     time_base,
                     start_offset,
+                    &mut seek_target,
                     true,
                 );
                 shared.audio_ended.store(true, Ordering::Relaxed);
@@ -1606,6 +1693,7 @@ fn run_audio_decoder(
                     device_rate,
                     time_base,
                     start_offset,
+                    &mut seek_target,
                     false,
                 );
             }
@@ -1627,10 +1715,12 @@ fn reset_audio_session(
     last_pts: &mut f64,
     resampler: &mut Option<ffmpeg::software::resampling::Context>,
     stretcher: &mut TimeStretcher,
+    seek_target: &mut Option<f64>,
     request: FlushRequest,
 ) {
     *generation = request.generation;
     *last_pts = request.target;
+    *seek_target = Some(request.target);
     decoder.flush();
     *resampler = None;
     stretcher.reset();
@@ -1653,6 +1743,7 @@ fn drain_audio(
     device_rate: u32,
     time_base: f64,
     start_offset: f64,
+    seek_target: &mut Option<f64>,
     flushing: bool,
 ) {
     // Keep the stretcher in step with the UI slider.
@@ -1687,6 +1778,24 @@ fn drain_audio(
         let input_samples = frame.samples();
         if input_samples == 0 {
             continue;
+        }
+
+        // Throw away the audio that belongs before a seek target, exactly as the
+        // video decoder does. The container seek snaps back to an earlier point
+        // (for a plain MP3, to the start of the file), so without this the sound
+        // would be replayed from there while the clock and the picture are
+        // already at the target — the audio then runs out early and playback
+        // ends before the bar has reached the end.
+        if let Some(target) = *seek_target {
+            let frame_secs = input_samples as f64 / frame.rate().max(1) as f64;
+            if pts + frame_secs <= target {
+                continue;
+            }
+            // This frame reaches the target: stop skipping, keep the whole
+            // frame. Trimming it to the sample would be finer, but the residual
+            // is under one frame (a few milliseconds) and the video decoder
+            // makes the same trade.
+            *seek_target = None;
         }
 
         // (Re)build the resampler whenever the source format changes, which
@@ -1819,43 +1928,49 @@ fn decode_subtitle_packet(
     start_offset: f64,
 ) -> Option<Cue> {
     let mut subtitle = ffmpeg::Subtitle::new();
-    match decoder.decode(packet, &mut subtitle) {
-        Ok(true) => {}
-        _ => return None,
-    }
-
-    let base = match subtitle.pts().or_else(|| packet.pts()) {
-        Some(pts) => pts as f64 * time_base - start_offset,
-        None => return None,
-    };
-    let start = base + subtitle.start() as f64 / 1000.0;
-    let end = base + subtitle.end() as f64 / 1000.0;
-
-    let mut text = String::new();
-    for rect in subtitle.rects() {
-        let piece: String = match rect {
-            ffmpeg::subtitle::Rect::Text(t) => t.get().to_string(),
-            ffmpeg::subtitle::Rect::Ass(a) => a.get().to_string(),
-            _ => continue,
-        };
-        if piece.trim().is_empty() {
-            continue;
-        }
-        if !text.is_empty() {
-            text.push('\n');
-        }
-        text.push_str(&piece);
-    }
-    if text.trim().is_empty() {
+    if !matches!(decoder.decode(packet, &mut subtitle), Ok(true)) {
+        bitmap_subtitle::free_subtitle(&mut subtitle);
         return None;
     }
 
-    Some(Cue {
-        start,
-        end: if end > start { end } else { start + 2.0 },
-        text: strip_ass_markup(&text),
-        style: Default::default(),
-    })
+    let cue = (|| {
+        let base = match subtitle.pts().or_else(|| packet.pts()) {
+            Some(pts) => pts as f64 * time_base - start_offset,
+            None => return None,
+        };
+        let start = base + subtitle.start() as f64 / 1000.0;
+        let end = base + subtitle.end() as f64 / 1000.0;
+
+        let mut text = String::new();
+        for rect in subtitle.rects() {
+            let piece: String = match rect {
+                ffmpeg::subtitle::Rect::Text(t) => t.get().to_string(),
+                ffmpeg::subtitle::Rect::Ass(a) => a.get().to_string(),
+                _ => continue,
+            };
+            if piece.trim().is_empty() {
+                continue;
+            }
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&piece);
+        }
+        if text.trim().is_empty() {
+            return None;
+        }
+
+        Some(Cue {
+            start,
+            end: if end > start { end } else { start + 2.0 },
+            text: strip_ass_markup(&text),
+            style: Default::default(),
+        })
+    })();
+    // The decoder allocated the text rectangles; `ffmpeg-next`'s wrapper has no
+    // `Drop`, so they are released here before the subtitle goes out of scope.
+    bitmap_subtitle::free_subtitle(&mut subtitle);
+    cue
 }
 
 /// Reduce an ASS/SSA event text to plain text for our own renderer.
@@ -1904,7 +2019,7 @@ fn publish_subtitles(
     const BATCH: usize = 24;
 
     // An external side-car always wins over what is muxed into the container.
-    if shared.external_subtitle.lock().is_some() {
+    if shared.has_external_subtitle() {
         return;
     }
     // With nothing to show there is nothing to publish; switching a track off
@@ -1928,4 +2043,68 @@ fn publish_subtitles(
     });
     *shared.subtitle.lock() = Some(Arc::clone(&subtitle));
     let _ = shared.event_tx.send(EngineEvent::SubtitleChanged(subtitle));
+}
+
+/// Add a decoded graphical cue to the sliding window.
+///
+/// A PGS composition with no rectangles is a "clear": it closes whatever was on
+/// screen and shows nothing itself. A cue with no duration of its own is closed
+/// at the next cue's start, or given a short default if it is the last one.
+fn push_bitmap_cue(cues: &mut Vec<BitmapCue>, cue: BitmapCue) {
+    if cue.rects.is_empty() {
+        if let Some(last) = cues.last_mut() {
+            if cue.start > last.start {
+                last.end = cue.start;
+            }
+        }
+        return;
+    }
+    if let Some(last) = cues.last_mut() {
+        if last.end <= last.start {
+            last.end = if cue.start > last.start {
+                cue.start
+            } else {
+                last.start + 4.0
+            };
+        }
+    }
+    let mut cue = cue;
+    if cue.end <= cue.start {
+        cue.end = cue.start + 4.0;
+    }
+    cues.push(cue);
+}
+
+/// Drop the oldest graphical cues until the window is inside its byte and count
+/// budgets, so a pathological track cannot grow the player's memory forever.
+fn cap_bitmap_window(cues: &mut Vec<BitmapCue>) {
+    while cues.len() > BITMAP_WINDOW_CUES || bitmap_subtitle::byte_size(cues) > BITMAP_WINDOW_BYTES
+    {
+        if cues.is_empty() {
+            break;
+        }
+        cues.remove(0);
+    }
+}
+
+/// Publish the graphical cue window, unless an external subtitle is in charge.
+fn publish_bitmap_subtitles(
+    shared: &Arc<Shared>,
+    cues: &[BitmapCue],
+    canvas: Option<(u32, u32)>,
+) {
+    if shared.has_external_subtitle() {
+        return;
+    }
+    if cues.is_empty() {
+        return;
+    }
+    let track = Arc::new(BitmapSubtitle {
+        cues: cues.to_vec(),
+        canvas,
+    });
+    *shared.bitmap_subtitle.lock() = Some(Arc::clone(&track));
+    let _ = shared
+        .event_tx
+        .send(EngineEvent::BitmapSubtitleChanged(track));
 }

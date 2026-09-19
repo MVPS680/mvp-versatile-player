@@ -361,11 +361,23 @@ fn wheel_volume(app: &mut PlayerApp, scroll: f32) {
     }
 }
 
-fn draw_subtitles(app: &PlayerApp, ui: &mut Ui, rect: &Rect, tokens: &Tokens) {
+fn draw_subtitles(app: &mut PlayerApp, ui: &mut Ui, rect: &Rect, tokens: &Tokens) {
     let time = app.engine.display_position() - app.settings.subtitle_delay;
-    let Some(cue) = app.engine.active_subtitle(time) else {
+    if let Some(cue) = app.engine.active_subtitle(time) {
+        draw_text_subtitle(app, ui, rect, tokens, &cue);
         return;
-    };
+    }
+    draw_bitmap_subtitles(app, ui, rect, time);
+}
+
+/// Paint a text cue over the picture.
+fn draw_text_subtitle(
+    app: &PlayerApp,
+    ui: &mut Ui,
+    rect: &Rect,
+    tokens: &Tokens,
+    cue: &mvp_subtitle::Cue,
+) {
     let text = cue.text.trim();
     if text.is_empty() {
         return;
@@ -404,6 +416,80 @@ fn draw_subtitles(app: &PlayerApp, ui: &mut Ui, rect: &Rect, tokens: &Tokens) {
     }
     painter.galley(origin, galley, color);
     let _ = tokens;
+}
+
+/// Paint a graphical (bitmap) subtitle cue over the picture.
+///
+/// The cue's coordinates live in the subtitle stream's own canvas — the video
+/// resolution for PGS, the DVD frame size for VobSub — so they are scaled into
+/// the rectangle the picture actually occupies. The textures are cached and
+/// only rebuilt when the active cue changes.
+fn draw_bitmap_subtitles(app: &mut PlayerApp, ui: &mut Ui, rect: &Rect, time: f64) {
+    let source = app
+        .engine
+        .info()
+        .and_then(|info| info.video.first().map(|v| (v.width, v.height)))
+        .or_else(|| (app.uploaded_size.0 > 1).then_some(app.uploaded_size));
+
+    let Some(track) = app.engine.bitmap_subtitle() else {
+        app.ui.subtitle_key = None;
+        app.ui.subtitle_textures.clear();
+        return;
+    };
+    let Some(cue) = track.active_at(time) else {
+        app.ui.subtitle_key = None;
+        app.ui.subtitle_textures.clear();
+        return;
+    };
+
+    let key = (cue.start.to_bits(), cue.rects.len());
+    if app.ui.subtitle_key != Some(key) {
+        let mut textures = Vec::with_capacity(cue.rects.len());
+        for (index, bitmap) in cue.rects.iter().enumerate() {
+            let image = egui::ColorImage::from_rgba_unmultiplied(
+                [bitmap.width as usize, bitmap.height as usize],
+                &bitmap.rgba(),
+            );
+            textures.push(ui.ctx().load_texture(
+                format!("mvp-subtitle-{}-{index}", cue.start),
+                image,
+                egui::TextureOptions::LINEAR,
+            ));
+        }
+        app.ui.subtitle_key = Some(key);
+        app.ui.subtitle_textures = textures;
+    }
+
+    // The coordinate space the rectangles are expressed in. PGS does not state
+    // one because its coordinates are already video pixels; VobSub states the
+    // DVD frame size. Falling back to the video's own size covers the first.
+    let (canvas_w, canvas_h) = track
+        .canvas
+        .filter(|(w, h)| *w > 0 && *h > 0)
+        .or(source)
+        .map(|(w, h)| (w as f32, h as f32))
+        .unwrap_or((0.0, 0.0));
+    if canvas_w <= 0.0 || canvas_h <= 0.0 {
+        return;
+    }
+    let scale_x = rect.width() / canvas_w;
+    let scale_y = rect.height() / canvas_h;
+
+    let painter = ui.painter();
+    let full_uv = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+    for (bitmap, texture) in cue.rects.iter().zip(&app.ui.subtitle_textures) {
+        let destination = Rect::from_min_size(
+            egui::pos2(
+                rect.left() + bitmap.x as f32 * scale_x,
+                rect.top() + bitmap.y as f32 * scale_y,
+            ),
+            Vec2::new(
+                bitmap.width as f32 * scale_x,
+                bitmap.height as f32 * scale_y,
+            ),
+        );
+        painter.image(texture.id(), destination, full_uv, Color32::WHITE);
+    }
 }
 
 /// Compute where the picture goes inside `area`.

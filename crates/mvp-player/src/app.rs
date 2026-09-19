@@ -504,7 +504,7 @@ impl PlayerApp {
         let Some(sidecar) = self.pending_sidecar.take() else {
             return;
         };
-        let has_embedded = info.subtitles.iter().any(|stream| stream.is_text);
+        let has_embedded = info.subtitles.iter().any(|stream| stream.is_renderable());
         if has_embedded {
             log::info!("使用内嵌字幕，忽略同名字幕文件: {}", sidecar.display());
         } else {
@@ -539,7 +539,15 @@ impl PlayerApp {
     }
 
     /// Load a subtitle file into the engine.
+    ///
+    /// Graphical side-cars (`.sup`, VobSub `.idx`/`.sub`) are decoded to bitmaps
+    /// and handed to the engine as a picture track; everything else goes through
+    /// the text parser.
     pub fn load_subtitle_file(&mut self, path: &Path) {
+        if mvp_core::bitmap_subtitle::is_graphic_subtitle(path) {
+            self.load_graphic_subtitle_file(path);
+            return;
+        }
         match std::fs::read(path) {
             Ok(bytes) => {
                 let subtitle = Subtitle::parse(&bytes);
@@ -562,6 +570,32 @@ impl PlayerApp {
                 )));
             }
             Err(err) => self.error(format!("无法读取字幕文件: {err}")),
+        }
+    }
+
+    /// Decode a graphical side-car and hand it to the engine.
+    fn load_graphic_subtitle_file(&mut self, path: &Path) {
+        match mvp_core::bitmap_subtitle::decode_external(path) {
+            Ok(track) => {
+                if track.is_empty() {
+                    self.toast(Toast::warning(format!(
+                        "图形字幕没有可用内容: {}",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    )));
+                    return;
+                }
+                let count = track.len();
+                self.engine
+                    .set_external_bitmap_subtitle(Some(Arc::new(track)));
+                self.settings.last_subtitle_dir =
+                    path.parent().map(std::path::Path::to_path_buf);
+                self.store.mark_dirty();
+                self.toast(Toast::success(format!(
+                    "已加载图形字幕 · {count} 条 · {}",
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                )));
+            }
+            Err(err) => self.error(format!("无法解码图形字幕: {err}")),
         }
     }
 
@@ -771,6 +805,7 @@ impl PlayerApp {
                 }
                 EngineEvent::StateChanged(_) => {}
                 EngineEvent::SubtitleChanged(_) => {}
+                EngineEvent::BitmapSubtitleChanged(_) => {}
                 EngineEvent::Error(message) => {
                     // A missing audio device is worth a warning, not an error
                     // banner: the video is still perfectly watchable.
@@ -1524,18 +1559,21 @@ impl PlayerApp {
         if on
             && self.engine.subtitle_track().is_none()
             && self.engine.subtitle().is_none()
-            && self.has_embedded_text_subtitles()
+            && self.engine.bitmap_subtitle().is_none()
+            && self.has_embedded_subtitles()
         {
             self.engine.set_subtitle_track_auto();
         }
         self.store.mark_dirty();
     }
 
-    /// `true` when the open file carries a text subtitle track.
-    fn has_embedded_text_subtitles(&self) -> bool {
-        self.engine
-            .info()
-            .is_some_and(|info| info.subtitles.iter().any(|stream| stream.is_text))
+    /// `true` when the open file carries a subtitle track we can draw.
+    fn has_embedded_subtitles(&self) -> bool {
+        self.engine.info().is_some_and(|info| {
+            info.subtitles
+                .iter()
+                .any(mvp_core::SubtitleStreamInfo::is_renderable)
+        })
     }
 
     /// Show an embedded subtitle track, dropping any external file in its way.
@@ -1544,6 +1582,7 @@ impl PlayerApp {
     /// without removing it the click would appear to do nothing at all.
     pub fn select_embedded_subtitle(&mut self, index: usize) {
         self.engine.set_external_subtitle(None);
+        self.engine.set_external_bitmap_subtitle(None);
         // Re-selecting the *same* index is a no-op for the demuxer, so the
         // selection is cleared first to make it notice and republish.
         self.engine.set_subtitle_track(None);
@@ -1557,11 +1596,12 @@ impl PlayerApp {
     /// Any embedded track that was selected underneath becomes visible again,
     /// which is what "remove the side-car" should mean.
     pub fn remove_external_subtitle(&mut self) {
-        if self.engine.subtitle().is_none() {
+        if !self.engine.has_external_subtitle() {
             return;
         }
         let embedded = self.engine.subtitle_track();
         self.engine.set_external_subtitle(None);
+        self.engine.set_external_bitmap_subtitle(None);
         if let Some(index) = embedded {
             self.engine.set_subtitle_track(None);
             self.engine.set_subtitle_track(Some(index));
@@ -1759,11 +1799,13 @@ fn find_sidecar_subtitle(media: &Path) -> Option<PathBuf> {
     let languages = ["zh", "chs", "cht", "sc", "tc", "eng", "en"];
     let mut candidates: Vec<PathBuf> = Vec::new();
     for lang in languages {
-        for ext in ["srt", "ass", "ssa", "vtt", "sub"] {
+        for ext in ["srt", "ass", "ssa", "vtt", "sub", "sup"] {
             candidates.push(dir.join(format!("{stem}.{lang}.{ext}")));
         }
     }
-    for ext in ["srt", "ass", "ssa", "vtt"] {
+    // `.idx` comes before `.sub` so a VobSub pair is opened through its index,
+    // which is the half that carries the timestamps and palette.
+    for ext in ["srt", "ass", "ssa", "vtt", "sup", "idx", "sub"] {
         candidates.push(dir.join(format!("{stem}.{ext}")));
     }
     candidates.into_iter().find(|candidate| candidate.is_file())

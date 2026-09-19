@@ -150,8 +150,11 @@ so callers need only depend on `mvp-core`.
 - "Clean up" unused declared dependencies; several are intentionally kept.
 - Claim JXL/AVIF image support. The `image` crate is compiled without those
   decoders even though the README and `format_label` mention them.
-- Add video-track switching or PGS/VobSub rendering; both are conscious
-  non-features that report themselves instead of failing silently.
+- Add video-track switching. It is a conscious non-feature that reports itself
+  instead of failing silently. (Graphical subtitles — PGS/VobSub/DVB, embedded
+  and side-car — *are* supported: decoded to bitmaps in `mvp-core/src/bitmap_subtitle.rs`
+  and drawn as textures by `ui/canvas.rs`; do not reintroduce an "unsupported"
+  message for them.)
 - Band `sws_scale` to parallelise it. It is stateful across calls; a measured
   attempt produced wrong pixels from the cut onwards. The exact route is
   `sws_frame_start` / `sws_send_slice` / `sws_receive_slice`.

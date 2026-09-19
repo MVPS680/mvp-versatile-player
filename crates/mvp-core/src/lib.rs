@@ -17,6 +17,7 @@
 //!   error state, because damaged files are a fact of life.
 
 pub mod audio;
+pub mod bitmap_subtitle;
 pub mod dsp;
 pub mod engine;
 pub mod error;
@@ -30,6 +31,7 @@ pub mod video;
 pub use engine::{
     Clock, Engine, EngineConfig, EngineEvent, EngineSnapshot, MediaSource, PlaybackState,
 };
+pub use bitmap_subtitle::{BitmapCue, BitmapRect, BitmapSubtitle};
 pub use error::{MediaError, Result};
 pub use hdr::{DoviConfig, HdrInfo, HdrKind, ToneMapper};
 pub use image_view::{FitMode, ImageDoc, ImageFrame, ImageView};

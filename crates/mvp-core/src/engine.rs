@@ -29,6 +29,7 @@ use ffmpeg_next as ffmpeg;
 use parking_lot::{Condvar, Mutex};
 
 use crate::audio::AudioSink;
+use crate::bitmap_subtitle::BitmapSubtitle;
 use crate::error::{MediaError, Result};
 use crate::info::MediaInfo;
 use crate::util::MsEwma;
@@ -143,6 +144,8 @@ pub enum EngineEvent {
     StateChanged(PlaybackState),
     /// Subtitle cues became available (embedded or side-car).
     SubtitleChanged(Arc<Subtitle>),
+    /// Graphical (bitmap) subtitle cues became available.
+    BitmapSubtitleChanged(Arc<BitmapSubtitle>),
     /// The end of the media was reached.
     Ended,
     /// A non-fatal or fatal error occurred; the string is user presentable.
@@ -313,6 +316,10 @@ pub(crate) struct Shared {
     pub pool: FramePool,
     pub subtitle: Mutex<Option<Arc<Subtitle>>>,
     pub external_subtitle: Mutex<Option<Arc<Subtitle>>>,
+    /// Graphical cues currently on screen (embedded or external).
+    pub bitmap_subtitle: Mutex<Option<Arc<BitmapSubtitle>>>,
+    /// The external graphical subtitle in force, if any.
+    pub external_bitmap: Mutex<Option<Arc<BitmapSubtitle>>>,
     pub audio: Mutex<Option<Arc<AudioSink>>>,
     pub event_tx: Sender<EngineEvent>,
 
@@ -382,6 +389,8 @@ impl Shared {
             pool: FramePool::new(config.buffer_pool_bytes),
             subtitle: Mutex::new(None),
             external_subtitle: Mutex::new(None),
+            bitmap_subtitle: Mutex::new(None),
+            external_bitmap: Mutex::new(None),
             audio: Mutex::new(None),
             event_tx,
             generation: AtomicU64::new(1),
@@ -477,6 +486,14 @@ impl Shared {
         self.audio.lock().clone()
     }
 
+    /// `true` when an external subtitle file (text or graphical) is in force.
+    ///
+    /// An external side-car always wins over what is muxed into the container,
+    /// and the two kinds are mutually exclusive: loading one clears the other.
+    pub fn has_external_subtitle(&self) -> bool {
+        self.external_subtitle.lock().is_some() || self.external_bitmap.lock().is_some()
+    }
+
     /// `true` when the video worker should stop what it is doing right now.
     pub fn video_flush_pending(&self) -> bool {
         self.video_flush.lock().is_some()
@@ -529,6 +546,8 @@ impl Engine {
         *self.shared.duration.lock() = 0.0;
         *self.shared.subtitle.lock() = None;
         *self.shared.external_subtitle.lock() = None;
+        *self.shared.bitmap_subtitle.lock() = None;
+        *self.shared.external_bitmap.lock() = None;
         *self.shared.seek_request.lock() = None;
         *self.shared.seek_target.lock() = None;
         self.shared.generation.store(1, Ordering::SeqCst);
@@ -836,13 +855,21 @@ impl Engine {
             None => TRACK_OFF,
         };
         self.shared.subtitle_track.store(value, Ordering::Relaxed);
-        // Turning embedded subtitles off must also drop the decoded cues.
+        // Turning embedded subtitles off must also drop the decoded cues, of
+        // both kinds: text and graphical tracks share one selector.
         if index.is_none() {
             *self.shared.subtitle.lock() = None;
+            *self.shared.bitmap_subtitle.lock() = None;
             let _ = self
                 .shared
                 .event_tx
                 .send(EngineEvent::SubtitleChanged(Arc::new(Subtitle::empty())));
+            let _ = self
+                .shared
+                .event_tx
+                .send(EngineEvent::BitmapSubtitleChanged(Arc::new(
+                    BitmapSubtitle::empty(),
+                )));
         }
     }
 
@@ -858,38 +885,66 @@ impl Engine {
 
     /// Index of the subtitle stream actually in use.
     ///
-    /// Only text streams can be shown, so "auto" resolves to the file's default
-    /// text track and never to a bitmap one (PGS/VobSub), which would decode
-    /// into nothing.
+    /// Only streams we can draw are offered: text tracks and graphical ones
+    /// (PGS/VobSub/DVB), whose bitmaps are shown directly. "Auto" resolves to
+    /// the file's default such track, falling back to the first one.
     pub fn subtitle_track(&self) -> Option<usize> {
         let selector = self.shared.subtitle_track.load(Ordering::Relaxed);
         let auto = self.info().and_then(|info| {
             info.subtitles
                 .iter()
-                .find(|stream| stream.is_default && stream.is_text)
-                .or_else(|| info.subtitles.iter().find(|stream| stream.is_text))
+                .find(|stream| stream.is_default && stream.is_renderable())
+                .or_else(|| info.subtitles.iter().find(|stream| stream.is_renderable()))
                 .map(|stream| stream.index)
         });
         resolve_selector(selector, auto)
     }
 
     /// Provide an external subtitle file (or clear it with `None`).
+    ///
+    /// Loading a text side-car clears any external graphical one: the two are
+    /// alternatives for the same slot, not layers.
     pub fn set_external_subtitle(&self, subtitle: Option<Arc<Subtitle>>) {
-        let empty = subtitle.is_none();
+        *self.shared.external_bitmap.lock() = None;
         *self.shared.external_subtitle.lock() = subtitle.clone();
-        if empty {
+        if let Some(s) = subtitle {
+            // The text side-car takes over the slot: hide the embedded bitmap.
+            *self.shared.bitmap_subtitle.lock() = None;
+            *self.shared.subtitle.lock() = Some(Arc::clone(&s));
+            let _ = self.shared.event_tx.send(EngineEvent::SubtitleChanged(s));
+        } else {
             *self.shared.subtitle.lock() = None;
             let _ = self
                 .shared
                 .event_tx
                 .send(EngineEvent::SubtitleChanged(Arc::new(Subtitle::empty())));
-        } else {
-            *self.shared.subtitle.lock() = subtitle.clone();
-            if let Some(s) = subtitle {
+        }
+    }
+
+    /// Provide an external graphical subtitle file (or clear it with `None`).
+    ///
+    /// Mirrors [`Engine::set_external_subtitle`] for bitmap tracks: it takes the
+    /// external slot, drops any text side-car, and hides the embedded cues.
+    pub fn set_external_bitmap_subtitle(&self, subtitle: Option<Arc<BitmapSubtitle>>) {
+        *self.shared.external_subtitle.lock() = None;
+        *self.shared.external_bitmap.lock() = subtitle.clone();
+        match subtitle {
+            Some(track) => {
+                *self.shared.subtitle.lock() = None;
+                *self.shared.bitmap_subtitle.lock() = Some(Arc::clone(&track));
                 let _ = self
                     .shared
                     .event_tx
-                    .send(EngineEvent::SubtitleChanged(s));
+                    .send(EngineEvent::BitmapSubtitleChanged(track));
+            }
+            None => {
+                *self.shared.bitmap_subtitle.lock() = None;
+                let _ = self
+                    .shared
+                    .event_tx
+                    .send(EngineEvent::BitmapSubtitleChanged(Arc::new(
+                        BitmapSubtitle::empty(),
+                    )));
             }
         }
     }
@@ -897,6 +952,16 @@ impl Engine {
     /// Currently active subtitle cues (external wins over embedded).
     pub fn subtitle(&self) -> Option<Arc<Subtitle>> {
         self.shared.subtitle.lock().clone()
+    }
+
+    /// Currently active graphical subtitle cues (external wins over embedded).
+    pub fn bitmap_subtitle(&self) -> Option<Arc<BitmapSubtitle>> {
+        self.shared.bitmap_subtitle.lock().clone()
+    }
+
+    /// `true` when an external subtitle file (text or graphical) is loaded.
+    pub fn has_external_subtitle(&self) -> bool {
+        self.shared.has_external_subtitle()
     }
 
     /// Shift the audio relative to the video, in seconds (positive delays audio).

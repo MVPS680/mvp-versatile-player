@@ -62,6 +62,21 @@ fn now_ns() -> u64 {
     base.elapsed().as_nanos() as u64
 }
 
+/// One batch of interleaved samples tagged with the flush generation it belongs
+/// to.
+///
+/// The tag is what keeps a seek honest. A flush is acted on by the device
+/// callback, which runs on its own schedule; between the flush and the callback
+/// the producer may already have decoded and pushed samples for the *new*
+/// position. Draining the whole queue when the callback finally notices would
+/// throw those away — which is exactly what left a seek near the end of a file
+/// silent. Comparing each chunk's tag against the live generation instead
+/// discards only what the flush was meant to discard.
+struct AudioChunk {
+    generation: u64,
+    samples: Vec<f32>,
+}
+
 /// State shared between the public handle and the real-time device callback.
 #[derive(Debug)]
 struct Shared {
@@ -138,7 +153,7 @@ impl Shared {
 pub struct AudioSink {
     /// Kept alive for as long as the sink exists; dropping it stops audio.
     stream: cpal::Stream,
-    tx: Sender<Vec<f32>>,
+    tx: Sender<AudioChunk>,
     shared: Arc<Shared>,
     sample_rate: u32,
     channels: u16,
@@ -195,7 +210,7 @@ impl AudioSink {
         let sample_rate = config.sample_rate.0;
         let channels = config.channels;
 
-        let (tx, rx) = bounded::<Vec<f32>>(QUEUE_CHUNKS);
+        let (tx, rx) = bounded::<AudioChunk>(QUEUE_CHUNKS);
         let shared = Arc::new(Shared::new(volume, speed));
 
         let error_shared = Arc::clone(&shared);
@@ -254,7 +269,7 @@ impl AudioSink {
     fn build<T>(
         device: &cpal::Device,
         config: &cpal::StreamConfig,
-        rx: Receiver<Vec<f32>>,
+        rx: Receiver<AudioChunk>,
         shared: Arc<Shared>,
         channels: u16,
         error_fn: impl FnMut(cpal::StreamError) + Send + 'static,
@@ -287,23 +302,32 @@ impl AudioSink {
                         (target_gain - applied_gain) / out.len() as f32
                     };
 
-                    // The producer flushed the queue (seek, track change, stop):
-                    // drop the partially consumed chunk *and* everything still
-                    // waiting, so no pre-seek audio can leak through.
-                    let generation = shared.flush_generation.load(Ordering::Relaxed);
-                    if generation != seen_generation {
-                        seen_generation = generation;
-                        current.clear();
-                        cursor = 0;
-                        while rx.try_recv().is_ok() {}
-                    }
-
                     let mut written = 0usize;
                     while written < out.len() {
                         if cursor >= current.len() {
+                            // A flush (seek, track change, stop) drops the
+                            // partial chunk still being played, and every chunk
+                            // that was queued for the old position. It must not
+                            // drain the whole queue, though: between the flush
+                            // and this callback the producer may already have
+                            // pushed samples decoded for the *new* position, and
+                            // those carry the new generation. Comparing each
+                            // chunk's tag against the live generation discards
+                            // exactly the stale audio and keeps the fresh — the
+                            // difference between a seek near the end of a file
+                            // playing its last seconds and falling silent.
+                            let live = shared.flush_generation.load(Ordering::Relaxed);
+                            if live != seen_generation {
+                                seen_generation = live;
+                                current.clear();
+                                cursor = 0;
+                            }
                             match rx.try_recv() {
-                                Ok(chunk) if !chunk.is_empty() => {
-                                    current = chunk;
+                                Ok(chunk) if !chunk.samples.is_empty() => {
+                                    if chunk.generation != live {
+                                        continue;
+                                    }
+                                    current = chunk.samples;
                                     cursor = 0;
                                 }
                                 Ok(_) => continue,
@@ -442,17 +466,20 @@ impl AudioSink {
             self.shared.anchored.store(true, Ordering::Release);
         }
 
-        let mut samples = samples;
+        let mut chunk = AudioChunk {
+            generation: self.shared.flush_generation.load(Ordering::Relaxed),
+            samples,
+        };
         let deadline = std::time::Instant::now() + Duration::from_millis(500);
         loop {
-            match self.tx.send_timeout(samples, Duration::from_millis(10)) {
+            match self.tx.send_timeout(chunk, Duration::from_millis(10)) {
                 Ok(()) => return true,
                 Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
                     self.shared.dropped.fetch_add(1, Ordering::Relaxed);
                     return false;
                 }
                 Err(crossbeam_channel::SendTimeoutError::Timeout(returned)) => {
-                    samples = returned;
+                    chunk = returned;
                     if self.shared.closing.load(Ordering::Relaxed)
                         || std::time::Instant::now() >= deadline
                     {

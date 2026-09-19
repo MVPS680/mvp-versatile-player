@@ -487,7 +487,17 @@ fn seek_row(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
                     ),
                     None => mvp_core::util::format_duration(value),
                 };
-                let galley = ui.painter().layout_no_wrap(
+                // The readout sits *above* the bar, which is taller than the strip
+                // the transport panel reserved for it — and the canvas, laid out
+                // after the panel, paints over everything outside that strip. A
+                // `Foreground` layer painter escapes the panel's clip rect and
+                // draws over the picture, the way a tooltip does, instead of being
+                // cropped away to nothing.
+                let painter = ui.ctx().layer_painter(egui::LayerId::new(
+                    egui::Order::Foreground,
+                    egui::Id::new("mvp_seek_preview"),
+                ));
+                let galley = painter.layout_no_wrap(
                     label,
                     egui::FontId::proportional(font::TINY),
                     tokens.text,
@@ -500,7 +510,6 @@ fn seek_row(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
                     egui::pos2(x, rect.top() - size.y - 6.0),
                     size,
                 );
-                let painter = ui.painter();
                 painter.rect_filled(
                     bubble,
                     egui::CornerRadius::same(radius::SM as u8),
@@ -928,12 +937,12 @@ fn track_menu(app: &mut PlayerApp, ui: &mut Ui) {
         let current = app.engine.subtitle_track();
         for subtitle in &info.subtitles {
             let selected = app.settings.subtitles_enabled && current == Some(subtitle.index);
-            let suffix = if subtitle.is_text {
+            let suffix = if subtitle.is_renderable() {
                 ""
             } else {
-                "（图形字幕，暂不支持）"
+                "（暂不支持）"
             };
-            ui.add_enabled_ui(subtitle.is_text, |ui| {
+            ui.add_enabled_ui(subtitle.is_renderable(), |ui| {
                 if ui
                     .selectable_label(
                         selected,

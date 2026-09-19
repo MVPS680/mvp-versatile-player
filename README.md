@@ -52,6 +52,8 @@
 - 内嵌字幕（SRT / ASS / SSA / MOV_TEXT / WebVTT）与外部字幕文件。
   打开文件时按设置决定用哪一个：默认「外部字幕优先」，同目录有同名字幕就用它；
   关掉这个开关则优先用文件自带的内嵌字幕，没有内嵌字幕时才回退到外部文件。
+- **图形字幕（PGS / VobSub / DVB）**：内嵌轨道与外部文件（`.sup`、VobSub 的
+  `.idx` + `.sub`）都直接按位图绘制在画面上，不需要 OCR，颜色和排版与片源一致。
 - 自动加载同目录下的同名字幕，优先匹配 `.zh` / `.chs` / `.cht` 等语言后缀。
 - 自动识别编码：UTF-8 / UTF-16 BOM / **GBK** / Big5 / Shift_JIS / Windows-1252。
   中文外挂字幕大量使用 GBK，这一点很重要。
@@ -391,6 +393,19 @@ cargo test -p mvp-core --test dolby_vision -- --nocapture --test-threads=1
 扫描带看门狗：卡死的样本会被点名（并区分「线程 panic」与「真的卡住」），
 而不是让测试永远挂在那儿。
 
+### 图形字幕素材（可选）
+
+本机链接的 FFmpeg 共享包只有 PGS/VobSub **解码器**、没有编码器，无法由文本字幕
+生成样本，所以相关集成测试默认跳过。把一个真实样本的路径告诉它即可运行：
+
+```powershell
+$env:MVP_PGS_SAMPLE = "C:\path\to\movie.sup"
+cargo test -p mvp-core --test graphic_subtitle -- --nocapture
+```
+
+位图模型的单元测试（调色板展开、时间区间、清屏语义、`AVSubtitleRect` 提取）
+不需要样本，正常参与 `--workspace`。
+
 ### 排查单个文件
 
 ```powershell
@@ -404,8 +419,8 @@ $env:RUST_LOG = "mvp_core=debug"   # 需要看内部细节时
 ## 已知限制
 
 - **仅支持 Windows**。`mvp-platform` 的其他平台分支可以编译，但功能是空实现。
-- **图形字幕（PGS / VobSub）不能显示**。它们是位图而非文本，需要 OCR。
-  遇到这类轨道时播放器会明确提示，而不是静默忽略。
+- **图形字幕的坐标基于源字幕画布**：PGS 的坐标就是视频像素，位置精确；VobSub 使用
+  自己的 DVD 画布（如 720×480），在分辨率差异较大的片源上会有轻微缩放偏差。
 - **HDR 色调映射是 CPU 上的近似实现**：按亮度曲线 + BT.2020→BT.709 矩阵逐像素换算，
   不参与逐帧动态元数据（RPU），极饱和的高光会有偏差；实测调试构建 1080p 约 22 ms/帧、
   4K 约 90 ms/帧（发布会快数倍），真正的解法是着色器实现。

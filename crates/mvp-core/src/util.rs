@@ -47,7 +47,11 @@ pub const IMAGE_EXTENSIONS: &[&str] = &[
 pub const PLAYLIST_EXTENSIONS: &[&str] = &["m3u", "m3u8", "pls", "xspf", "wpl"];
 
 /// Extensions treated as subtitle side-cars.
-pub const SUBTITLE_EXTENSIONS: &[&str] = &["srt", "ass", "ssa", "vtt", "sub", "idx", "smi"];
+///
+/// `.sup` and `.idx` are graphical: raw PGS and a VobSub index. A binary `.sub`
+/// is graphical too, but the extension is shared with MicroDVD text, so it is
+/// decided by content rather than by name.
+pub const SUBTITLE_EXTENSIONS: &[&str] = &["srt", "ass", "ssa", "vtt", "sub", "idx", "smi", "sup"];
 
 /// Extensions of optical-disc images.
 ///
