@@ -116,6 +116,13 @@ pub struct PlayerApp {
     /// Both ends of that readback; the canvas is handed the sender.
     snapshot_tx: SnapshotSender,
     snapshot_rx: crossbeam_channel::Receiver<picture_pass::SnapshotResult>,
+    /// A file dialog running on a thread of its own; its answer arrives on this channel.
+    ///
+    /// The native dialog blocks the thread that opens it. Opening it from the interface
+    /// thread — which is what this player used to do — stops the window repainting and
+    /// answering for as long as it is up: no picture, no sidebar, no shortcuts, and Windows
+    /// calling the process "not responding". `None` when no dialog is open.
+    dialog_rx: Option<crossbeam_channel::Receiver<DialogResult>>,
 
     /// The playlist.
     pub playlist: Playlist,
@@ -269,6 +276,7 @@ impl PlayerApp {
             pending_snapshot: None,
             snapshot_tx,
             snapshot_rx,
+            dialog_rx: None,
             playlist,
             image: ImageView::new(),
             mode: Mode::Empty,
@@ -1399,84 +1407,164 @@ impl PlayerApp {
     // -----------------------------------------------------------------------
 
     /// Ask the user for media files and open them.
+    ///
+    /// The dialog runs on its own thread and its answer is applied a frame or two later, by
+    /// which time the player may well have moved on — so the flags that depend on what is
+    /// playing are decided when the answer arrives, not when the question was asked.
     pub fn request_open_file(&mut self) {
-        let mut dialog = rfd::FileDialog::new().set_title("打开媒体文件");
-        if let Some(dir) = &self.settings.last_dir {
-            if dir.is_dir() {
-                dialog = dialog.set_directory(dir);
-            }
-        }
-        let filters: Vec<(&str, Vec<&str>)> = vec![
+        let dir = self.settings.last_dir.clone();
+        let filters: Vec<(String, Vec<String>)> = vec![
             (
-                "所有支持的媒体",
+                "所有支持的媒体".to_owned(),
                 mvp_platform::assoc::all_extensions()
                     .iter()
-                    .map(|e| e.trim_start_matches('.'))
+                    .map(|e| e.trim_start_matches('.').to_owned())
                     .collect(),
             ),
-            ("视频", vec!["mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "ts", "m2ts", "mpg", "mpeg", "rmvb", "3gp", "vob", "ogv"]),
-            ("音频", vec!["mp3", "flac", "aac", "m4a", "ogg", "opus", "wav", "wma", "ape", "alac", "ac3", "dts"]),
-            ("图片", vec!["jpg", "jpeg", "png", "gif", "webp", "bmp", "tif", "tiff", "avif", "jxl", "heic"]),
-            ("播放列表", vec!["m3u", "m3u8", "pls", "xspf"]),
-            ("所有文件", vec!["*"]),
+            (
+                "视频".to_owned(),
+                extensions(&[
+                    "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "ts", "m2ts", "mpg", "mpeg",
+                    "rmvb", "3gp", "vob", "ogv",
+                ]),
+            ),
+            (
+                "音频".to_owned(),
+                extensions(&[
+                    "mp3", "flac", "aac", "m4a", "ogg", "opus", "wav", "wma", "ape", "alac",
+                    "ac3", "dts",
+                ]),
+            ),
+            (
+                "图片".to_owned(),
+                extensions(&[
+                    "jpg", "jpeg", "png", "gif", "webp", "bmp", "tif", "tiff", "avif", "jxl",
+                    "heic",
+                ]),
+            ),
+            (
+                "播放列表".to_owned(),
+                extensions(&["m3u", "m3u8", "pls", "xspf"]),
+            ),
+            ("所有文件".to_owned(), extensions(&["*"])),
         ];
-        for (name, extensions) in filters {
-            dialog = dialog.add_filter(name, &extensions);
-        }
-        let Some(paths) = dialog.pick_files() else {
-            return;
-        };
-        let replace = !self.engine.state().is_active() && self.mode != Mode::Image;
-        self.open_paths(&paths, replace, true);
+        self.run_dialog(move || {
+            let mut dialog = rfd::FileDialog::new().set_title("打开媒体文件");
+            if let Some(dir) = &dir {
+                if dir.is_dir() {
+                    dialog = dialog.set_directory(dir);
+                }
+            }
+            for (name, extensions) in &filters {
+                dialog = dialog.add_filter(name.as_str(), extensions);
+            }
+            let paths = dialog.pick_files()?;
+            Some(Box::new(move |app: &mut PlayerApp| {
+                let replace = !app.engine.state().is_active() && app.mode != Mode::Image;
+                app.open_paths(&paths, replace, true);
+            }) as DialogResult)
+        });
     }
 
     /// Ask the user for a folder and queue everything in it.
     pub fn request_open_folder(&mut self) {
-        let mut dialog = rfd::FileDialog::new().set_title("打开文件夹");
-        if let Some(dir) = &self.settings.last_dir {
-            if dir.is_dir() {
-                dialog = dialog.set_directory(dir);
+        let dir = self.settings.last_dir.clone();
+        self.run_dialog(move || {
+            let mut dialog = rfd::FileDialog::new().set_title("打开文件夹");
+            if let Some(dir) = &dir {
+                if dir.is_dir() {
+                    dialog = dialog.set_directory(dir);
+                }
             }
-        }
-        let Some(folder) = dialog.pick_folder() else {
-            return;
-        };
-        self.open_paths(&[folder], true, true);
+            let folder = dialog.pick_folder()?;
+            Some(Box::new(move |app: &mut PlayerApp| {
+                app.open_paths(&[folder], true, true);
+            }) as DialogResult)
+        });
     }
 
     /// Ask the user for a subtitle file and attach it.
     pub fn request_open_subtitle(&mut self) {
-        let mut dialog = rfd::FileDialog::new()
-            .set_title("加载字幕文件")
-            .add_filter("字幕", &["srt", "ass", "ssa", "vtt", "sub", "smi"]);
-        if let Some(dir) = &self.settings.last_subtitle_dir {
-            if dir.is_dir() {
+        let dir = self
+            .settings
+            .last_subtitle_dir
+            .clone()
+            .filter(|dir| dir.is_dir())
+            .or_else(|| self.settings.last_dir.clone().filter(|dir| dir.is_dir()));
+        self.run_dialog(move || {
+            let mut dialog = rfd::FileDialog::new()
+                .set_title("加载字幕文件")
+                .add_filter("字幕", &["srt", "ass", "ssa", "vtt", "sub", "smi"]);
+            if let Some(dir) = &dir {
                 dialog = dialog.set_directory(dir);
             }
-        } else if let Some(dir) = &self.settings.last_dir {
-            if dir.is_dir() {
-                dialog = dialog.set_directory(dir);
-            }
-        }
-        let Some(path) = dialog.pick_file() else {
-            return;
-        };
-        self.load_subtitle_file(&path);
+            let path = dialog.pick_file()?;
+            Some(
+                Box::new(move |app: &mut PlayerApp| app.load_subtitle_file(&path)) as DialogResult,
+            )
+        });
     }
 
     /// Ask the user where to save the current playlist.
     pub fn request_save_playlist(&mut self) {
-        let Some(path) = rfd::FileDialog::new()
-            .set_title("保存播放列表")
-            .add_filter("M3U 播放列表", &["m3u"])
-            .set_file_name("播放列表.m3u")
-            .save_file()
-        else {
+        self.run_dialog(|| {
+            let path = rfd::FileDialog::new()
+                .set_title("保存播放列表")
+                .add_filter("M3U 播放列表", &["m3u"])
+                .set_file_name("播放列表.m3u")
+                .save_file()?;
+            Some(Box::new(move |app: &mut PlayerApp| {
+                match app.playlist.save_m3u(&path) {
+                    Ok(()) => app.toast(Toast::success(format!("已保存 · {}", path.display()))),
+                    Err(err) => app.error(format!("保存播放列表失败: {err}")),
+                }
+            }) as DialogResult)
+        });
+    }
+
+    /// Open `pick` on a thread of its own and apply whatever it hands back on a later frame.
+    ///
+    /// One at a time: a second 「打开文件」 while one is open would put an invisible second
+    /// dialog behind the first, and the user would be answering a question they cannot see.
+    pub fn run_dialog<F>(&mut self, pick: F)
+    where
+        F: FnOnce() -> Option<DialogResult> + Send + 'static,
+    {
+        if self.dialog_rx.is_some() {
+            self.toast(Toast::info("上一个文件对话框还没有关闭"));
+            return;
+        }
+        let (tx, rx) = crossbeam_channel::bounded::<DialogResult>(1);
+        self.dialog_rx = Some(rx);
+        // A dialog the user cancels simply never sends: the receiver reports a disconnect and
+        // the flag is cleared on the next frame, so nothing is left waiting behind a dialog
+        // that is not going to answer. A spawn that fails, or a thread that panics, is the
+        // same story — the sender is dropped either way.
+        let _ = std::thread::Builder::new()
+            .name("mvp-dialog".to_owned())
+            .spawn(move || {
+                if let Some(apply) = pick() {
+                    let _ = tx.send(apply);
+                }
+            });
+    }
+
+    /// Apply a file dialog's answer, if one has arrived.
+    ///
+    /// A cancelled dialog arrives as a disconnect, which is also how a thread that never
+    /// started reports itself: both mean "there is nothing to apply and nothing to wait for".
+    fn poll_dialog(&mut self) {
+        let Some(rx) = self.dialog_rx.as_ref() else {
             return;
         };
-        match self.playlist.save_m3u(&path) {
-            Ok(()) => self.toast(Toast::success(format!("已保存 · {}", path.display()))),
-            Err(err) => self.error(format!("保存播放列表失败: {err}")),
+        let answer = match rx.try_recv() {
+            Ok(answer) => Some(answer),
+            Err(crossbeam_channel::TryRecvError::Empty) => return,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => None,
+        };
+        self.dialog_rx = None;
+        if let Some(apply) = answer {
+            apply(self);
         }
     }
 
@@ -2214,6 +2302,12 @@ impl eframe::App for PlayerApp {
         }
         // The pass is built after the first frame has been painted, not before it.
         self.build_picture_pass();
+        // A file dialog runs on its own thread, so the window keeps painting while it is up;
+        // all this has to do here is pick its answer up.
+        self.poll_dialog();
+        if self.dialog_rx.is_some() {
+            ctx.request_repaint();
+        }
         // A minimized window has no picture to update, and a frame that is
         // pulled, converted and uploaded anyway is work nobody will ever see —
         // at 4K that is tens of megabytes a frame, sixty times a second, for a
@@ -2272,6 +2366,17 @@ impl eframe::App for PlayerApp {
             1.0,
         ]
     }
+}
+
+/// What a finished file dialog hands back: a closure that applies its own result.
+///
+/// A boxed closure rather than an enum of outcomes: five dialogs pick five different things,
+/// and each of them already knows what to do with what it picked.
+pub type DialogResult = Box<dyn FnOnce(&mut PlayerApp) + Send>;
+
+/// The extension list for one file-dialog filter, owned so it can cross to the dialog thread.
+fn extensions(list: &[&str]) -> Vec<String> {
+    list.iter().map(|extension| (*extension).to_owned()).collect()
 }
 
 /// The picture channel is a video-only feature.

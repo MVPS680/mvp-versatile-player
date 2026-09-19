@@ -204,9 +204,9 @@ fn compile(gl: &glow::Context, kind: u32, source: &str) -> Result<glow::Shader, 
     }
 }
 
-/// Vertex stage: one quad, in *physical pixels* with the origin at the top left,
-/// flipped into clip space. egui hands a callback its rect in points and the
-/// framebuffer counts from the bottom, so both conversions happen here.
+/// Vertex stage: one quad, in the callback's own pixels — its rectangle starts at `0, 0`
+/// because egui has already made that rectangle the GL viewport — flipped into clip space,
+/// since the framebuffer counts from the bottom and the quad does not.
 const VERTEX_SRC: &str = r#"#version 330 core
 layout (location = 0) in vec2 a_pos;
 layout (location = 1) in vec2 a_uv;
@@ -321,9 +321,9 @@ impl PicturePass {
     /// returns, so this only has to leave the state it touched somewhere sane rather
     /// than exactly where it found it.
     ///
-    /// `rect` and `uv` come from the caller's `image_transformed`, which means rotation
-    /// and mirroring arrive already applied. The shader never learns that the picture
-    /// is turned, and that is what keeps it in step with the untouched path.
+    /// `uv` comes from the caller's `image_transformed`, which means rotation and mirroring
+    /// arrive already applied. The shader never learns that the picture is turned, and that
+    /// is what keeps it in step with the untouched path.
     // Every one of these is a separate thing the frame is drawn with, and grouping them
     // into a struct would only move the list: same as `image_transformed`, which carries
     // the geometry for the other path.
@@ -333,7 +333,6 @@ impl PicturePass {
         painter: &Painter,
         info: &PaintCallbackInfo,
         frame: egui::TextureId,
-        rect: egui::Rect,
         uv: [[f32; 2]; 4],
         frame_size: [f32; 2],
         uniforms: &PictureUniforms,
@@ -344,37 +343,39 @@ impl PicturePass {
             return;
         };
         let gl = painter.gl();
-        let ppp = info.pixels_per_point;
-        let screen = [info.screen_size_px[0] as f32, info.screen_size_px[1] as f32];
 
-        let (left, top) = (rect.left() * ppp, rect.top() * ppp);
-        let (right, bottom) = (rect.right() * ppp, rect.bottom() * ppp);
-        // Where the four corners of the quad go, in the order the vertex builder below
-        // expects them.
-        let corners = [
-            (left, top, uv[0]),
-            (right, top, uv[1]),
-            (right, bottom, uv[2]),
-            (left, bottom, uv[3]),
-        ];
+        // `egui_glow` sets the GL viewport to *this callback's own rectangle* before calling
+        // it, so the quad is built in that rectangle's pixels — local `0..width, 0..height`
+        // — and the shader's `a_pos / u_screen` lands it exactly on the rectangle, whichever
+        // way egui rounded the rectangle to whole pixels.
+        //
+        // This used to be absolute screen pixels against the framebuffer size. The two are
+        // the same arithmetic only while the viewport happens to be the whole screen; with
+        // the viewport clipped to the picture's rectangle, the picture was drawn into the
+        // top-left corner of its own rectangle, about half size — which is what "the video
+        // shifts when I adjust the picture" was.
         let viewport = info.viewport_in_pixels();
-        // SAFETY: the scissor is set inside the player's own rectangle and lifted
-        // again below; nothing is created or deleted here.
+        let screen = [viewport.width_px as f32, viewport.height_px as f32];
+        // Where the four corners of the quad go, in the order the vertex builder expects.
+        let corners = [
+            (0.0, 0.0, uv[0]),
+            (screen[0], 0.0, uv[1]),
+            (screen[0], screen[1], uv[2]),
+            (0.0, screen[1], uv[3]),
+        ];
+
+        // No scissor of our own: egui has already clipped this callback to the canvas, and
+        // replacing that with the picture's rectangle would let a zoomed-in picture paint
+        // over the panels. Blending is ours to switch off — the shader writes opaque pixels,
+        // exactly as the untouched mesh path does.
+        // SAFETY: one state this function is responsible for, put back below.
         unsafe {
-            gl.enable(glow::SCISSOR_TEST);
-            gl.scissor(
-                viewport.left_px,
-                viewport.from_bottom_px,
-                viewport.width_px,
-                viewport.height_px,
-            );
             gl.disable(glow::BLEND);
         }
         self.draw_quad(gl, screen, corners, texture, frame_size, uniforms);
-        // SAFETY: lifting the two states this function changed, which is what egui
-        // expects to find when it draws its own shapes after the callback.
+        // SAFETY: restoring the one state this function changed, which is what egui expects
+        // to find when it draws its own shapes after the callback.
         unsafe {
-            gl.disable(glow::SCISSOR_TEST);
             gl.enable(glow::BLEND);
         }
     }
@@ -391,13 +392,17 @@ impl PicturePass {
     /// keeps the shape and the orientation it has always had: none of the display's
     /// zoom, rotation or mirroring is baked in, and the sharpening radius is the same
     /// `1 / frame_size` the screen uses.
+    ///
+    /// `viewport_px` is the on-screen viewport egui had set for the callback — the picture's
+    /// own rectangle, in `left, bottom, width, height` — which is put back before returning,
+    /// because this renders into a framebuffer of its own in the middle of egui's paint.
     pub fn render_offscreen(
         &self,
         painter: &Painter,
         frame: egui::TextureId,
         frame_size: [f32; 2],
         uniforms: &PictureUniforms,
-        viewport_px: [i32; 2],
+        viewport_px: [i32; 4],
         job: &SnapshotJob,
     ) {
         let width = frame_size[0].round().max(1.0) as i32;
@@ -475,14 +480,16 @@ impl PicturePass {
                         pixels = Some(bytes);
                     }
                 }
-                // Back to what `draw` leaves behind for egui's own shapes: blending on,
-                // clipping off.
+                // Back to what egui had set up for this callback: clipping and blending on,
+                // and its own viewport (put back just below). This renders in the middle of
+                // egui's paint, which carries on with its own shapes as soon as it returns.
+                gl.enable(glow::SCISSOR_TEST);
                 gl.enable(glow::BLEND);
                 gl.bind_framebuffer(glow::FRAMEBUFFER, previous);
                 gl.delete_framebuffer(fbo);
                 gl.delete_texture(target);
             }
-            gl.viewport(0, 0, viewport_px[0], viewport_px[1]);
+            gl.viewport(viewport_px[0], viewport_px[1], viewport_px[2], viewport_px[3]);
             pixels
         };
 

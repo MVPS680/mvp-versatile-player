@@ -338,22 +338,28 @@ fn video_page(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
         &dir.display().to_string(),
         190.0,
         |ui| {
-            let mut changed = false;
             if ui.button(RichText::new("打开").size(font::SMALL)).clicked() {
                 let _ = std::fs::create_dir_all(&dir);
                 mvp_platform::shell::reveal_in_explorer(&dir);
             }
             if ui.button(RichText::new("选择…").size(font::SMALL)).clicked() {
-                if let Some(picked) = rfd::FileDialog::new()
-                    .set_title("选择截图保存目录")
-                    .set_directory(&dir)
-                    .pick_folder()
-                {
-                    app.settings.snapshot_dir = Some(picked);
-                    changed = true;
-                }
+                // On the dialog's own thread, like every other picker in the player: a native
+                // dialog opened from here would freeze the interface while it was up.
+                let start = dir.clone();
+                app.run_dialog(move || {
+                    let picked = rfd::FileDialog::new()
+                        .set_title("选择截图保存目录")
+                        .set_directory(&start)
+                        .pick_folder()?;
+                    Some(Box::new(move |app: &mut PlayerApp| {
+                        app.settings.snapshot_dir = Some(picked);
+                        app.store.mark_dirty();
+                    }) as crate::app::DialogResult)
+                });
             }
-            changed
+            // Picking a folder is answered on another thread now, so this row has nothing to
+            // report back: the answer marks the store dirty itself when it arrives.
+            false
         },
     );
     changed |= widgets::switch_row(

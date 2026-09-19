@@ -578,12 +578,18 @@ fn render_snapshot(
     job: SnapshotJob,
 ) {
     let callback = eframe::egui_glow::CallbackFn::new(move |info, painter| {
+        let viewport = info.viewport_in_pixels();
         adjusted.pass.render_offscreen(
             painter,
             texture,
             adjusted.frame_size,
             &adjusted.uniforms,
-            [info.screen_size_px[0] as i32, info.screen_size_px[1] as i32],
+            [
+                viewport.left_px,
+                viewport.from_bottom_px,
+                viewport.width_px,
+                viewport.height_px,
+            ],
             &job,
         );
     });
@@ -671,7 +677,6 @@ pub fn image_transformed(
                 painter,
                 &info,
                 texture,
-                rect,
                 corners,
                 adjusted.frame_size,
                 &adjusted.uniforms,
