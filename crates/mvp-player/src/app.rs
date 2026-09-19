@@ -79,6 +79,14 @@ pub struct PlayerApp {
     pub store: SettingsStore,
     /// Visual tokens.
     pub theme: Theme,
+    /// The GL context, kept so the picture pass can be built once the window is up.
+    ///
+    /// Building it inside `App::new` — before the first frame — puts a shader compile in
+    /// front of the window: a driver that blocks there shows *nothing at all*, and the
+    /// player looks like it never started. Built on the first frame after the window has
+    /// painted instead, so the worst case is a visible window that then stalls, with the
+    /// log saying which step it stalled in.
+    gl: Option<Arc<eframe::glow::Context>>,
     /// The picture adjustment pass, once there is a GL context to build it in.
     ///
     /// `None` on a backend without one, and the pass itself carries a `failed` flag
@@ -97,12 +105,14 @@ pub struct PlayerApp {
     /// second of every following film ramps towards its own statistics instead of
     /// arriving at them.
     picture_state_key: Option<String>,
-    /// A snapshot waiting for the canvas to render it off screen.
+    /// A snapshot waiting for the canvas to render it off screen, and when it started
+    /// waiting.
     ///
     /// See [`PlayerApp::snapshot_needs_render`]: the adjustments are a GPU effect, so
     /// a snapshot that includes them has to be drawn once more into a framebuffer this
-    /// player owns and read back a frame later.
-    pending_snapshot: Option<PathBuf>,
+    /// player owns and read back a frame later. The timestamp is what gives up on a job
+    /// that never comes back.
+    pending_snapshot: Option<(PathBuf, Instant)>,
     /// Both ends of that readback; the canvas is handed the sender.
     snapshot_tx: SnapshotSender,
     snapshot_rx: crossbeam_channel::Receiver<picture_pass::SnapshotResult>,
@@ -250,9 +260,9 @@ impl PlayerApp {
             launch,
             store: SettingsStore::default(),
             theme,
-            // Built once, here: the shader is compiled at start-up, not the first time
-            // somebody moves a slider.
-            picture_pass: cc.gl.clone().map(|gl| Arc::new(PicturePass::new(gl))),
+            gl: cc.gl.clone(),
+            // Built on the first frame after the window has painted — see `self.gl`.
+            picture_pass: None,
             picture_state: None,
             picture_state_at: None,
             picture_state_key: None,
@@ -971,7 +981,7 @@ impl PlayerApp {
         // once more into a framebuffer this player owns, and the pixels come back on a
         // channel a frame later — see [`PlayerApp::take_snapshot_render`].
         if self.snapshot_needs_render() {
-            self.pending_snapshot = Some(path);
+            self.pending_snapshot = Some((path, Instant::now()));
             return;
         }
 
@@ -1003,11 +1013,46 @@ impl PlayerApp {
     /// the pixels back on this channel, which [`PlayerApp::collect_snapshot`] picks up
     /// on a later frame.
     pub fn take_snapshot_render(&mut self) -> Option<SnapshotJob> {
-        let path = self.pending_snapshot.take()?;
+        let (path, _) = self.pending_snapshot.take()?;
         Some(SnapshotJob {
             path,
             sender: self.snapshot_tx.clone(),
         })
+    }
+
+    /// How long a snapshot waits for the canvas before it is written the ordinary way.
+    ///
+    /// The offscreen render needs one paint, so a job still waiting after this long is not
+    /// going to get one: the window was minimized, or another kind of file was opened. The
+    /// frame the engine produced — and a word about it — beats a file that never appears
+    /// and a request for a repaint that never stops.
+    const SNAPSHOT_RENDER_TIMEOUT: Duration = Duration::from_secs(2);
+
+    /// Give up on an offscreen render that never came, and write the plain frame instead.
+    fn expire_snapshot(&mut self) {
+        let Some((_, started)) = self.pending_snapshot.as_ref() else {
+            return;
+        };
+        if !Self::snapshot_expired(*started, Instant::now()) {
+            return;
+        }
+        let Some((path, _)) = self.pending_snapshot.take() else {
+            return;
+        };
+        log::warn!(
+            "截图：画面调节未能在 {:.1} 秒内渲染，已改为保存原始帧",
+            Self::SNAPSHOT_RENDER_TIMEOUT.as_secs_f32()
+        );
+        let result = self.write_snapshot(&path);
+        self.report_snapshot(path, result);
+    }
+
+    /// `true` when a snapshot has been waiting longer than [`Self::SNAPSHOT_RENDER_TIMEOUT`].
+    ///
+    /// A pure function because the interesting case — the canvas never running the job —
+    /// is not something a test can make the canvas do.
+    fn snapshot_expired(started: Instant, now: Instant) -> bool {
+        now.saturating_duration_since(started) >= Self::SNAPSHOT_RENDER_TIMEOUT
     }
 
     /// Write a snapshot the canvas has finished rendering, if one has arrived.
@@ -1775,6 +1820,35 @@ impl PlayerApp {
         self.picture_pass.as_ref().filter(|pass| !pass.failed)
     }
 
+    /// Build the picture pass, once, on the first frame after the window has painted.
+    ///
+    /// Never retried: a driver that refused the shader once will refuse it again, and
+    /// asking sixty times a second would turn a fallback into a stutter. Both ends of the
+    /// compile are logged so that a hang here is identifiable from `mvp.log` instead of
+    /// looking like a player that never started.
+    fn build_picture_pass(&mut self) {
+        if self.picture_pass.is_some() || !self.first_frame_painted {
+            return;
+        }
+        let Some(gl) = self.gl.clone() else {
+            // A backend without a GL context: the picture takes the path it always did.
+            return;
+        };
+        log::info!("画面调节：开始编译着色器");
+        let started = Instant::now();
+        let pass = PicturePass::new(gl);
+        log::info!(
+            "画面调节：着色器{}，耗时 {:.1} ms",
+            if pass.failed {
+                "不可用，已回退到原始渲染路径"
+            } else {
+                "已就绪"
+            },
+            started.elapsed().as_secs_f32() * 1000.0
+        );
+        self.picture_pass = Some(Arc::new(pass));
+    }
+
     /// Everything an adjusted draw of the picture needs, or `None` for the untouched
     /// path.
     ///
@@ -2132,9 +2206,14 @@ impl eframe::App for PlayerApp {
         // up on the next paint, so this frame has to happen even while the player sits
         // paused on a still frame, and the pixels are written when they arrive.
         self.collect_snapshot();
+        // A job that never came back: give up on the offscreen render rather than asking
+        // for a repaint every frame for the rest of the session.
+        self.expire_snapshot();
         if self.pending_snapshot.is_some() {
             ctx.request_repaint();
         }
+        // The pass is built after the first frame has been painted, not before it.
+        self.build_picture_pass();
         // A minimized window has no picture to update, and a frame that is
         // pulled, converted and uploaded anyway is work nobody will ever see —
         // at 4K that is tens of megabytes a frame, sixty times a second, for a
@@ -2218,6 +2297,25 @@ mod tests {
         assert!(!picture_channel_applies(Mode::Audio));
         assert!(!picture_channel_applies(Mode::Image));
         assert!(!picture_channel_applies(Mode::Empty));
+    }
+
+    /// A snapshot job the canvas never picks up — the window was minimized, or another kind
+    /// of file was opened before the next paint — has to be given up on. Otherwise the
+    /// player keeps asking for a repaint, and keeps waiting, for the rest of the session.
+    #[test]
+    fn a_snapshot_job_that_never_renders_is_given_up_on() {
+        let started = Instant::now();
+        assert!(!PlayerApp::snapshot_expired(started, started));
+        assert!(!PlayerApp::snapshot_expired(
+            started,
+            started + PlayerApp::SNAPSHOT_RENDER_TIMEOUT - Duration::from_millis(1)
+        ));
+        assert!(PlayerApp::snapshot_expired(
+            started,
+            started + PlayerApp::SNAPSHOT_RENDER_TIMEOUT
+        ));
+        // A clock that went backwards (a suspended machine) must not expire it by accident.
+        assert!(!PlayerApp::snapshot_expired(started, started));
     }
 
     #[test]

@@ -162,7 +162,17 @@ pub struct PictureUniforms {
 /// bytes. The copy is walked on a stride and every sampled pixel counts once, which
 /// is what makes this cheap enough to run ten times a second.
 pub fn analyse(rgba: &[u8], width: usize, height: usize, max_side: usize) -> FrameStats {
-    if width == 0 || height == 0 || max_side == 0 || rgba.len() < width * height * 4 {
+    // `width * height * 4` is what the buffer is supposed to hold, and it is the guard the
+    // walk below trusts. Checked rather than multiplied: a pair of dimensions large enough
+    // to wrap would let a short slice past the guard and send the walk past its end, and a
+    // panic in the interface thread is a dead player.
+    let Some(expected) = width
+        .checked_mul(height)
+        .and_then(|pixels| pixels.checked_mul(4))
+    else {
+        return FrameStats::default();
+    };
+    if width == 0 || height == 0 || max_side == 0 || rgba.len() < expected {
         return FrameStats::default();
     }
     let stride = (width.max(height).div_ceil(max_side)).max(1);
@@ -700,6 +710,23 @@ mod tests {
             &off,
             EnhanceState::default()
         ));
+    }
+
+    #[test]
+    fn analyse_survives_dimensions_that_do_not_fit() {
+        // The product of the dimensions overflows `usize`. Multiplied unchecked it wraps to
+        // something small, the length guard passes against a short slice, and the walk runs
+        // off the end of the buffer — a panic, in the middle of the interface thread.
+        let stats = analyse(&[0u8; 64], usize::MAX / 2, usize::MAX / 2, ANALYSIS_SIDE);
+        assert_eq!(stats, FrameStats::default());
+        assert_eq!(
+            analyse(&[0u8; 64], usize::MAX, 1, ANALYSIS_SIDE),
+            FrameStats::default()
+        );
+        assert_eq!(
+            analyse(&[0u8; 64], 4, usize::MAX, ANALYSIS_SIDE),
+            FrameStats::default()
+        );
     }
 
     /// Not a benchmark: a guard on the one part of this feature that costs CPU at all.

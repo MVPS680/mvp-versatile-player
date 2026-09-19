@@ -440,6 +440,13 @@ impl PicturePass {
                 );
                 if gl.check_framebuffer_status(glow::FRAMEBUFFER) == glow::FRAMEBUFFER_COMPLETE {
                     gl.viewport(0, 0, width, height);
+                    // The framebuffer is fresh, so its contents are undefined: blending
+                    // against them would make the snapshot depend on whatever was in that
+                    // memory. Nothing here wants blending anyway — the shader writes opaque
+                    // pixels — and the scissor belongs to whatever egui was clipping, not
+                    // to a texture of our own.
+                    gl.disable(glow::SCISSOR_TEST);
+                    gl.disable(glow::BLEND);
                     let corners = [
                         (0.0, 0.0, [0.0, 0.0]),
                         (width as f32, 0.0, [1.0, 0.0]),
@@ -468,6 +475,9 @@ impl PicturePass {
                         pixels = Some(bytes);
                     }
                 }
+                // Back to what `draw` leaves behind for egui's own shapes: blending on,
+                // clipping off.
+                gl.enable(glow::BLEND);
                 gl.bind_framebuffer(glow::FRAMEBUFFER, previous);
                 gl.delete_framebuffer(fbo);
                 gl.delete_texture(target);
