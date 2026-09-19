@@ -16,7 +16,10 @@ use mvp_platform::single_instance::{AppInstance, IpcMessage};
 use mvp_subtitle::Subtitle;
 
 use crate::settings::{LaunchOverrides, Settings, SettingsStore};
-use crate::state::{FrameHistory, InfoRow, Mode, Overlay, SettingsTab, ShownFrame, Toast, ToastKind, UiState};
+use crate::state::{
+    FrameHistory, InfoRow, Mode, Overlay, SettingsTab, ShownFrame, ThumbCache, Toast, ToastKind,
+    UiState,
+};
 use crate::theme::Theme;
 
 /// Options the player was started with.
@@ -83,6 +86,9 @@ pub struct PlayerApp {
     pub mode: Mode,
     /// Transient interface state.
     pub ui: UiState,
+
+    /// Lazily decoded filmstrip thumbnails for the image viewer.
+    pub thumbs: ThumbCache,
 
     /// GPU texture holding the current video frame.
     pub texture: Option<TextureHandle>,
@@ -218,6 +224,7 @@ impl PlayerApp {
             image: ImageView::new(),
             mode: Mode::Empty,
             ui: UiState::default(),
+            thumbs: ThumbCache::new(),
             texture: None,
             uploaded_serial: 0,
             uploaded_pts: 0.0,
@@ -301,6 +308,10 @@ impl PlayerApp {
         }
         if replace {
             self.playlist.clear();
+            // The filmstrip's thumbnails describe a playlist that no longer
+            // exists; the cache is keyed by path, but the order and the set are
+            // re-generated from scratch.
+            self.thumbs.clear();
         }
         let first = self.playlist.len();
         for path in &expanded {
@@ -433,7 +444,14 @@ impl PlayerApp {
         } else {
             self.engine.set_subtitle_track(None);
         }
-        self.mode = Mode::Media;
+        // The file name already tells us which screen an MP3 opens on; a URL or
+        // a container that turns out to have no video is corrected by
+        // `sync_media_mode` once the probe lands.
+        self.mode = if self.pending_audio {
+            Mode::Audio
+        } else {
+            Mode::Video
+        };
         self.image.close();
         self.reset_zoom();
         self.texture = None;
@@ -593,7 +611,7 @@ impl PlayerApp {
     /// reference. That is only possible because the engine hands out the *only*
     /// reference to the frame — it deliberately keeps none of its own.
     pub fn update_frame_texture(&mut self, ctx: &Context) {
-        if self.mode != Mode::Media {
+        if !self.mode.is_media() {
             return;
         }
         let now = self.engine.display_position();
@@ -1004,7 +1022,7 @@ impl PlayerApp {
                     .unwrap_or_default();
                 format!("{prefix}{name} - MVP-Versatile-Player")
             }
-            Mode::Media => {
+            Mode::Video | Mode::Audio => {
                 let name = self
                     .playlist
                     .current()
@@ -1103,20 +1121,34 @@ impl PlayerApp {
         self.store.mark_dirty();
     }
 
-    /// `true` when what is on screen is sound and nothing else.
+    /// Keep [`Mode`] honest about whether a media file has a picture.
     ///
-    /// The probe is the authority as soon as it lands; before that the file
-    /// name is (see [`PlayerApp::pending_audio`]). "Has no picture" is a
-    /// property of the file, not of how far the pipeline has got, which is why
-    /// this is asked *before* the first frame is decoded as well as after.
-    pub fn is_audio_only(&self) -> bool {
-        if self.mode != Mode::Media {
-            return false;
+    /// A URL or a container whose name says nothing is opened as video, because
+    /// that is the common case; the probe is the authority and may turn out to
+    /// say there is no video stream at all. This is the one place that promotes
+    /// such a file to the audio screen — and it runs before anything is drawn,
+    /// so the interface never spends a frame in the wrong layout.
+    pub fn sync_media_mode(&mut self) {
+        if !self.mode.is_media() {
+            return;
         }
-        match self.engine.info() {
+        let audio_only = match self.engine.info() {
             Some(info) => info.is_audio_only(),
             None => self.pending_audio,
+        };
+        let wanted = if audio_only { Mode::Audio } else { Mode::Video };
+        if self.mode != wanted {
+            self.mode = wanted;
         }
+    }
+
+    /// `true` when what is on screen is sound and nothing else.
+    ///
+    /// "Has no picture" is a property of the file, not of how far the pipeline
+    /// has got, which is why the mode is settled before the first frame is
+    /// decoded as well as after — see [`PlayerApp::sync_media_mode`].
+    pub fn is_audio_only(&self) -> bool {
+        self.mode.is_audio()
     }
 
     /// `true` when there is a picture on screen: a video frame or an image.
@@ -1125,11 +1157,20 @@ impl PlayerApp {
     /// ask this rather than "is anything open?", so an audio file does not
     /// offer controls that could only ever do nothing to it.
     pub fn has_picture(&self) -> bool {
-        match self.mode {
-            Mode::Image => true,
-            Mode::Media => !self.is_audio_only(),
-            Mode::Empty => false,
-        }
+        matches!(self.mode, Mode::Image | Mode::Video)
+    }
+
+    /// The probe's answer for the file that is open, if it has landed.
+    pub fn media_info(&self) -> Option<Arc<MediaInfo>> {
+        self.engine.info()
+    }
+
+    /// The chapters of the current file, empty when there are none.
+    pub fn chapters(&self) -> Vec<mvp_core::ChapterInfo> {
+        self.engine
+            .info()
+            .map(|info| info.chapters.clone())
+            .unwrap_or_default()
     }
 
     /// Human readable "now playing" line for the OSD.
@@ -1141,13 +1182,13 @@ impl PlayerApp {
                 .doc
                 .as_ref()
                 .and_then(|d| d.path.file_name().map(|n| n.to_string_lossy().into_owned())),
-            Mode::Media => self.playlist.current().map(|i| i.title.clone()),
+            Mode::Video | Mode::Audio => self.playlist.current().map(|i| i.title.clone()),
         }
     }
 
     /// Enable or disable the display-sleep blocker according to playback state.
     pub fn update_sleep_blocker(&mut self) {
-        let wanted = self.engine.is_playing() && self.mode == Mode::Media;
+        let wanted = self.engine.is_playing() && self.mode.is_media();
         if wanted != self.sleep_blocker.is_enabled() {
             self.sleep_blocker.set(wanted);
         }
@@ -1789,6 +1830,12 @@ impl eframe::App for PlayerApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.handle_ipc();
         self.handle_engine_events(ctx);
+        // The probe may have just said the open file has no video stream; the
+        // layout has to know before anything is painted.
+        self.sync_media_mode();
+        if self.mode.is_image() && self.thumbs.drain(ctx) > 0 {
+            ctx.request_repaint();
+        }
         self.apply_window_chrome();
         self.sync_display(ctx);
         self.sync_fullscreen(ctx);

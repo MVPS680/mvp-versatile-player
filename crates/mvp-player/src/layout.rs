@@ -198,6 +198,12 @@ pub struct TransportBudget {
     pub shuffle: bool,
     /// Subtitle visibility.
     pub subtitles: bool,
+    /// Quick audio/subtitle track pickers.
+    pub tracks: bool,
+    /// The aspect/rotate/mirror menu.
+    pub pan_scan: bool,
+    /// The A–B loop control.
+    pub ab_loop: bool,
 }
 
 impl TransportBudget {
@@ -210,6 +216,9 @@ impl TransportBudget {
         repeat: true,
         shuffle: true,
         subtitles: true,
+        tracks: true,
+        pan_scan: true,
+        ab_loop: true,
     };
 
     /// What is left when not even the optional controls fit: the bar always
@@ -223,6 +232,9 @@ impl TransportBudget {
         repeat: false,
         shuffle: false,
         subtitles: false,
+        tracks: false,
+        pan_scan: false,
+        ab_loop: false,
     };
 
     /// Drop one control, in the order the bar gives things up. `step` counts
@@ -236,8 +248,11 @@ impl TransportBudget {
                 1 => budget.speed = false,
                 2 => budget.volume_slider = false,
                 3 => budget.snapshot = false,
-                4 => budget.subtitles = false,
-                5 => budget.shuffle = false,
+                4 => budget.ab_loop = false,
+                5 => budget.pan_scan = false,
+                6 => budget.tracks = false,
+                7 => budget.subtitles = false,
+                8 => budget.shuffle = false,
                 _ => budget.repeat = false,
             }
         }
@@ -272,6 +287,15 @@ impl TransportBudget {
         if self.snapshot {
             right += TOOL + GAP;
         }
+        if self.ab_loop {
+            right += TOOL + GAP;
+        }
+        if self.pan_scan {
+            right += TOOL + GAP;
+        }
+        if self.tracks {
+            right += TOOL + GAP;
+        }
 
         // The `GAP` between the two groups, plus the slack that absorbs the
         // difference between this arithmetic and what `egui` actually measures.
@@ -280,7 +304,7 @@ impl TransportBudget {
 }
 
 /// How many controls have to be given up, out of `TransportBudget::FULL`.
-const DROP_STEPS: usize = 7;
+const DROP_STEPS: usize = 10;
 
 /// Choose the transport controls that fit in `width` points.
 ///
@@ -370,6 +394,9 @@ mod tests {
                 budget.repeat,
                 budget.shuffle,
                 budget.subtitles,
+                budget.tracks,
+                budget.pan_scan,
+                budget.ab_loop,
             ]
             .iter()
             .filter(|shown| **shown)
@@ -382,6 +409,9 @@ mod tests {
                 previous.repeat,
                 previous.shuffle,
                 previous.subtitles,
+                previous.tracks,
+                previous.pan_scan,
+                previous.ab_loop,
             ]
             .iter()
             .filter(|shown| **shown)

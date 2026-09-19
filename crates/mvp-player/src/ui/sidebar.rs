@@ -31,13 +31,21 @@ pub fn draw(app: &mut PlayerApp, ctx: &Context) {
         .width_range(min_width..=max_width)
         .resizable(true)
         .show(ctx, |ui| {
-            let tabs: Vec<&str> = SidebarTab::all().iter().map(|t| t.label()).collect();
-            let active = SidebarTab::all()
+            let pages = tabs_for(app.mode);
+            let tabs: Vec<&str> = pages
+                .iter()
+                .map(|tab| tab_label(*tab, app.mode))
+                .collect();
+            // The persisted tab may belong to another kind of media (the last
+            // film's 「章节」 page is meaningless for a photo), so an unknown
+            // page falls back to the first one this screen offers.
+            let active = pages
                 .iter()
                 .position(|t| *t == app.ui.sidebar_tab)
                 .unwrap_or(0);
+            app.ui.sidebar_tab = pages[active];
             if let Some(index) = widgets::tab_strip(ui, &tokens, &tabs, active) {
-                app.ui.sidebar_tab = SidebarTab::all()[index];
+                app.ui.sidebar_tab = pages[index];
                 app.store.mark_dirty();
             }
             ui.add_space(space::SM);
@@ -49,8 +57,40 @@ pub fn draw(app: &mut PlayerApp, ctx: &Context) {
                     SidebarTab::Tracks => tracks_tab(app, ui, &tokens),
                     SidebarTab::Chapters => chapters_tab(app, ui, &tokens),
                     SidebarTab::Info => info_tab(app, ui, &tokens),
+                    SidebarTab::Lyrics => lyrics_tab(app, ui, &tokens),
+                    SidebarTab::Exif => exif_tab(app, ui, &tokens),
                 });
         });
+}
+
+/// The sidebar pages this screen offers.
+fn tabs_for(mode: Mode) -> &'static [SidebarTab] {
+    match mode {
+        Mode::Empty => &[SidebarTab::Playlist],
+        Mode::Video => &[
+            SidebarTab::Playlist,
+            SidebarTab::Tracks,
+            SidebarTab::Chapters,
+            SidebarTab::Info,
+        ],
+        Mode::Audio => &[
+            SidebarTab::Playlist,
+            SidebarTab::Lyrics,
+            SidebarTab::Tracks,
+            SidebarTab::Info,
+        ],
+        Mode::Image => &[SidebarTab::Exif, SidebarTab::Info, SidebarTab::Playlist],
+    }
+}
+
+/// The label a page wears on a given screen; the playlist is a queue to a
+/// listener and a playlist to a viewer.
+fn tab_label(tab: SidebarTab, mode: Mode) -> &'static str {
+    if mode.is_audio() && tab == SidebarTab::Playlist {
+        "播放队列"
+    } else {
+        tab.label()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -593,6 +633,122 @@ fn chapters_tab(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
     }
     if let Some(time) = seek_to {
         app.seek(time);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Lyrics
+// ---------------------------------------------------------------------------
+
+/// The current subtitle track, shown as scrolling lyrics.
+///
+/// A subtitle track on a music file is a lyrics file, and the useful way to show
+/// one is as a column that follows the song: the line being sung is highlighted
+/// and the view scrolls to keep it in the middle. Clicking a line seeks to it,
+/// which is how a lyrics panel doubles as a chapter list for a long mix.
+fn lyrics_tab(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
+    let Some(subtitle) = app.engine.subtitle() else {
+        widgets::empty_hint(ui, tokens, "没有歌词 / 字幕\n用「加载字幕文件」加入歌词");
+        return;
+    };
+    if subtitle.is_empty() {
+        widgets::empty_hint(ui, tokens, "歌词为空");
+        return;
+    }
+
+    let time = app.engine.display_position() - app.settings.subtitle_delay;
+    let current = subtitle.index_at(time);
+    // Scroll only when the highlighted line *changes*: asking egui to scroll
+    // every frame would fight the user's own scrollbar.
+    let scrolled = app.ui.last_lyric != current;
+    app.ui.last_lyric = current;
+
+    let mut seek_to: Option<f64> = None;
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for (index, cue) in subtitle.cues.iter().enumerate() {
+                let text = cue.text.trim();
+                if text.is_empty() {
+                    continue;
+                }
+                let active = current == Some(index);
+                let response = ui.add(
+                    egui::Label::new(
+                        RichText::new(text)
+                            .size(if active { font::BODY } else { font::SMALL })
+                            .color(if active {
+                                tokens.accent
+                            } else {
+                                tokens.text_weak
+                            }),
+                    )
+                    .wrap()
+                    .sense(egui::Sense::click()),
+                );
+                if active && scrolled {
+                    response.scroll_to_me(Some(egui::Align::Center));
+                }
+                if response.clicked() {
+                    seek_to = Some(cue.start);
+                }
+            }
+        });
+
+    if let Some(position) = seek_to {
+        app.seek(position);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Picture information
+// ---------------------------------------------------------------------------
+
+/// The image viewer's parameter page: the same rows the information page lists,
+/// plus the file itself and the things a photographer asks about a frame.
+fn exif_tab(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
+    let Some(doc) = &app.image.doc else {
+        widgets::empty_hint(ui, tokens, "未打开图片");
+        return;
+    };
+
+    widgets::section(ui, tokens, "图片");
+    let name = doc
+        .path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    widgets::key_value(ui, tokens, "文件", &name);
+    let path = doc.path.to_string_lossy();
+    widgets::key_value(ui, tokens, "路径", &path);
+    let megapixels = (doc.width as f64 * doc.height as f64) / 1_000_000.0;
+    widgets::key_value(
+        ui,
+        tokens,
+        "像素",
+        &format!("{:.1} 百万像素", megapixels),
+    );
+    if doc.exif_orientation != 1 {
+        widgets::key_value(
+            ui,
+            tokens,
+            "EXIF 方向",
+            &format!("{}（已按方向自动旋转）", doc.exif_orientation),
+        );
+    }
+    if doc.is_animated {
+        widgets::key_value(ui, tokens, "动画", &format!("{} 帧", doc.frames.len()));
+    }
+
+    widgets::section(ui, tokens, "格式");
+    let rows: Vec<(String, String)> = app
+        .ui
+        .info_rows
+        .iter()
+        .map(|r| (r.label.clone(), r.value.clone()))
+        .collect();
+    for (label, value) in rows {
+        widgets::key_value(ui, tokens, &label, &value);
     }
 }
 

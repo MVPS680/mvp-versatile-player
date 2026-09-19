@@ -19,6 +19,7 @@ mod canvas;
 mod dialogs;
 mod menu;
 mod minimap;
+mod screens;
 mod settings_window;
 mod sidebar;
 mod surface;
@@ -68,23 +69,14 @@ pub fn draw(app: &mut PlayerApp, ctx: &Context) {
     // being drawn across the top of the picture.
     app.ui.error_banner = error_banner(app, ctx);
 
-    // The sidebar takes its width from the central panel, so it is laid out
-    // before it. In fullscreen it still docks to the right, over the picture.
-    if app.ui.sidebar_visible {
-        sidebar::draw(app, ctx);
-    }
-
-    if !app.ui.fullscreen {
-        transport::draw(app, ctx);
-    }
-
     // Minimized: keep the clock, and do none of the expensive work.
     //
-    // This sits immediately before the canvas because that is where the frame is
-    // pulled from the engine and uploaded to the texture — the two costs that made
-    // a night in the background into a locked-up window (and into a frame that
-    // queues behind thousands nobody saw). Audio carries on regardless: it runs on
-    // its own thread, which is what keeps a minimized player playing.
+    // This sits immediately before the screen because the canvas is where the
+    // frame is pulled from the engine and uploaded to the texture — the two costs
+    // that made a night in the background into a locked-up window (and into a
+    // frame that queues behind thousands nobody saw). Audio carries on
+    // regardless: it runs on its own thread, which is what keeps a minimized
+    // player playing.
     if window_hidden(ctx) {
         app.ui.tick_toast();
         ctx.request_repaint_after(HIDDEN_POLL);
@@ -95,13 +87,15 @@ pub fn draw(app: &mut PlayerApp, ctx: &Context) {
     // it, and painting — and it is the half that answers "why does it feel slow".
     let render_started = std::time::Instant::now();
 
-    canvas::draw(app, ctx);
+    // Each media kind has its own screen, and each screen owns the panel order
+    // that makes it work: sidebar, then its own bottom strip, then the canvas.
+    screens::draw(app, ctx);
 
     // The floating island is the *only* transport in fullscreen and it is an
     // `Area`, not a panel: it reserves nothing, so it is painted over the canvas
     // rather than before it.
     if app.ui.fullscreen && app.ui.controls_visible() {
-        transport::draw_overlay(app, ctx);
+        screens::draw_overlay(app, ctx);
     }
 
     settings_window::draw(app, ctx);
@@ -212,7 +206,7 @@ fn schedule_repaint(app: &PlayerApp, ctx: &Context) {
     // An open dialog must not stop the clock: playback continues behind the
     // settings window, and the end of a file still has to advance the playlist.
     match app.mode {
-        Mode::Media => {
+        Mode::Video | Mode::Audio => {
             if app.engine.state() == mvp_core::PlaybackState::Opening {
                 // A file that is still opening has produced no frame *and* no
                 // event yet — the `Opened` event is what the audio screen takes

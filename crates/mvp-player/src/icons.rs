@@ -165,6 +165,18 @@ pub enum Icon {
     Clear,
     /// Floppy disk, "save playlist".
     Save,
+    /// A bracketed region between two points, "A–B loop".
+    AbLoop,
+    /// Stacked text lines, "lyrics".
+    Lyrics,
+    /// A small grid of squares, "thumbnail strip".
+    Grid,
+    /// A painter's palette, "background".
+    Palette,
+    /// A stopwatch, "slideshow interval".
+    Timer,
+    /// A speaker with a cog, "output device".
+    Device,
 }
 
 /// Draw `icon` inside `rect` using `color`.
@@ -513,6 +525,63 @@ pub fn draw(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
             painter.rect_filled(slot, 0.0, color);
             let label = egui::Rect::from_min_max(c.p(7.0, 13.0), c.p(17.0, 20.5));
             painter.rect_stroke(label, 0.0, thin, StrokeKind::Middle);
+        }
+        Icon::AbLoop => {
+            // Two brackets around a double-headed arrow: the region between the
+            // two points. The letters themselves would need glyph outlines, and
+            // the shape reads at every size without them.
+            c.line(painter, (7.5, 6.0), (4.5, 6.0), stroke);
+            c.line(painter, (4.5, 6.0), (4.5, 18.0), stroke);
+            c.line(painter, (4.5, 18.0), (7.5, 18.0), stroke);
+            c.line(painter, (16.5, 6.0), (19.5, 6.0), stroke);
+            c.line(painter, (19.5, 6.0), (19.5, 18.0), stroke);
+            c.line(painter, (19.5, 18.0), (16.5, 18.0), stroke);
+            c.line(painter, (8.0, 12.0), (16.0, 12.0), thin);
+            c.poly(painter, &[(9.5, 9.6), (6.8, 12.0), (9.5, 14.4)], color);
+            c.poly(painter, &[(14.5, 9.6), (17.2, 12.0), (14.5, 14.4)], color);
+        }
+        Icon::Lyrics => {
+            // Text lines with one highlighted, the way a lyric sheet marks the
+            // line being sung.
+            for y in [6.0f32, 12.0, 18.0] {
+                c.line(painter, (5.0, y), (19.0, y), thin);
+            }
+            c.line(painter, (5.0, 12.0), (14.0, 12.0), stroke);
+            painter.circle_filled(c.p(20.0, 12.0), c.s(1.4), color);
+        }
+        Icon::Grid => {
+            for x in [5.0f32, 12.0, 19.0] {
+                for y in [5.0f32, 12.0, 19.0] {
+                    let square =
+                        egui::Rect::from_center_size(c.p(x, y), Vec2::splat(c.s(4.2)));
+                    painter.rect_filled(square, c.s(1.0), color);
+                }
+            }
+        }
+        Icon::Palette => {
+            // A painter's palette: an open outline with three paint dots on it.
+            painter.circle_stroke(c.p(12.0, 12.0), c.s(8.0), stroke);
+            painter.circle_filled(c.p(15.5, 15.0), c.s(2.0), color);
+            for (x, y) in [(8.5f32, 9.0f32), (12.0, 7.2), (15.5, 9.0)] {
+                painter.circle_filled(c.p(x, y), c.s(1.5), color);
+            }
+        }
+        Icon::Timer => {
+            painter.circle_stroke(c.p(12.0, 13.0), c.s(7.0), stroke);
+            c.line(painter, (12.0, 13.0), (12.0, 8.5), stroke);
+            c.line(painter, (12.0, 13.0), (15.5, 13.0), thin);
+            c.line(painter, (9.5, 4.0), (14.5, 4.0), stroke);
+            c.line(painter, (12.0, 4.0), (12.0, 6.0), thin);
+        }
+        Icon::Device => {
+            c.poly(
+                painter,
+                &[(3.0, 9.5), (6.5, 9.5), (10.0, 6.0), (10.0, 18.0), (6.5, 14.5), (3.0, 14.5)],
+                color,
+            );
+            painter.arc(c.p(10.0, 12.0), c.s(4.0), -0.8..0.8, Stroke::new(w, color));
+            painter.circle_stroke(c.p(18.0, 15.0), c.s(3.2), thin);
+            painter.circle_filled(c.p(18.0, 15.0), c.s(1.2), color);
         }
     }
 }

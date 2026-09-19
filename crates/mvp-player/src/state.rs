@@ -1,7 +1,8 @@
 //! Transient interface state — everything that is *not* persisted and not part
 //! of the media engine.
 
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use mvp_core::playlist::RepeatMode;
@@ -12,20 +13,33 @@ use crate::settings::SidebarTab;
 use crate::view::{CanvasPicture, CanvasView};
 
 /// What the main area is currently showing.
+///
+/// Video and audio are separate modes rather than one `Media` mode with a flag
+/// inside it: each has its own screen module, its own transport bar and its own
+/// set of sidebar pages, and a single enum variant that lies about which of the
+/// two is open is exactly how the two ends up sharing one layout. The engine
+/// still drives both; only the interface forks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     /// Nothing is open.
     Empty,
-    /// The video/audio pipeline is driving the display.
-    Media,
+    /// A file with a picture: the video pipeline drives the display.
+    Video,
+    /// A file with no picture: the audio screen drives the display.
+    Audio,
     /// The still-image viewer is driving the display.
     Image,
 }
 
 impl Mode {
-    /// Whether the media transport controls apply.
+    /// Whether the timeline transport controls apply (video and audio).
     pub fn is_media(self) -> bool {
-        matches!(self, Mode::Media)
+        matches!(self, Mode::Video | Mode::Audio)
+    }
+
+    /// Whether the audio screen is on screen.
+    pub fn is_audio(self) -> bool {
+        matches!(self, Mode::Audio)
     }
 
     /// Whether the image tools apply.
@@ -318,6 +332,120 @@ impl FrameHistory {
     }
 }
 
+/// Lazily decoded thumbnails for the image filmstrip.
+///
+/// Decoding a photograph is too slow to do inside a frame — a 50 MP JPEG takes
+/// tens of milliseconds — so a single background thread owns the work and the
+/// interface only ever uploads what is already done. Requests are made for the
+/// rows the filmstrip is actually showing, and a failed decode is remembered as
+/// "no thumbnail" rather than retried every frame.
+pub struct ThumbCache {
+    /// Uploaded textures, or `None` for a file that could not be decoded.
+    textures: HashMap<PathBuf, Option<egui::TextureHandle>>,
+    /// Files a request is outstanding for, so one is never queued twice.
+    pending: HashSet<PathBuf>,
+    requests: crossbeam_channel::Sender<PathBuf>,
+    results: crossbeam_channel::Receiver<(PathBuf, Option<ThumbResult>)>,
+}
+
+/// One decoded thumbnail: pixel size and RGBA bytes.
+type ThumbResult = (usize, usize, Vec<u8>);
+
+/// Longest edge of a generated thumbnail, in source pixels.
+const THUMB_MAX_EDGE: u32 = 192;
+/// How many thumbnails may be remembered before the cache is dropped whole.
+const THUMB_CACHE_MAX: usize = 256;
+
+fn decode_thumbnail(path: &Path) -> Option<ThumbResult> {
+    let image = image::open(path).ok()?;
+    let thumb = image.thumbnail(THUMB_MAX_EDGE, THUMB_MAX_EDGE);
+    let rgba = thumb.to_rgba8();
+    Some((rgba.width() as usize, rgba.height() as usize, rgba.into_raw()))
+}
+
+impl ThumbCache {
+    /// Start the decode thread.
+    pub fn new() -> Self {
+        let (requests, request_rx) = crossbeam_channel::unbounded::<PathBuf>();
+        let (result_tx, results) = crossbeam_channel::unbounded();
+        let spawned = std::thread::Builder::new()
+            .name("mvp-thumbs".to_string())
+            .stack_size(512 * 1024)
+            .spawn(move || {
+                while let Ok(path) = request_rx.recv() {
+                    let decoded = decode_thumbnail(&path);
+                    if result_tx.send((path, decoded)).is_err() {
+                        break;
+                    }
+                }
+            });
+        if spawned.is_err() {
+            log::warn!("无法启动缩略图线程，胶片条将不显示缩略图");
+        }
+        Self {
+            textures: HashMap::new(),
+            pending: HashSet::new(),
+            requests,
+            results,
+        }
+    }
+
+    /// Ask for a thumbnail, unless it is already known or already queued.
+    pub fn request(&mut self, path: &Path) {
+        if self.textures.contains_key(path) || !self.pending.insert(path.to_path_buf()) {
+            return;
+        }
+        if self.requests.send(path.to_path_buf()).is_err() {
+            self.pending.remove(path);
+        }
+    }
+
+    /// A finished thumbnail, if one has been decoded.
+    pub fn get(&self, path: &Path) -> Option<&egui::TextureHandle> {
+        self.textures.get(path).and_then(|entry| entry.as_ref())
+    }
+
+    /// Upload every thumbnail finished since the last call.
+    ///
+    /// Returns how many textures became available, so the caller can keep
+    /// repainting while the filmstrip fills in.
+    pub fn drain(&mut self, ctx: &egui::Context) -> usize {
+        let mut uploaded = 0;
+        while let Ok((path, decoded)) = self.results.try_recv() {
+            self.pending.remove(&path);
+            let texture = decoded.map(|(width, height, data)| {
+                let image = egui::ColorImage::from_rgba_unmultiplied([width, height], &data);
+                ctx.load_texture(
+                    format!("mvp-thumb-{}", path.to_string_lossy()),
+                    image,
+                    egui::TextureOptions::LINEAR,
+                )
+            });
+            self.textures.insert(path, texture);
+            uploaded += 1;
+        }
+        if self.textures.len() > THUMB_CACHE_MAX {
+            self.textures.clear();
+        }
+        uploaded
+    }
+
+    /// Forget everything (the playlist changed identity).
+    pub fn clear(&mut self) {
+        self.textures.clear();
+        self.pending.clear();
+    }
+}
+
+impl std::fmt::Debug for ThumbCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ThumbCache")
+            .field("textures", &self.textures.len())
+            .field("pending", &self.pending.len())
+            .finish()
+    }
+}
+
 /// Transient UI state.
 #[derive(Debug)]
 pub struct UiState {
@@ -360,6 +488,9 @@ pub struct UiState {
     /// measuring the window instead would include the sidebar and the transport
     /// bar, and `+` would jump the first time it was pressed.
     pub picture: Option<CanvasPicture>,
+    /// Cue index the lyrics page highlighted last frame, so the view scrolls
+    /// only when the highlighted line changes rather than every frame.
+    pub last_lyric: Option<usize>,
     /// Row the user highlighted in the playlist.
     ///
     /// Deliberately *not* the playlist's "current" entry: clicking a row is a
@@ -523,6 +654,7 @@ impl Default for UiState {
             wheel_seek: 0.0,
             canvas: CanvasView::new(),
             picture: None,
+            last_lyric: None,
             playlist_selection: None,
             overlay: Overlay::None,
             settings_tab: SettingsTab::default(),

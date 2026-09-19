@@ -4,30 +4,72 @@ use egui::{Color32, Context, Rect, RichText, Sense, Stroke, Ui, Vec2};
 
 use crate::app::PlayerApp;
 use crate::icons::{self, Icon};
-use crate::settings::AspectMode;
-use crate::state::{Mode, Overlay, Toast};
+use crate::settings::{AspectMode, ImageBackground};
+use crate::state::{Overlay, Toast};
 use crate::theme::{font, radius, space, Tokens};
 use crate::ui::minimap;
 use crate::ui::surface;
 use crate::ui::widgets;
 use crate::view;
 
-/// Draw the central area.
-pub fn draw(app: &mut PlayerApp, ctx: &Context) {
+/// Draw one screen's central area.
+///
+/// The central panel is whatever the panels declared before it left over, so it
+/// has to be asked for *after* the sidebar and the transport bar have claimed
+/// their strips. Each screen owns its own entry point here because the fill
+/// behind the content differs — a film is letterboxed against pure black, the
+/// audio screen against the window background, and the welcome screen against
+/// the panel colour — and because the screen decides what "the content" is.
+fn central(
+    app: &mut PlayerApp,
+    ctx: &Context,
+    fill: Color32,
+    body: impl FnOnce(&mut PlayerApp, &mut Ui, &Tokens, &Context),
+) {
     // Whatever is on the canvas is about to be measured again. Anything that
     // reads the picture without being inside this function — the zoom keys, the
     // menu, the bird's-eye view — must see "nothing is on the canvas" rather
     // than last frame's answer on a frame that shows no picture at all.
     app.ui.picture = None;
     let tokens = app.theme.tokens.clone();
-    let frame = egui::Frame::new().fill(tokens.letterbox);
+    let frame = egui::Frame::new().fill(fill);
     egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
-        match app.mode {
-            Mode::Empty => empty_state(app, ui, &tokens),
-            Mode::Media => media_view(app, ui, &tokens),
-            Mode::Image => image_view(app, ui, &tokens, ctx),
+        body(app, ui, &tokens, ctx);
+    });
+}
+
+/// The video canvas.
+pub fn draw_video(app: &mut PlayerApp, ctx: &Context) {
+    let fill = app.theme.tokens.letterbox;
+    central(app, ctx, fill, |app, ui, tokens, _| media_view(app, ui, tokens));
+}
+
+/// The audio canvas, with no picture at all.
+pub fn draw_audio(app: &mut PlayerApp, ctx: &Context) {
+    let fill = app.theme.tokens.bg;
+    central(app, ctx, fill, |app, ui, tokens, _| {
+        let area = ui.available_rect_before_wrap();
+        audio_view(app, ui, tokens, area);
+        // A subtitle track is still good for something on a file with no
+        // picture: a lyrics file. It rides along the bottom of the screen.
+        if app.settings.subtitles_enabled {
+            draw_subtitles(app, ui, &area, tokens);
         }
     });
+}
+
+/// The still-image canvas.
+pub fn draw_image(app: &mut PlayerApp, ctx: &Context) {
+    let fill = app.theme.tokens.bg;
+    central(app, ctx, fill, |app, ui, tokens, ctx| {
+        image_view(app, ui, tokens, ctx)
+    });
+}
+
+/// The welcome screen, shown until something is open.
+pub fn draw_empty(app: &mut PlayerApp, ctx: &Context) {
+    let fill = app.theme.tokens.bg;
+    central(app, ctx, fill, |app, ui, tokens, _| empty_state(app, ui, tokens));
 }
 
 // ---------------------------------------------------------------------------
@@ -39,18 +81,12 @@ fn media_view(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
     let area = ui.available_rect_before_wrap();
     let response = ui.allocate_rect(area, Sense::click_and_drag());
 
-    // A file that is nothing but sound has no picture to letterbox, so the
-    // canvas becomes a screen of its own instead of holding "正在准备画面…" up
-    // for as long as the file plays.
-    let audio = app.is_audio_only();
-
     // ---- control-bar scrim ----------------------------------------------
     // A dimming gradient at the bottom of the picture, so the controls read
     // over bright video. In windowed mode the transport bar is docked right
     // below it; in fullscreen the bar floats over the picture and only appears
-    // with the controls, so the scrim follows it. The audio screen has no
-    // picture to dim, and its own colours are already the dark ones.
-    if !audio && app.settings.control_scrim && (!app.ui.fullscreen || app.ui.controls_visible()) {
+    // with the controls, so the scrim follows it.
+    if app.settings.control_scrim && (!app.ui.fullscreen || app.ui.controls_visible()) {
         let height = if app.ui.fullscreen { 120.0 } else { 96.0 };
         let band = Rect::from_min_max(
             egui::pos2(area.left(), (area.bottom() - height).max(area.top())),
@@ -59,35 +95,24 @@ fn media_view(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
         widgets::paint_scrim(ui.painter(), band);
     }
 
-    // Where the picture went, or `None` when there is no picture at all.
-    let picture = if audio {
-        audio_view(app, ui, tokens, area);
-        None
-    } else {
-        Some(video_view(app, ui, tokens, area))
-    };
-    if let Some(rect) = picture {
-        app.ui.picture = Some(view::CanvasPicture {
-            rect,
-            canvas: area,
-        });
-    }
+    // Where the picture went.
+    let picture = video_view(app, ui, tokens, area);
+    app.ui.picture = Some(view::CanvasPicture {
+        rect: picture,
+        canvas: area,
+    });
 
     // ---- subtitles ------------------------------------------------------
-    // Over the picture — or, with no picture to be over, along the bottom of
-    // the audio screen, which is what a subtitle track is still good for there
-    // (a lyrics file, most of the time).
     if app.settings.subtitles_enabled {
-        let anchor = picture.unwrap_or(area);
-        draw_subtitles(app, ui, &anchor, tokens);
+        draw_subtitles(app, ui, &picture, tokens);
     }
 
     // ---- bird's-eye view ------------------------------------------------
     // Measured before the pointer is handled, because a press that lands on the
     // map travels the picture instead of dragging it.
-    let map = picture.and_then(|rect| minimap::target(app, area, rect));
-    if let (Some(rect), Some(sheet)) = (picture, map) {
-        minimap::draw(app, ui, area, rect, sheet, tokens);
+    let map = minimap::target(app, area, picture);
+    if let Some(sheet) = map {
+        minimap::draw(app, ui, area, picture, sheet, tokens);
     }
 
     // ---- interaction ----------------------------------------------------
@@ -227,7 +252,7 @@ fn handle_video_interaction(
     ui: &mut Ui,
     response: &egui::Response,
     area: Rect,
-    picture: Option<Rect>,
+    picture: Rect,
     map: Option<Rect>,
 ) {
     if response.double_clicked() && app.settings.double_click_fullscreen {
@@ -236,21 +261,17 @@ fn handle_video_interaction(
     }
     // A press on the map travels; a press beside it drags the picture.
     if let Some(point) = map_press(response, map) {
-        if let Some(rect) = picture {
-            let base = app.ui.canvas.fitted_rect(rect, area);
-            let pan = view::pan_for_centre(point, rect.size());
-            app.ui.canvas.set_pan(pan, base, area);
-        }
+        let base = app.ui.canvas.fitted_rect(picture, area);
+        let pan = view::pan_for_centre(point, picture.size());
+        app.ui.canvas.set_pan(pan, base, area);
         app.ui.wake_controls(3.0);
         return;
     }
     if response.dragged() {
         if !app.ui.canvas.is_fitted() {
-            if let Some(rect) = picture {
-                let delta = response.drag_delta();
-                let base = app.ui.canvas.fitted_rect(rect, area);
-                app.ui.canvas.pan_by(delta, base, area);
-            }
+            let delta = response.drag_delta();
+            let base = app.ui.canvas.fitted_rect(picture, area);
+            app.ui.canvas.pan_by(delta, base, area);
         }
         app.ui.wake_controls(3.0);
         return;
@@ -260,8 +281,7 @@ fn handle_video_interaction(
         return;
     }
 
-    // Scroll: volume by default, zoom with Ctrl — and, on the audio screen,
-    // where there is no picture to zoom, Ctrl keeps seeking.
+    // Scroll: volume by default, zoom with Ctrl.
     //
     // One notch is one step, whatever the device reports: a notched wheel sends
     // a single 40-point spike per notch while a precision touch-pad sends a
@@ -276,18 +296,14 @@ fn handle_video_interaction(
     let (scroll, modifiers) = ui.ctx().input(|i| (i.raw_scroll_delta.y, i.modifiers));
     if scroll != 0.0 && response.hovered() && !app.ui.has_overlay() {
         if modifiers.ctrl || modifiers.command {
-            if picture.is_some() {
-                // Continuous rather than stepped: one notch is a tenth of a
-                // step, and a touch-pad's stream of small deltas zooms
-                // smoothly instead of nothing happening for a minute and then
-                // everything happening at once.
-                let factor = (scroll * WHEEL_ZOOM_RATE).exp();
-                let anchor = response.hover_pos().map(|p| p - area.center());
-                if app.zoom_media(factor, anchor) {
-                    app.ui.wake_controls(3.0);
-                }
-            } else {
-                wheel_seek(app, scroll);
+            // Continuous rather than stepped: one notch is a tenth of a step,
+            // and a touch-pad's stream of small deltas zooms smoothly instead of
+            // nothing happening for a minute and then everything happening at
+            // once.
+            let factor = (scroll * WHEEL_ZOOM_RATE).exp();
+            let anchor = response.hover_pos().map(|p| p - area.center());
+            if app.zoom_media(factor, anchor) {
+                app.ui.wake_controls(3.0);
             }
         } else if !app.settings.wheel_controls_volume {
             wheel_seek(app, scroll);
@@ -527,7 +543,7 @@ const AUDIO_TEXT_WIDTH: f32 = 0.86;
 /// Everything is painted rather than laid out as widgets: the screen is one
 /// column of centred blocks whose sizes all come from [`crate::layout`], and a
 /// label that wraps, clips or re-measures itself is exactly what would break it.
-fn audio_view(app: &PlayerApp, ui: &mut Ui, tokens: &Tokens, area: Rect) {
+pub(crate) fn audio_view(app: &PlayerApp, ui: &mut Ui, tokens: &Tokens, area: Rect) {
     let screen = crate::layout::AudioScreen::fit(area.width(), area.height());
     let info = app.engine.info();
 
@@ -884,9 +900,22 @@ fn image_view(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens, ctx: &Context) 
         canvas: area,
     });
 
-    // Cheap checkerboard for transparent images.
-    paint_checkerboard(ui.painter(), rect, tokens);
-
+    // What the photograph sits on. A transparent PNG reveals the checkerboard;
+    // any other file reveals the chosen surround where it does not reach the
+    // window edges.
+    match app.settings.image_background {
+        ImageBackground::Dark => {}
+        ImageBackground::Checkerboard => paint_checkerboard(ui.painter(), area, tokens),
+        other => {
+            if let Some(rgb) = crate::settings::background_fill(other) {
+                ui.painter().rect_filled(
+                    area,
+                    egui::CornerRadius::ZERO,
+                    Color32::from_rgb(rgb[0], rgb[1], rgb[2]),
+                );
+            }
+        }
+    }
     if let Some(texture) = &app.texture {
         image_transformed(
             ui.painter(),
@@ -924,7 +953,7 @@ fn image_toolbar(app: &mut PlayerApp, ui: &mut Ui, area: &Rect, tokens: &Tokens)
     let bar_height = 40.0;
     // The bar is narrower than its design only when the canvas really is that
     // narrow; the floor stops a tiny window from producing a negative width.
-    let bar_width = (area.width() - 24.0).clamp(160.0, 360.0);
+    let bar_width = (area.width() - 24.0).clamp(160.0, 560.0);
     let rect = Rect::from_center_size(
         egui::pos2(area.center().x, area.bottom() - space::XL - bar_height / 2.0),
         Vec2::new(bar_width, bar_height),
@@ -945,25 +974,40 @@ fn image_toolbar(app: &mut PlayerApp, ui: &mut Ui, area: &Rect, tokens: &Tokens)
     let ui = &mut child;
     ui.spacing_mut().item_spacing.x = space::XS;
 
-    if crate::ui::widgets::tool_button(tokens, ui, Icon::ZoomOut, "缩小 (-)", true).clicked() {
+    if widgets::tool_button(tokens, ui, Icon::ZoomOut, "缩小 (-)", true).clicked() {
         app.image.zoom_by(0.8, Some((area.width(), area.height())));
     }
-    if crate::ui::widgets::tool_button(tokens, ui, Icon::ZoomIn, "放大 (+)", true).clicked() {
+    if widgets::tool_button(tokens, ui, Icon::ZoomIn, "放大 (+)", true).clicked() {
         app.image.zoom_by(1.25, Some((area.width(), area.height())));
     }
-    if crate::ui::widgets::tool_button(tokens, ui, Icon::FitToWindow, "适应窗口 (0)", true).clicked()
-    {
+    if widgets::tool_button(tokens, ui, Icon::FitToWindow, "适应窗口 (0)", true).clicked() {
         app.image.fit = mvp_core::FitMode::Fit;
         app.image.offset = (0.0, 0.0);
     }
-    if crate::ui::widgets::tool_button(tokens, ui, Icon::RotateCcw, "逆时针旋转", true).clicked() {
+    widgets::icon_menu(ui, tokens, Icon::FitToWindow, "适应", |ui| {
+        ui.set_min_width(160.0);
+        for (mode, label) in [
+            (mvp_core::FitMode::Fit, "适应窗口"),
+            (mvp_core::FitMode::Fill, "填充窗口"),
+            (mvp_core::FitMode::Original, "原始大小 100%"),
+        ] {
+            if ui
+                .selectable_label(app.image.fit == mode, RichText::new(label).size(font::SMALL))
+                .clicked()
+            {
+                app.image.fit = mode;
+                app.image.offset = (0.0, 0.0);
+                ui.close();
+            }
+        }
+    });
+    if widgets::tool_button(tokens, ui, Icon::RotateCcw, "逆时针旋转", true).clicked() {
         app.image.rotate_ccw();
     }
-    if crate::ui::widgets::tool_button(tokens, ui, Icon::RotateCw, "顺时针旋转 (R)", true).clicked()
-    {
+    if widgets::tool_button(tokens, ui, Icon::RotateCw, "顺时针旋转 (R)", true).clicked() {
         app.image.rotate_cw();
     }
-    if crate::ui::widgets::toggle_tool_button(
+    if widgets::toggle_tool_button(
         tokens,
         ui,
         Icon::FlipHorizontal,
@@ -975,7 +1019,7 @@ fn image_toolbar(app: &mut PlayerApp, ui: &mut Ui, area: &Rect, tokens: &Tokens)
     {
         app.image.toggle_flip_h();
     }
-    if crate::ui::widgets::toggle_tool_button(
+    if widgets::toggle_tool_button(
         tokens,
         ui,
         Icon::FlipVertical,
@@ -987,7 +1031,27 @@ fn image_toolbar(app: &mut PlayerApp, ui: &mut Ui, area: &Rect, tokens: &Tokens)
     {
         app.image.toggle_flip_v();
     }
-    if crate::ui::widgets::toggle_tool_button(
+
+    // ---- background ------------------------------------------------------
+    widgets::icon_menu(ui, tokens, Icon::Palette, "背景", |ui| {
+        ui.set_min_width(140.0);
+        for mode in ImageBackground::all() {
+            if ui
+                .selectable_label(
+                    app.settings.image_background == *mode,
+                    RichText::new(mode.label()).size(font::SMALL),
+                )
+                .clicked()
+            {
+                app.settings.image_background = *mode;
+                app.store.mark_dirty();
+                ui.close();
+            }
+        }
+    });
+
+    // ---- slideshow -------------------------------------------------------
+    if widgets::toggle_tool_button(
         tokens,
         ui,
         Icon::Slideshow,
@@ -1002,11 +1066,43 @@ fn image_toolbar(app: &mut PlayerApp, ui: &mut Ui, area: &Rect, tokens: &Tokens)
         let on = app.settings.slideshow_active;
         app.toast(Toast::info(if on { "幻灯片已开启" } else { "幻灯片已关闭" }));
     }
+    widgets::icon_menu(ui, tokens, Icon::Timer, "间隔", |ui| {
+        ui.set_min_width(150.0);
+        for seconds in [2.0f32, 3.0, 5.0, 8.0, 10.0, 15.0] {
+            let selected = (app.settings.slideshow_interval - seconds).abs() < 0.1;
+            if ui
+                .selectable_label(
+                    selected,
+                    RichText::new(format!("{seconds:.0} 秒")).size(font::SMALL),
+                )
+                .clicked()
+            {
+                app.settings.slideshow_interval = seconds;
+                app.store.mark_dirty();
+                ui.close();
+            }
+        }
+        ui.separator();
+        if ui
+            .selectable_label(
+                app.settings.shuffle,
+                RichText::new("随机顺序").size(font::SMALL),
+            )
+            .clicked()
+        {
+            app.settings.shuffle = !app.settings.shuffle;
+            app.store.mark_dirty();
+            ui.close();
+        }
+    });
 }
 
 fn paint_checkerboard(painter: &egui::Painter, rect: Rect, tokens: &Tokens) {
     /// Cell size in points, before it is snapped to whole pixels.
     const CELL: f32 = 12.0;
+    /// Rough ceiling on the number of squares, so covering a 4K canvas does not
+    /// generate a hundred thousand rectangles; the cell grows to respect it.
+    const MAX_CELLS: f32 = 4000.0;
 
     // Both the grid and its origin are snapped to whole *device* pixels first. A
     // checkerboard whose cell edges fall between pixels gets a grey seam along
@@ -1014,7 +1110,8 @@ fn paint_checkerboard(painter: &egui::Painter, rect: Rect, tokens: &Tokens) {
     // for — that reads as a fine mesh of scratches ruled over the picture.
     let scale = painter.ctx().pixels_per_point().max(1.0);
     let snap = |value: f32| (value * scale).round() / scale;
-    let cell = snap(CELL).max(1.0);
+    let floor = ((rect.width() * rect.height() / MAX_CELLS).sqrt()).max(CELL);
+    let cell = snap(floor).max(1.0);
     let rect = Rect::from_min_max(
         egui::pos2(snap(rect.min.x), snap(rect.min.y)),
         egui::pos2(snap(rect.max.x), snap(rect.max.y)),
@@ -1023,11 +1120,6 @@ fn paint_checkerboard(painter: &egui::Painter, rect: Rect, tokens: &Tokens) {
     painter.rect_filled(rect, egui::CornerRadius::ZERO, Color32::from_gray(28));
     let cols = (rect.width() / cell).ceil() as i32;
     let rows = (rect.height() / cell).ceil() as i32;
-    // Cap the number of cells so a wildly zoomed-out image does not generate
-    // tens of thousands of rectangles.
-    if cols * rows > 4000 {
-        return;
-    }
     for row in 0..rows {
         for col in 0..cols {
             if (row + col) % 2 == 0 {

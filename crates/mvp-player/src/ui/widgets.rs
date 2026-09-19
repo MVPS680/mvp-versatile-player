@@ -458,6 +458,23 @@ pub fn toggle_tool_button(
 }
 
 /// A labelled switch row for the settings window.
+/// A menu button preceded by an icon.
+///
+/// `egui`'s `MenuButton` takes text and nothing else, but the transport and the
+/// image toolbar are icon-led surfaces; this draws the glyph in the same slot a
+/// tool button would use and hands the menu itself to the caller.
+pub fn icon_menu(
+    ui: &mut Ui,
+    tokens: &Tokens,
+    icon: Icon,
+    text: &str,
+    add: impl FnOnce(&mut Ui),
+) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(16.0, 18.0), Sense::hover());
+    icons::draw(ui.painter(), rect.shrink(1.0), icon, tokens.text_weak);
+    egui::containers::menu::MenuButton::new(RichText::new(text).size(font::SMALL)).ui(ui, add);
+}
+
 pub fn switch_row(ui: &mut Ui, tokens: &Tokens, label: &str, value: &mut bool, hint: &str) -> bool {
     row(ui, tokens, label, hint, 40.0, |ui| {
         switch(ui, tokens, value).changed()
@@ -721,6 +738,8 @@ pub fn seek_bar(
     position: f64,
     duration: f64,
     dragging: Option<f64>,
+    marks: &[f64],
+    ab_loop: Option<(f64, f64)>,
 ) -> SeekBarOutput {
     let height = 22.0;
     /// Radius of the handle under the pointer. The ends of the track are inset
@@ -765,6 +784,59 @@ pub fn seek_bar(
             Vec2::new(bar.width() * progress, bar.height()),
         );
         ui.painter().rect_filled(filled, radius, tokens.progress);
+    }
+
+    // The A–B region, when one is armed: a warm band under the progress, drawn
+    // over the track so the section is readable even where it has not been
+    // played yet, with a hard end mark at each letter.
+    if duration > 0.0 {
+        if let Some((a, b)) = ab_loop {
+            let (from, to) = (a.min(b), a.max(b));
+            if to > from {
+                let x0 = track.left() + track.width() * fraction(from);
+                let x1 = track.left() + track.width() * fraction(to);
+                let band = Rect::from_min_max(
+                    egui::pos2(x0, bar.top() - 2.0),
+                    egui::pos2(x1, bar.bottom() + 2.0),
+                );
+                ui.painter().rect_filled(
+                    band,
+                    CornerRadius::same(2),
+                    tokens.warning.gamma_multiply(0.35),
+                );
+                for edge in [x0, x1] {
+                    ui.painter().rect_filled(
+                        Rect::from_min_max(
+                            egui::pos2(edge - 1.0, bar.top() - 4.0),
+                            egui::pos2(edge + 1.0, bar.bottom() + 4.0),
+                        ),
+                        CornerRadius::ZERO,
+                        tokens.warning,
+                    );
+                }
+            }
+        }
+    }
+
+    // Chapter marks: hairlines on the track the viewer can aim at. A chapter
+    // start is a place a film is actually navigated to, so it earns a visible
+    // tick where an arbitrary time would not.
+    if duration > 0.0 {
+        for mark in marks {
+            let fraction = fraction(*mark);
+            if !(0.001..=0.999).contains(&fraction) {
+                continue;
+            }
+            let x = track.left() + track.width() * fraction;
+            ui.painter().rect_filled(
+                Rect::from_min_max(
+                    egui::pos2(x - 0.75, bar.top() - 3.0),
+                    egui::pos2(x + 0.75, bar.bottom() + 3.0),
+                ),
+                CornerRadius::ZERO,
+                tokens.text.gamma_multiply(0.55),
+            );
+        }
     }
 
     // Handle: a plain white disc, the way every system this one borrows from

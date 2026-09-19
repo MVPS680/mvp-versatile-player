@@ -95,6 +95,13 @@ pub enum SidebarTab {
     Chapters,
     /// Technical details of the current file.
     Info,
+    /// The current file's subtitle track shown as scrolling lyrics.
+    ///
+    /// Only offered by the audio screen: on a film the same cues belong on the
+    /// picture, where they already are.
+    Lyrics,
+    /// A photograph's parameters: size, format, colour, EXIF orientation.
+    Exif,
 }
 
 impl SidebarTab {
@@ -105,16 +112,21 @@ impl SidebarTab {
             SidebarTab::Tracks => "轨道",
             SidebarTab::Chapters => "章节",
             SidebarTab::Info => "信息",
+            SidebarTab::Lyrics => "歌词",
+            SidebarTab::Exif => "图片信息",
         }
     }
 
-    /// Every tab, in display order.
+    /// Every tab, in display order. Kept for the settings document and tests;
+    /// each screen narrows this to the pages that mean something to it.
     pub fn all() -> &'static [SidebarTab] {
         &[
             SidebarTab::Playlist,
             SidebarTab::Tracks,
             SidebarTab::Chapters,
             SidebarTab::Info,
+            SidebarTab::Lyrics,
+            SidebarTab::Exif,
         ]
     }
 }
@@ -148,6 +160,59 @@ impl EndAction {
     /// settings page could quietly drift apart.
     pub fn choices() -> [(EndAction, &'static str); 3] {
         [EndAction::Playlist, EndAction::Hold, EndAction::Close].map(|action| (action, action.label()))
+    }
+}
+
+/// What is painted behind a still image.
+///
+/// A photograph that does not fill the window sits on *something*, and what that
+/// something is changes how the picture reads: a dark surround for normal
+/// viewing, pure black for judging contrast, a light surround for print, and the
+/// checkerboard when the file has transparency to reveal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ImageBackground {
+    /// The window background — the quiet default.
+    #[default]
+    Dark,
+    /// Pure black, for judging contrast the way a grading suite does.
+    Black,
+    /// Light grey, the surround a print is judged against.
+    Light,
+    /// A transparency checkerboard.
+    Checkerboard,
+}
+
+impl ImageBackground {
+    /// Label for the toolbar menu.
+    pub fn label(self) -> &'static str {
+        match self {
+            ImageBackground::Dark => "深色",
+            ImageBackground::Black => "纯黑",
+            ImageBackground::Light => "浅色",
+            ImageBackground::Checkerboard => "棋盘格",
+        }
+    }
+
+    /// Every choice, in menu order.
+    pub fn all() -> &'static [ImageBackground] {
+        &[
+            ImageBackground::Dark,
+            ImageBackground::Black,
+            ImageBackground::Light,
+            ImageBackground::Checkerboard,
+        ]
+    }
+
+}
+
+/// An RGB fill for the canvas, for everything but the checkerboard (which draws
+/// itself) and the default (which leaves the panel's own background alone).
+pub fn background_fill(background: ImageBackground) -> Option<[u8; 3]> {
+    match background {
+        ImageBackground::Dark => None,
+        ImageBackground::Black => Some([0, 0, 0]),
+        ImageBackground::Light => Some([214, 214, 216]),
+        ImageBackground::Checkerboard => None,
     }
 }
 
@@ -232,6 +297,8 @@ pub struct Settings {
     pub slideshow_active: bool,
     /// Animated images loop.
     pub animate_images: bool,
+    /// What is painted behind a still that does not fill the window.
+    pub image_background: ImageBackground,
 
     // ---- shell integration ----------------------------------------------
     /// Media families to register with Explorer.
@@ -331,6 +398,7 @@ impl Default for Settings {
             slideshow_interval: 5.0,
             slideshow_active: false,
             animate_images: true,
+            image_background: ImageBackground::default(),
 
             file_kinds: FileKinds::default(),
             context_menu: true,
@@ -754,7 +822,12 @@ mod tests {
         assert_eq!(AspectMode::Fit.forced_ratio(), None);
         assert!((AspectMode::Ratio16x9.forced_ratio().unwrap() - 16.0 / 9.0).abs() < 1e-6);
         assert_eq!(AspectMode::all().len(), 5);
-        assert_eq!(SidebarTab::all().len(), 4);
+        // The sidebar has grown past the playlist's original four pages: the
+        // audio screen adds lyrics and the image screen adds picture details.
+        assert_eq!(SidebarTab::all().len(), 6);
+        for tab in SidebarTab::all() {
+            assert!(!tab.label().is_empty());
+        }
     }
 
     /// Two menu entries that do the same thing are worse than one: `Source`
