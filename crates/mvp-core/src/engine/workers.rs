@@ -49,6 +49,24 @@ const WORKER_POLL: Duration = Duration::from_millis(25);
 /// seek or a rate change takes effect at once.
 const VIDEO_LEAD: f64 = 0.5;
 
+/// How much audio the decoder may hold ahead of the playhead, in *real*
+/// seconds.
+///
+/// The sound path's counterpart to [`VIDEO_LEAD`]. Audio is decoded *ahead* of
+/// the clock and time-stretched before it is queued, so everything already in
+/// the queue keeps the speed it was decoded with: without a bound, an
+/// audio-only file — where no video queue throttles the demuxer — fills the
+/// whole chunk queue, about three seconds, and a rate change is not heard until
+/// that backlog has drained, while the clock has already run off at the new
+/// speed.
+///
+/// The bound is expressed in real seconds rather than media seconds because
+/// that is what the user actually waits: 0.5 s of media queued at 0.25x still
+/// takes two real seconds to play out, which would leave a slow-speed rate
+/// change feeling just as late. Half a second of real audio covers a disk or
+/// network hiccup without making a rate change feel late.
+const AUDIO_LEAD: f64 = 0.5;
+
 /// How long the decoder may be fed without producing a frame before the engine
 /// declares the file unplayable.
 ///
@@ -1729,6 +1747,33 @@ fn reset_audio_session(
     shared.audio_ended.store(false, Ordering::Relaxed);
 }
 
+/// Wait until the audio just decoded is no more than [`AUDIO_LEAD`] ahead of the
+/// playhead.
+///
+/// Returns `false` when the batch must be abandoned: the player is shutting down,
+/// or a seek / track change is waiting and must not be left behind a full queue.
+/// The wait is a plain sleep because the clock — the thing being waited for —
+/// advances on its own; each sleep is bounded to a poll interval so a control
+/// request is noticed promptly.
+fn wait_for_audio_lead(shared: &Shared, pts: f64) -> bool {
+    loop {
+        if shared.abort.load(Ordering::Relaxed) || shared.audio_flush.lock().is_some() {
+            return false;
+        }
+        // Media seconds ahead, converted to the real time it will take to play
+        // them out. The clock closes that real gap at one second per second, so
+        // the wait below is exact while the speed is steady, and re-measured
+        // after every sleep.
+        let speed = shared.speed().max(0.05);
+        let lead = (pts - shared.clock.now()) / speed;
+        if lead <= AUDIO_LEAD {
+            return true;
+        }
+        let wait = (lead - AUDIO_LEAD).clamp(0.001, CONTROL_POLL.as_secs_f64());
+        std::thread::sleep(Duration::from_secs_f64(wait));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn drain_audio(
     shared: &Arc<Shared>,
@@ -1879,6 +1924,13 @@ fn drain_audio(
         let mut stretched: Vec<f32> = Vec::with_capacity(expected + 4096);
         stretcher.push(scratch, &mut stretched);
         if !stretched.is_empty() {
+            // Never let the already-stretched output pile up ahead of the
+            // playhead: it carries whatever speed it was decoded with, so a
+            // backlog is a rate change the user has not heard yet. See
+            // [`AUDIO_LEAD`].
+            if !wait_for_audio_lead(shared, pts) {
+                return;
+            }
             sink.push(stretched, pts);
         }
     }
