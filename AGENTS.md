@@ -96,6 +96,22 @@ so callers need only depend on `mvp-core`.
   the per-file key and the renderer all ask, and with the sliders neutral and the
   enhancement off `picture::uniforms` returns `None`, so the pass is not in the pipeline
   at all — that, rather than a small alpha, is what "off" means.
+- **Audio enhancement lives in the device callback, and the callback owns the DSP.**
+  `mvp-core/src/dsp/enhance.rs` is the chain (ten-band EQ → bass/harmonics → clarity/transients
+  → loudness → spatial → look-ahead limiter), `dsp/biquad.rs` the RBJ filters behind it — both
+  a sibling of `dsp.rs` in the same Rust-2018 layout `engine.rs`/`engine/` uses. The chain is
+  built in `AudioSink::build`, once per opened device, so its buffers are allocated there and
+  **never** in the callback; parameters arrive through `EnhanceParams`, a seqlock over a flat
+  atomic block, which is a fourth instance of the same rule as the three below — the real-time
+  thread takes no lock, allocates nothing and waits for nobody. `mvp-player` writes that block
+  through `PlayerApp::publish_audio_enhance` (one path from interface to DSP, as `picture.rs`
+  does for the GPU) and the settings document only mirrors it (`AudioEnhanceSettings::snapshot`
+  is the single translation point, and it clamps).
+  "Off" means off here too, and there are two of them: the master switch keeps the chain out of
+  the callback entirely, and a chain that is switched on with every control neutral returns
+  before touching a sample — the tests assert both are bit-exact against the untouched buffer.
+  Latency is real and reported, not hidden: the limiter's 1 ms of look-ahead (plus 12 ms when
+  the cross-feed is on) is what `Engine::audio_enhance_latency_ms` exists for.
 - `mvp-player/src/app.rs` is the only place the engine, playlist, settings and
   UI state are allowed to talk to each other. `state.rs` is transient UI state
   (never persisted); `settings.rs` is the persisted document.

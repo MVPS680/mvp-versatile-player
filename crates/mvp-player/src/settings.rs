@@ -369,6 +369,221 @@ pub fn background_fill(background: ImageBackground) -> Option<[u8; 3]> {
 /// Keys that no longer exist are ignored rather than rejected, which is how a
 /// retired preference — `autoplay`, which used to leave the player unable to
 /// play a double-clicked file — is dropped instead of breaking the document.
+/// A named equaliser curve.
+///
+/// The bands themselves are fixed — the frequencies live in `mvp_core::dsp::EQ_FREQS`,
+/// so the interface, the presets and the DSP cannot drift apart — and a preset is
+/// nothing but ten gain values in dB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum EqPreset {
+    /// Everything at 0 dB.
+    #[default]
+    Flat,
+    /// Bass and low mids up, treble slightly down: warmth for small speakers.
+    Warm,
+    /// Bass down, presence and air up.
+    Bright,
+    /// Mids and presence up: film dialogue and speech.
+    Voice,
+    /// A scoop in the low mids with bass and presence lifted.
+    Rock,
+    /// Sub-bass and bass up hardest, everything else untouched.
+    Bass,
+    /// Presence and air up, bass untouched.
+    Treble,
+    /// A gentle mid scoop with both ends lifted.
+    Pop,
+    /// The user's own gains. Selecting it changes nothing; moving any band
+    /// switches the preset to it.
+    Custom,
+}
+
+impl EqPreset {
+    /// Every preset, in menu order.
+    pub fn all() -> &'static [EqPreset] {
+        &[
+            EqPreset::Flat,
+            EqPreset::Warm,
+            EqPreset::Bright,
+            EqPreset::Voice,
+            EqPreset::Rock,
+            EqPreset::Bass,
+            EqPreset::Treble,
+            EqPreset::Pop,
+            EqPreset::Custom,
+        ]
+    }
+
+    /// Label for the preset menu.
+    pub fn label(self) -> &'static str {
+        match self {
+            EqPreset::Flat => "平直",
+            EqPreset::Warm => "温暖",
+            EqPreset::Bright => "明亮",
+            EqPreset::Voice => "人声",
+            EqPreset::Rock => "摇滚",
+            EqPreset::Bass => "低音增强",
+            EqPreset::Treble => "高音增强",
+            EqPreset::Pop => "流行",
+            EqPreset::Custom => "自定义",
+        }
+    }
+
+    /// Band gains in dB, one per [`mvp_core::dsp::EQ_BANDS`] band.
+    pub fn gains(self) -> [f32; mvp_core::dsp::EQ_BANDS] {
+        match self {
+            EqPreset::Flat | EqPreset::Custom => [0.0; mvp_core::dsp::EQ_BANDS],
+            EqPreset::Warm => [3.0, 2.5, 1.5, 0.5, 0.0, -0.5, -1.0, -1.0, -0.5, 0.0],
+            EqPreset::Bright => [-2.0, -1.5, -0.5, 0.0, 0.5, 1.0, 2.0, 3.0, 3.5, 3.0],
+            EqPreset::Voice => [-3.0, -2.0, 0.0, 1.5, 2.5, 3.0, 3.0, 2.0, 1.0, 0.0],
+            EqPreset::Rock => [3.0, 2.0, 0.0, -1.0, -1.5, 0.0, 2.0, 3.0, 3.0, 2.5],
+            EqPreset::Bass => [6.0, 5.0, 3.5, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            EqPreset::Treble => [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 2.5, 4.0, 4.5, 4.0],
+            EqPreset::Pop => [-1.0, 0.0, 1.5, 3.0, 2.0, 0.0, -0.5, -0.5, 1.0, 2.0],
+        }
+    }
+
+    /// The preset a set of gains equals, or [`EqPreset::Custom`] when it matches none.
+    pub fn of(gains: [f32; mvp_core::dsp::EQ_BANDS]) -> EqPreset {
+        for preset in Self::all() {
+            if *preset == EqPreset::Custom {
+                continue;
+            }
+            let matches = preset
+                .gains()
+                .iter()
+                .zip(gains.iter())
+                .all(|(a, b)| (a - b).abs() < 0.05);
+            if matches {
+                return *preset;
+            }
+        }
+        EqPreset::Custom
+    }
+}
+
+/// Audio enhancement: the ten-band equaliser and the effects after it.
+///
+/// One flat document rather than a list of effects: the DSP chain is a fixed order
+/// (see `mvp_core::dsp::enhance`), so the settings that configure it should be just
+/// as fixed, and a stored file cannot ask for an order that does not exist.
+///
+/// The defaults are the *neutral* ones, twice over: [`Self::enabled`] is `false` and
+/// every control is at its do-nothing position. Switching the feature on without
+/// touching a control therefore sounds exactly like it did before the feature
+/// existed, which is what the DSP's bypass guarantees.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AudioEnhanceSettings {
+    /// Master switch. Off means the chain is not in the pipeline at all.
+    pub enabled: bool,
+    /// The named curve the band gains came from.
+    pub preset: EqPreset,
+    /// Band gains in dB, `-12.0..=12.0`.
+    pub bands: [f32; mvp_core::dsp::EQ_BANDS],
+    /// Q of the peaking bands: how wide each one is.
+    pub bandwidth: f32,
+    /// Low-shelf bass in dB.
+    pub bass_db: f32,
+    /// Second-harmonic content for the bass, `0.0..=1.0`.
+    pub bass_harmonics: f32,
+    /// High-shelf clarity in dB.
+    pub clarity_db: f32,
+    /// Transient emphasis, `0.0..=1.0`.
+    pub clarity_transient: f32,
+    /// Normalisation target in dBFS; `-60.0` is "off".
+    pub loudness_db: f32,
+    /// How fast the normaliser follows, in seconds.
+    pub loudness_speed: f32,
+    /// True-peak ceiling in dBFS, `-6.0..=0.0`.
+    pub limiter_ceiling_db: f32,
+    /// Stereo width, `1.0` is untouched.
+    pub width: f32,
+    /// Cross-feed amount, `0.0..=1.0`.
+    pub room: f32,
+}
+
+impl Default for AudioEnhanceSettings {
+    fn default() -> Self {
+        let snapshot = mvp_core::dsp::Snapshot::default();
+        Self {
+            enabled: false,
+            preset: EqPreset::default(),
+            bands: snapshot.eq_gain,
+            bandwidth: snapshot.eq_q,
+            bass_db: snapshot.bass_db,
+            bass_harmonics: snapshot.bass_harmonics,
+            clarity_db: snapshot.clarity_db,
+            clarity_transient: snapshot.clarity_transient,
+            loudness_db: snapshot.loudness_target_db,
+            loudness_speed: snapshot.loudness_speed_s,
+            limiter_ceiling_db: snapshot.limiter_ceiling_db,
+            width: snapshot.spatial_width,
+            room: snapshot.spatial_room,
+        }
+    }
+}
+
+impl AudioEnhanceSettings {
+    /// The parameter set the DSP reads.
+    ///
+    /// The single translation point between the document and the engine: the
+    /// interface never builds a `Snapshot` itself, and the stored shape is free to
+    /// stay comfortable (a named preset, ten gains) while the DSP gets a flat,
+    /// clamped block it can read from a real-time thread.
+    pub fn snapshot(&self) -> mvp_core::dsp::Snapshot {
+        let mut snapshot = mvp_core::dsp::Snapshot {
+            bypass: !self.enabled,
+            eq_gain: self.bands,
+            eq_q: self.bandwidth,
+            bass_db: self.bass_db,
+            bass_harmonics: self.bass_harmonics,
+            clarity_db: self.clarity_db,
+            clarity_transient: self.clarity_transient,
+            loudness_target_db: self.loudness_db,
+            loudness_speed_s: self.loudness_speed,
+            limiter_ceiling_db: self.limiter_ceiling_db,
+            spatial_width: self.width,
+            spatial_room: self.room,
+        };
+        // The file is editable by hand, so the clamp happens here rather than in the
+        // callback: a wild number must become a legal filter, not a NaN.
+        snapshot.clamp();
+        snapshot
+    }
+
+    /// `true` when every control is at its neutral position.
+    pub fn is_neutral(&self) -> bool {
+        self.snapshot().is_idle()
+    }
+
+    /// Set one band. The preset follows the gains: moving a band away from a named
+    /// curve switches the label to 自定义, and moving it back finds the curve again.
+    pub fn set_band(&mut self, index: usize, gain: f32) {
+        if let Some(slot) = self.bands.get_mut(index) {
+            *slot = gain.clamp(-12.0, 12.0);
+        }
+        self.preset = EqPreset::of(self.bands);
+    }
+
+    /// Select a preset, replacing the band gains with its curve.
+    ///
+    /// [`EqPreset::Custom`] is deliberately a no-op on the gains: it is a label for
+    /// what the user already set, not a curve of its own.
+    pub fn apply_preset(&mut self, preset: EqPreset) {
+        self.preset = preset;
+        if preset != EqPreset::Custom {
+            self.bands = preset.gains();
+        }
+    }
+
+    /// Everything back to neutral, leaving the master switch where it is.
+    pub fn reset(&mut self) {
+        let enabled = self.enabled;
+        *self = Self { enabled, ..Self::default() };
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -381,6 +596,8 @@ pub struct Settings {
     pub audio_device: Option<String>,
     /// Audio delay in seconds relative to the video.
     pub audio_delay: f64,
+    /// The equaliser and the effects after the volume stage.
+    pub audio_enhance: AudioEnhanceSettings,
 
     // ---- playback --------------------------------------------------------
     /// Playback rate.
@@ -535,6 +752,7 @@ impl Default for Settings {
             muted: false,
             audio_device: None,
             audio_delay: 0.0,
+            audio_enhance: AudioEnhanceSettings::default(),
 
             speed: 1.0,
             repeat: RepeatMode::Off,
@@ -1068,6 +1286,107 @@ mod tests {
         // here would touch the user's real settings file, which is why the test
         // stops at the decision and not at the write.)
         assert!(!store.flush_if_due(&s));
+    }
+
+    #[test]
+    fn the_audio_enhance_defaults_are_neutral_and_off() {
+        let s = Settings::default();
+        assert!(!s.audio_enhance.enabled, "the feature ships off");
+        assert!(
+            s.audio_enhance.is_neutral(),
+            "every control starts at its do-nothing position"
+        );
+        assert_eq!(s.audio_enhance.preset, EqPreset::Flat);
+        // And the snapshot says bypassed, which is what makes the default bit-exact:
+        // switching the feature on and touching nothing must not change a sample.
+        assert!(s.audio_enhance.snapshot().bypass);
+    }
+
+    #[test]
+    fn moving_a_band_leaves_the_named_preset_behind() {
+        let mut s = AudioEnhanceSettings::default();
+        s.apply_preset(EqPreset::Rock);
+        assert_eq!(s.preset, EqPreset::Rock);
+        assert_eq!(s.bands, EqPreset::Rock.gains());
+
+        s.set_band(4, EqPreset::Rock.gains()[4] + 3.0);
+        assert_eq!(s.preset, EqPreset::Custom, "a hand-moved band is no longer 摇滚");
+
+        // And putting it back finds the curve again.
+        s.set_band(4, EqPreset::Rock.gains()[4]);
+        assert_eq!(s.preset, EqPreset::Rock);
+    }
+
+    #[test]
+    fn selecting_custom_keeps_the_gains_the_user_set() {
+        let mut s = AudioEnhanceSettings::default();
+        s.set_band(0, 4.0);
+        let gains = s.bands;
+        s.apply_preset(EqPreset::Custom);
+        assert_eq!(s.bands, gains, "自定义 is a label, not a curve of its own");
+    }
+
+    #[test]
+    fn the_snapshot_is_what_the_dsp_reads() {
+        let mut s = AudioEnhanceSettings {
+            enabled: true,
+            bass_db: 5.0,
+            loudness_db: -18.0,
+            ..AudioEnhanceSettings::default()
+        };
+        s.set_band(9, 2.0);
+
+        let snapshot = s.snapshot();
+        assert!(!snapshot.bypass, "the master switch becomes the bypass flag");
+        assert_eq!(snapshot.bass_db, 5.0);
+        assert_eq!(snapshot.loudness_target_db, -18.0);
+        assert_eq!(snapshot.eq_gain[9], 2.0);
+        assert!(!snapshot.is_idle());
+    }
+
+    #[test]
+    fn a_hand_edited_audio_enhance_block_is_clamped_on_the_way_to_the_engine() {
+        // The settings file is editable by hand, and this is the last point before a wild
+        // number becomes a filter coefficient.
+        let mut s = AudioEnhanceSettings {
+            enabled: true,
+            bass_db: 999.0,
+            width: f32::INFINITY,
+            ..AudioEnhanceSettings::default()
+        };
+        s.bands = [f32::NAN; mvp_core::dsp::EQ_BANDS];
+
+        let snapshot = s.snapshot();
+        assert!(snapshot.eq_gain.iter().all(|gain| gain.is_finite()));
+        assert_eq!(snapshot.bass_db, 12.0);
+        assert!(snapshot.spatial_width.is_finite());
+    }
+
+    #[test]
+    fn the_audio_enhance_block_round_trips_through_json() {
+        let mut s = AudioEnhanceSettings {
+            enabled: true,
+            preset: EqPreset::Voice,
+            bass_db: 3.0,
+            room: 0.25,
+            ..AudioEnhanceSettings::default()
+        };
+        s.apply_preset(EqPreset::Voice);
+
+        let text = serde_json::to_string(&s).unwrap();
+        let back: AudioEnhanceSettings = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, s);
+    }
+
+    #[test]
+    fn an_old_settings_file_without_the_audio_enhance_block_still_loads() {
+        // Every settings file written before this feature existed has no such key, and
+        // `#[serde(default)]` has to produce the neutral, switched-off block.
+        let json = r#"{"volume":0.5}"#;
+        let s: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(s.volume, 0.5);
+        assert!(!s.audio_enhance.enabled);
+        assert!(s.audio_enhance.is_neutral());
     }
 
     /// `--volume` and `--speed` are start-up values, not preferences.

@@ -15,6 +15,7 @@
 //!  └──────────────────────────────────────────────────────────┘
 //!  ```
 
+mod audio_enhance;
 mod canvas;
 mod dialogs;
 mod menu;
@@ -104,10 +105,12 @@ pub fn draw(app: &mut PlayerApp, ctx: &Context) {
         screens::draw_overlay(app, ctx);
     }
 
-    // The picture panel is a window, not an overlay: it must not dim the frame it is
-    // being used to judge, so it is painted with the settings window, after the
-    // picture, and it never takes the keyboard.
+    // The picture panel and the audio enhancement panel are windows, not overlays:
+    // neither may dim what it is being used to judge — the frame, or the sound — so both
+    // are painted with the settings window, after the picture, and neither takes the
+    // keyboard.
     picture_panel::draw(app, ctx);
+    audio_enhance::draw(app, ctx);
 
     settings_window::draw(app, ctx);
     dialogs::draw(app, ctx);

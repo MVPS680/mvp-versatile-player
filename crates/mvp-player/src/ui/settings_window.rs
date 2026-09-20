@@ -1,5 +1,9 @@
 //! The settings window: seven pages covering playback, output, subtitles, shell
 //! integration, shortcuts and version information.
+//!
+//! The audio enhancement panel is deliberately **not** one of them: it is a floating
+//! window of its own, opened from the 音频 menu, so it can stay up while playback
+//! continues. See [`crate::ui::audio_enhance`].
 
 use egui::{Context, RichText, Ui};
 

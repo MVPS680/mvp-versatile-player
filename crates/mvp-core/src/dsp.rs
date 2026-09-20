@@ -10,6 +10,14 @@
 //! windows changes — never their pitch period — speech and music keep their
 //! natural pitch at any speed.
 
+mod biquad;
+mod enhance;
+
+pub use biquad::{Biquad, Coeffs};
+pub use enhance::{
+    EnhanceChain, EnhanceParams, Snapshot, EQ_BANDS, EQ_FREQS,
+};
+
 /// A SOLA time stretcher for interleaved `f32` audio.
 ///
 /// `push` accumulates input and appends stretched output; nothing is produced

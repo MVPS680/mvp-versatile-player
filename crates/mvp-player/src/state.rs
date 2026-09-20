@@ -515,6 +515,12 @@ pub struct UiState {
     /// judge, nor take the keyboard away from playback. See
     /// [`crate::ui::picture_panel`].
     pub picture_panel_open: bool,
+    /// The audio enhancement panel is open.
+    ///
+    /// A floating window rather than an [`Overlay`], for the same reason as the picture
+    /// panel: the equaliser is judged by ear while playback continues, so the panel must
+    /// not dim the interface or take the keyboard. See [`crate::ui::audio_enhance`].
+    pub audio_enhance_open: bool,
     /// Active settings page.
     pub settings_tab: SettingsTab,
     /// Settings page the other caches were filled for.
@@ -688,6 +694,7 @@ impl Default for UiState {
             playlist_selection: None,
             overlay: Overlay::None,
             picture_panel_open: false,
+            audio_enhance_open: false,
             settings_tab: SettingsTab::default(),
             cached_settings_tab: None,
             assoc_cache: None,

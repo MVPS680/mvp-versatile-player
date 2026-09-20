@@ -509,6 +509,14 @@ fn audio_menu(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
             }
         });
         separator(ui, tokens);
+        // Not a settings page, on purpose: an equaliser is adjusted while you listen, so
+        // this opens a panel of its own and playback keeps running. Never greyed out —
+        // the parameters belong to the output device rather than to the file — and the
+        // panel says plainly when there is no device for the chain to run on.
+        if item(ui, tokens, "音效增强…", "", true) {
+            app.open_audio_enhance();
+            ui.close();
+        }
         if item(ui, tokens, "音频输出设置…", "", true) {
             app.open_settings(SettingsTab::Audio);
         }

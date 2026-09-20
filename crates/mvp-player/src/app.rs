@@ -249,6 +249,9 @@ impl PlayerApp {
         engine.set_subtitle_delay(settings.subtitle_delay);
         engine.set_hardware_decoding(settings.hardware_decoding);
         engine.set_hdr_tone_map(settings.hdr_tone_map);
+        // Published before the first file is opened: the sink is built later, and it
+        // reads this block, so a persisted curve is in force from the first sample.
+        engine.set_audio_enhance(settings.audio_enhance.snapshot());
 
         let mut playlist = Playlist::new();
         if settings.restore_playlist && !settings.playlist.is_empty() {
@@ -926,9 +929,40 @@ impl PlayerApp {
         }
     }
 
+    /// Publish the audio enhancement parameters to the engine.
+    ///
+    /// The whole set travels at once, through the atomics the device callback reads,
+    /// and the callback smooths towards it — so calling this on every frame of a
+    /// slider drag is both cheap and quiet. Off (`enabled == false`) publishes the
+    /// bypass flag, which takes the chain out of the pipeline entirely.
+    pub fn publish_audio_enhance(&mut self) {
+        self.engine
+            .set_audio_enhance(self.settings.audio_enhance.snapshot());
+    }
+
+    /// `true` once the engine has built a chain for the open output device.
+    ///
+    /// `false` means there is no device: the enhancement panel says so rather than
+    /// offering controls that would do nothing.
+    pub fn audio_enhance_ready(&self) -> bool {
+        self.engine.audio_enhance_ready()
+    }
+
+    /// Delay the enhancement chain adds, in milliseconds.
+    pub fn audio_enhance_latency_ms(&self) -> f32 {
+        self.engine.audio_enhance_latency_ms()
+    }
+
+    /// Sample rate of the open output device, or the conventional 48 kHz when there is
+    /// none. The enhancement panel draws its curve at this rate.
+    pub fn audio_sample_rate(&self) -> f32 {
+        self.engine.audio_sample_rate()
+    }
+
     /// Push the settings that can change at runtime into the engine.
     pub fn sync_engine(&mut self) {
         self.engine.set_volume(self.settings.volume);
+        self.publish_audio_enhance();
         self.engine.set_muted(self.settings.muted);
         self.engine.set_speed(self.settings.speed);
         self.engine.set_audio_delay(self.settings.audio_delay);
@@ -1814,6 +1848,16 @@ impl PlayerApp {
         } else {
             self.toast(Toast::info("画面调节只对视频生效"));
         }
+    }
+
+    /// Open the audio enhancement panel.
+    ///
+    /// Unlike [`PlayerApp::open_picture_panel`] this never refuses: the parameters belong
+    /// to the output device rather than to the file, so the panel is just as meaningful
+    /// over a photograph or a file with no audio track — and it says so itself when no
+    /// device has been opened for the chain to run on.
+    pub fn open_audio_enhance(&mut self) {
+        self.ui.audio_enhance_open = true;
     }
 
     /// Whether the picture adjustments apply to whatever is open right now.

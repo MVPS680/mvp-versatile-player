@@ -321,6 +321,10 @@ pub(crate) struct Shared {
     /// The external graphical subtitle in force, if any.
     pub external_bitmap: Mutex<Option<Arc<BitmapSubtitle>>>,
     pub audio: Mutex<Option<Arc<AudioSink>>>,
+    /// Audio enhancement parameters, published by the interface and read by the
+    /// device callback. The very same `Arc` is handed to the sink, so a change
+    /// here is heard within one audio buffer rather than after the decode-ahead.
+    pub audio_enhance: Arc<crate::dsp::EnhanceParams>,
     pub event_tx: Sender<EngineEvent>,
 
     pub generation: AtomicU64,
@@ -392,6 +396,10 @@ impl Shared {
             bitmap_subtitle: Mutex::new(None),
             external_bitmap: Mutex::new(None),
             audio: Mutex::new(None),
+            // Built here, empty and bypassed: the interface publishes the persisted
+            // settings as soon as it has them, and until then the callback does
+            // nothing at all.
+            audio_enhance: Arc::new(crate::dsp::EnhanceParams::default()),
             event_tx,
             generation: AtomicU64::new(1),
             abort: AtomicBool::new(false),
@@ -792,6 +800,45 @@ impl Engine {
     /// `true` when muted.
     pub fn is_muted(&self) -> bool {
         self.shared.muted.load(Ordering::Relaxed)
+    }
+
+    /// Publish a whole set of audio enhancement parameters.
+    ///
+    /// The whole set travels at once, through the atomics the device callback
+    /// reads — no channel, no lock, no queue: putting a control message on the
+    /// packet channels is the deadlock this engine is built to avoid, and a
+    /// parameter change has to be audible *now*, not after the decode-ahead.
+    ///
+    /// Cheap enough to call from a slider's every frame; the callback smooths
+    /// towards it, so calling it forty times a second changes nothing.
+    pub fn set_audio_enhance(&self, snapshot: crate::dsp::Snapshot) {
+        self.shared.audio_enhance.publish(snapshot);
+    }
+
+    /// `true` once a chain has been built for the open output device.
+    ///
+    /// `false` means there is no device (or audio is disabled): the interface
+    /// says so instead of offering controls that would do nothing.
+    pub fn audio_enhance_ready(&self) -> bool {
+        self.shared.audio_enhance.ready.load(Ordering::Relaxed)
+    }
+
+    /// Delay the enhancement chain adds, in milliseconds (`0.0` when bypassed).
+    pub fn audio_enhance_latency_ms(&self) -> f32 {
+        self.shared.audio_enhance.latency_ms()
+    }
+
+    /// Sample rate of the open output device.
+    ///
+    /// Anything that draws a frequency response needs it: 16 kHz simply cannot exist at a
+    /// 22 kHz rate, and a curve that claimed otherwise would be lying about the sound.
+    /// The conventional 48 kHz when there is no device at all — right for almost every
+    /// Windows output, and better than drawing nothing.
+    pub fn audio_sample_rate(&self) -> f32 {
+        match self.shared.audio_sink() {
+            Some(sink) => sink.sample_rate() as f32,
+            None => 48_000.0,
+        }
     }
 
     /// The gain the decoder is actually applying to the samples it produces.

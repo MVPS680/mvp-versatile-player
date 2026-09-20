@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_channel::{bounded, Receiver, Sender};
 
+use crate::dsp::{EnhanceChain, EnhanceParams};
 use crate::error::{MediaError, Result};
 
 /// How many chunks of audio may wait in front of the device.
@@ -173,7 +174,15 @@ impl AudioSink {
     ///
     /// `preferred_device` is matched against the friendly device name; when it
     /// is `None` or does not match, the system default is used.
-    pub fn new(preferred_device: Option<&str>, volume: f32, speed: f64) -> Result<Self> {
+    ///
+    /// `enhance` is handed to the device callback, which owns the DSP chain: the
+    /// interface publishes parameters into it and never blocks on the audio thread.
+    pub fn new(
+        preferred_device: Option<&str>,
+        volume: f32,
+        speed: f64,
+        enhance: Arc<EnhanceParams>,
+    ) -> Result<Self> {
         let host = cpal::default_host();
 
         let device = match preferred_device {
@@ -222,27 +231,69 @@ impl AudioSink {
         };
 
         let stream = match sample_format {
-            cpal::SampleFormat::F32 => {
-                Self::build::<f32>(&device, &config, rx, Arc::clone(&shared), channels, error_fn)?
-            }
-            cpal::SampleFormat::I16 => {
-                Self::build::<i16>(&device, &config, rx, Arc::clone(&shared), channels, error_fn)?
-            }
-            cpal::SampleFormat::U16 => {
-                Self::build::<u16>(&device, &config, rx, Arc::clone(&shared), channels, error_fn)?
-            }
-            cpal::SampleFormat::I32 => {
-                Self::build::<i32>(&device, &config, rx, Arc::clone(&shared), channels, error_fn)?
-            }
-            cpal::SampleFormat::F64 => {
-                Self::build::<f64>(&device, &config, rx, Arc::clone(&shared), channels, error_fn)?
-            }
-            cpal::SampleFormat::I8 => {
-                Self::build::<i8>(&device, &config, rx, Arc::clone(&shared), channels, error_fn)?
-            }
-            cpal::SampleFormat::U8 => {
-                Self::build::<u8>(&device, &config, rx, Arc::clone(&shared), channels, error_fn)?
-            }
+            cpal::SampleFormat::F32 => Self::build::<f32>(
+                &device,
+                &config,
+                rx,
+                Arc::clone(&shared),
+                Arc::clone(&enhance),
+                channels,
+                error_fn,
+            )?,
+            cpal::SampleFormat::I16 => Self::build::<i16>(
+                &device,
+                &config,
+                rx,
+                Arc::clone(&shared),
+                Arc::clone(&enhance),
+                channels,
+                error_fn,
+            )?,
+            cpal::SampleFormat::U16 => Self::build::<u16>(
+                &device,
+                &config,
+                rx,
+                Arc::clone(&shared),
+                Arc::clone(&enhance),
+                channels,
+                error_fn,
+            )?,
+            cpal::SampleFormat::I32 => Self::build::<i32>(
+                &device,
+                &config,
+                rx,
+                Arc::clone(&shared),
+                Arc::clone(&enhance),
+                channels,
+                error_fn,
+            )?,
+            cpal::SampleFormat::F64 => Self::build::<f64>(
+                &device,
+                &config,
+                rx,
+                Arc::clone(&shared),
+                Arc::clone(&enhance),
+                channels,
+                error_fn,
+            )?,
+            cpal::SampleFormat::I8 => Self::build::<i8>(
+                &device,
+                &config,
+                rx,
+                Arc::clone(&shared),
+                Arc::clone(&enhance),
+                channels,
+                error_fn,
+            )?,
+            cpal::SampleFormat::U8 => Self::build::<u8>(
+                &device,
+                &config,
+                rx,
+                Arc::clone(&shared),
+                Arc::clone(&enhance),
+                channels,
+                error_fn,
+            )?,
             other => {
                 return Err(MediaError::AudioDevice(format!(
                     "不支持的采样格式: {other:?}"
@@ -271,6 +322,7 @@ impl AudioSink {
         config: &cpal::StreamConfig,
         rx: Receiver<AudioChunk>,
         shared: Arc<Shared>,
+        enhance: Arc<EnhanceParams>,
         channels: u16,
         error_fn: impl FnMut(cpal::StreamError) + Send + 'static,
     ) -> Result<cpal::Stream>
@@ -288,10 +340,29 @@ impl AudioSink {
         let mut seen_generation = shared.flush_generation.load(Ordering::Relaxed);
         let channels = channels.max(1) as usize;
 
+        // The enhancement chain lives on this thread, built from the device's own format —
+        // so the buffers it needs are allocated here and never in the callback. Its readiness
+        // and its latency are published for the interface to show rather than guess at.
+        let chain = EnhanceChain::new(config.sample_rate.0, config.channels);
+        enhance
+            .latency_ms
+            .store(chain.latency_ms().to_bits(), Ordering::Relaxed);
+        enhance.ready.store(true, Ordering::Relaxed);
+        let mut chain = Some(chain);
+        // The buffer the callback fills before the chain sees it. Grown once, to the largest
+        // size the driver asks for, and reused from then on.
+        let mut scratch: Vec<f32> = Vec::new();
+
         device
             .build_output_stream(
                 config,
                 move |out: &mut [T], info: &cpal::OutputCallbackInfo| {
+                    // The buffer the samples are built in, sized once to the largest callback
+                    // the driver asks for and reused afterwards: the real-time thread may not
+                    // allocate.
+                    if scratch.len() < out.len() {
+                        scratch.resize(out.len(), 0.0);
+                    }
                     // Two relaxed atomic loads, no locks: safe on the real-time
                     // thread, and the reason a volume change is audible within
                     // one buffer instead of after the decode-ahead drained.
@@ -337,10 +408,13 @@ impl AudioSink {
                         let take = (out.len() - written).min(current.len() - cursor);
                         for i in 0..take {
                             applied_gain += ramp;
-                            out[written + i] = T::from_sample(crate::dsp::apply_gain_sample(
+                            // Volume first, then the chain: the limiter's ceiling is then a
+                            // ceiling on what is actually heard, and the volume's own soft
+                            // knee keeps its familiar behaviour when nothing else is on.
+                            scratch[written + i] = crate::dsp::apply_gain_sample(
                                 current[cursor + i],
                                 applied_gain,
-                            ));
+                            );
                         }
                         written += take;
                         cursor += take;
@@ -350,12 +424,21 @@ impl AudioSink {
                     if written < out.len() {
                         // Nothing left: play silence rather than repeating the
                         // last buffer, which would sound like a stuck sample.
-                        for sample in &mut out[written..] {
-                            *sample = T::from_sample(0.0f32);
-                        }
+                        scratch[written..out.len()].fill(0.0);
                         if wrote_any(out.len(), written) {
                             shared.underruns.fetch_add(1, Ordering::Relaxed);
                         }
+                    }
+
+                    // The enhancement chain, if one was built for this format. `process`
+                    // checks the bypass flag itself — one relaxed load — so that a chain which
+                    // was switched off still gets to empty its delay lines on the way out.
+                    let buffer = &mut scratch[..out.len()];
+                    if let Some(chain) = chain.as_mut() {
+                        chain.process(buffer, &enhance);
+                    }
+                    for (target, value) in out.iter_mut().zip(buffer.iter()) {
+                        *target = T::from_sample(*value);
                     }
 
                     let _ = info;

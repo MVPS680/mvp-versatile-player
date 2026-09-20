@@ -375,7 +375,12 @@ fn demuxer_main(
         // not with the configuration the engine was built from: the user may
         // have moved the volume slider since, and the sink is where the gain is
         // actually applied.
-        match AudioSink::new(config.audio_device.as_deref(), shared.volume(), config.speed) {
+        match AudioSink::new(
+            config.audio_device.as_deref(),
+            shared.volume(),
+            config.speed,
+            Arc::clone(&shared.audio_enhance),
+        ) {
             Ok(device) => {
                 let device = Arc::new(device);
                 device.set_muted(shared.muted.load(Ordering::Relaxed));
