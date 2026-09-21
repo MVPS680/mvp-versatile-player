@@ -5,10 +5,19 @@ use egui::{Align, Context, Layout, Rect, RichText, Ui};
 
 use crate::app::PlayerApp;
 use crate::icons::Icon;
-use crate::state::{Overlay, Toast};
+use crate::state::{Overlay, SettingsTab, Toast};
 use crate::theme::{font, radius, space, Tokens};
 use crate::ui::surface;
 use crate::ui::widgets;
+
+/// Height of the video transport bar, in points.
+///
+/// The seek row and the 2 pt gap under it are 24 pt, the play button is the tallest control
+/// in the row below it, and the panel frame keeps 8 pt of air above and below both. That is
+/// 24 + 46 + 16 = 86 for the current play button, so the height the bar was designed at
+/// still holds — with 2 pt to spare. `theme::button::PLAY` can move a little inside it; past
+/// 48 pt it cannot.
+const VIDEO_BAR_HEIGHT: f32 = 88.0;
 
 /// The docked transport bar under the video.
 pub fn draw_video(app: &mut PlayerApp, ctx: &Context) {
@@ -19,7 +28,7 @@ pub fn draw_video(app: &mut PlayerApp, ctx: &Context) {
 
     egui::TopBottomPanel::bottom("mvp_transport_video")
         .frame(surface::bar_shell(&tokens, margin))
-        .exact_height(88.0)
+        .exact_height(VIDEO_BAR_HEIGHT)
         .show(ctx, |ui| {
             seek_row(app, ui, &tokens);
             ui.add_space(2.0);
@@ -73,6 +82,8 @@ pub fn draw_audio(app: &mut PlayerApp, ctx: &Context) {
 
     egui::TopBottomPanel::bottom("mvp_transport_audio")
         .frame(surface::bar_shell(&tokens, margin))
+        // Unchanged: the audio bar's tallest control is an icon button, and 96 pt already
+        // has room for one of those plus the seek row.
         .exact_height(96.0)
         .show(ctx, |ui| {
             seek_row(app, ui, &tokens);
@@ -125,7 +136,7 @@ fn audio_button_row(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
         if crate::icons::primary_transport_button(
             ui,
             icon,
-            48.0,
+            crate::theme::button::PLAY,
             tokens.accent,
             tokens.accent_hover,
             tokens.on_accent,
@@ -643,7 +654,7 @@ fn video_button_row(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
         if crate::icons::primary_transport_button(
             ui,
             icon,
-            40.0,
+            crate::theme::button::PLAY,
             tokens.accent,
             tokens.accent_hover,
             tokens.on_accent,
@@ -798,24 +809,22 @@ fn video_button_row(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
             }
 
             // ---- subtitles ---------------------------------------------------
-            let subtitle_on = app.settings.subtitles_enabled && app.engine.subtitle().is_some();
-            if budget.subtitles
-                && widgets::toggle_tool_button(
+            // A menu, not the on/off switch that used to stand here. A switch could only
+            // say "on" or "off", while what a viewer changes mid-film is *which*
+            // subtitle — and 「轨道」 next to it was already the shape for that. The glyph
+            // keeps the state the switch carried: it is tinted while cues are showing.
+            if budget.subtitles {
+                let showing =
+                    app.settings.subtitles_enabled && app.engine.subtitle().is_some();
+                widgets::icon_menu_button(
                     tokens,
                     ui,
                     Icon::Subtitles,
-                    "字幕开关 (V) · 加载字幕 (G)",
-                    subtitle_on,
-                    true,
-                )
-                .clicked()
-            {
-                app.set_subtitles_enabled(!app.settings.subtitles_enabled);
-                app.toast(Toast::info(if app.settings.subtitles_enabled {
-                    "字幕已开启"
-                } else {
-                    "字幕已关闭"
-                }));
+                    18.0,
+                    "字幕 · 选择轨道 / 关闭 / 加载文件 (V · G)",
+                    showing,
+                    |ui| subtitle_menu(app, ui),
+                );
             }
 
             // ---- quick track pickers -----------------------------------------
@@ -823,22 +832,35 @@ fn video_button_row(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
             // means leaving the picture; these menus are for the one thing a
             // viewer actually changes mid-film.
             //
-            // This one and 「画面」 below are plain menu buttons: the glyph that
-            // used to precede each of them sat in a rectangle of its own that
-            // took no clicks — the menu only ever opened from the text — so the
-            // pair read as a picture of a button beside a button. The label is
-            // the control, and the picture is gone rather than made clickable.
+            // All three of them are glyphs rather than words: two Chinese characters
+            // next to a row of 28 pt icon controls read as a different size of control
+            // entirely, and the bar runs out of width long before it runs out of glyphs.
+            // An earlier attempt at this was an icon drawn in its own rectangle *beside*
+            // a text button, which took no clicks; here the rectangle *is* the button, so
+            // the whole target opens the menu.
             if budget.tracks {
-                MenuButton::new(RichText::new("轨道").size(font::SMALL)).ui(ui, |ui| {
-                    track_menu(app, ui);
-                });
+                widgets::icon_menu_button(
+                    tokens,
+                    ui,
+                    Icon::Tracks,
+                    18.0,
+                    "轨道 · 选择音轨",
+                    false,
+                    |ui| track_menu(app, ui),
+                );
             }
 
             // ---- fit / rotate / mirror ---------------------------------------
             if budget.pan_scan {
-                MenuButton::new(RichText::new("画面").size(font::SMALL)).ui(ui, |ui| {
-                    pan_scan_menu(app, ui);
-                });
+                widgets::icon_menu_button(
+                    tokens,
+                    ui,
+                    Icon::Image,
+                    18.0,
+                    "画面 · 适应 / 旋转 / 镜像",
+                    false,
+                    |ui| pan_scan_menu(app, ui),
+                );
             }
 
             // ---- A–B loop ----------------------------------------------------
@@ -874,11 +896,11 @@ fn video_button_row(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
     });
 }
 
-/// The audio/subtitle pickers behind the video bar's 「轨道」 menu.
+/// The audio track picker behind the video bar's glyph menu.
 ///
-/// One menu rather than two buttons: the two lists are the same kind of choice,
-/// and the transport bar has neither the room nor a reason to double the
-/// controls for it.
+/// Subtitles used to be listed here too, under a second heading. They have a menu of
+/// their own now — the control that used to be a plain on/off switch — and two lists of
+/// the same tracks in one bar is how a viewer ends up changing the wrong one.
 fn track_menu(app: &mut PlayerApp, ui: &mut Ui) {
     ui.set_min_width(220.0);
     let info = app.media_info();
@@ -927,52 +949,93 @@ fn track_menu(app: &mut PlayerApp, ui: &mut Ui) {
         app.engine.set_audio_track(None);
         ui.close();
     }
+}
 
-    ui.separator();
-    ui.label(
-        RichText::new("字幕")
-            .size(font::TINY)
-            .color(app.theme.tokens.text_muted),
-    );
-    if let Some(info) = &info {
-        let current = app.engine.subtitle_track();
-        for subtitle in &info.subtitles {
-            let selected = app.settings.subtitles_enabled && current == Some(subtitle.index);
-            let suffix = if subtitle.is_renderable() {
-                ""
-            } else {
-                "（暂不支持）"
-            };
-            ui.add_enabled_ui(subtitle.is_renderable(), |ui| {
-                if ui
-                    .selectable_label(
-                        selected,
-                        RichText::new(format!("{}{suffix}", subtitle.display_name()))
-                            .size(font::SMALL),
-                    )
-                    .clicked()
-                {
-                    app.select_embedded_subtitle(subtitle.index);
-                    ui.close();
-                }
-            });
-        }
-    }
+/// The subtitle picker behind the video bar's glyph menu.
+///
+/// This replaced a plain on/off switch. Its two states are still here — the first entry
+/// is the "off" the switch used to be, and the glyph in the bar is tinted while cues are
+/// showing — but the things a viewer actually reaches for mid-film (a different track, a
+/// side-car file, the delay) now live together instead of being split between a switch
+/// and a menu.
+fn subtitle_menu(app: &mut PlayerApp, ui: &mut Ui) {
+    ui.set_min_width(200.0);
+    let info = app.media_info();
+    let current = app.engine.subtitle_track();
+    let external = app.engine.has_external_subtitle();
+
     if ui
         .selectable_label(
-            !app.settings.subtitles_enabled || app.engine.subtitle_track().is_none(),
+            !app.settings.subtitles_enabled,
             RichText::new("关闭字幕").size(font::SMALL),
         )
         .clicked()
     {
         app.set_subtitles_enabled(false);
         ui.close();
+        return;
     }
+
+    match &info {
+        Some(info) if !info.subtitles.is_empty() => {
+            for subtitle in &info.subtitles {
+                let selected = app.settings.subtitles_enabled && current == Some(subtitle.index);
+                let suffix = if subtitle.is_renderable() {
+                    ""
+                } else {
+                    "（暂不支持）"
+                };
+                ui.add_enabled_ui(subtitle.is_renderable(), |ui| {
+                    if ui
+                        .selectable_label(
+                            selected,
+                            RichText::new(format!("{}{suffix}", subtitle.display_name()))
+                                .size(font::SMALL),
+                        )
+                        .clicked()
+                    {
+                        app.select_embedded_subtitle(subtitle.index);
+                        ui.close();
+                    }
+                });
+            }
+        }
+        // An external file is a track as far as the viewer is concerned, so an empty
+        // embedded list is only worth a line when there is nothing else showing either.
+        Some(_) if !external => {
+            ui.add_enabled(
+                false,
+                egui::Button::new(RichText::new("（没有内嵌字幕）").size(font::SMALL)),
+            );
+        }
+        _ => {}
+    }
+
+    ui.separator();
     if ui
         .button(RichText::new("加载字幕文件…").size(font::SMALL))
         .clicked()
     {
         app.request_open_subtitle();
+        ui.close();
+    }
+    if ui
+        .add_enabled(
+            external,
+            egui::Button::new(RichText::new("移除外部字幕").size(font::SMALL)),
+        )
+        .clicked()
+    {
+        app.remove_external_subtitle();
+        ui.close();
+    }
+    // In fullscreen there is no menu bar, and this is the only way to the delay or the
+    // style page without leaving the picture.
+    if ui
+        .button(RichText::new("字幕延迟与样式…").size(font::SMALL))
+        .clicked()
+    {
+        app.open_settings(SettingsTab::Subtitles);
         ui.close();
     }
 }
@@ -1037,5 +1100,65 @@ fn pan_scan_menu(app: &mut PlayerApp, ui: &mut Ui) {
     {
         app.set_flip_v(!flip_v);
         ui.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The play button has to fit inside the bar it is drawn in.
+    ///
+    /// The bar is an `exact_height` panel, so anything taller than its content rectangle is
+    /// clipped — and a clipped play button is exactly what one sized without doing this
+    /// arithmetic looks like (the design's 48 pt scaled to 62 pt inside this 88 pt bar was
+    /// drawn cut off top and bottom). This builds the real frame, the real seek row and the
+    /// real button, and asks egui where the button and the panel's clip rectangle ended up.
+    #[test]
+    fn the_play_button_is_not_clipped_by_the_transport_bar() {
+        let ctx = egui::Context::default();
+        let tokens = Tokens::default();
+        let mut button = Rect::NOTHING;
+        let mut clip = Rect::NOTHING;
+
+        for frame in 0..2 {
+            // Built in one expression rather than assigned onto `default()`, which clippy
+            // flags (and which the tests elsewhere in the crate already do).
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 720.0),
+                )),
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::TopBottomPanel::bottom("mvp_probe_transport")
+                    .frame(surface::bar_shell(&tokens, egui::Margin::symmetric(12, 8)))
+                    .exact_height(VIDEO_BAR_HEIGHT)
+                    .show(ctx, |ui| {
+                        // The seek row and the 2 pt gap under it, exactly as `draw_video`
+                        // lays them out.
+                        ui.allocate_space(egui::vec2(ui.available_width(), 24.0));
+                        let response = crate::icons::primary_transport_button(
+                            ui,
+                            Icon::Play,
+                            crate::theme::button::PLAY,
+                            tokens.accent,
+                            tokens.accent_hover,
+                            tokens.on_accent,
+                        );
+                        if frame == 1 {
+                            button = response.rect;
+                            clip = ui.clip_rect();
+                        }
+                    });
+            });
+        }
+
+        assert!(button.height() > 0.0, "the probe drew no button");
+        assert!(
+            clip.contains_rect(button),
+            "the play button ({button:?}) sticks out of the bar's clip rectangle ({clip:?})"
+        );
     }
 }

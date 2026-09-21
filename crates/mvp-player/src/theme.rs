@@ -179,6 +179,39 @@ pub mod radius {
     pub const XL: f32 = 16.0;
 }
 
+/// How much bigger the buttons are than the size the interface was laid out at.
+///
+/// Buttons **only**. The menu bar, the settings rows, the tabs, the switches, the type,
+/// the spacing and every panel and dialog keep the size they were designed at; what
+/// follows this factor is an icon button's box and its glyph, and the play/pause button.
+///
+/// Two containers are sized *as* "button plus its own padding" and therefore follow it —
+/// the floating image toolbar and the height of the video transport bar. There is no room
+/// for a bigger button inside a box that was measured around the smaller one.
+pub mod button {
+    /// The multiplier applied to an icon button's geometry.
+    pub const SCALE: f32 = 1.3;
+
+    /// `points`, at the current button size.
+    ///
+    /// A named call rather than `* SCALE` at each site: it is what tells a reader that a
+    /// number is button geometry and not, say, a gap.
+    pub const fn of(points: f32) -> f32 {
+        points * SCALE
+    }
+
+    /// Diameter of the play/pause button, in points.
+    ///
+    /// Deliberately *not* a scaled design size. Scaling the design's own 48 pt (video bar) and
+    /// 40 pt (audio bar) made the triangle inside the button — 58 % of the diameter — half
+    /// again as large as the icon glyphs beside it, and in the video bar larger than the bar
+    /// itself, so it was drawn clipped. 46 puts that glyph at 26.7 pt, optically the same as
+    /// the icon buttons' 26.2; it is the largest value that still fits the 88 pt video bar
+    /// (24 + 46 + 16 ≤ 88), and it makes the button the same size in both bars instead of the
+    /// two sizes it used to have.
+    pub const PLAY: f32 = 46.0;
+}
+
 /// Font sizes, in points.
 ///
 /// `epaint` has no variable-weight faces, so the type hierarchy is carried by
@@ -589,6 +622,26 @@ pub fn row_fill(tokens: &Tokens, selected: bool, hovered: bool) -> Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The play button has to fit the transport bar it sits in, and stay the biggest control
+    /// in it. The bar is 88 pt: 24 pt of seek row and gap, the button, and the 8 pt frame
+    /// above and below. Scaling the button without doing this arithmetic is how it ended up
+    /// drawn clipped once already.
+    #[test]
+    fn the_play_button_fits_the_transport_bar_and_still_leads_it() {
+        // Through locals: `assert!(button::PLAY > button::of(28.0))` is a constant expression
+        // and clippy says so, which is a lint rather than a test.
+        let play = button::PLAY;
+        let tool = button::of(28.0);
+        assert!(
+            play > tool,
+            "the play button ({play}) must stay bigger than a tool button ({tool})"
+        );
+        assert!(
+            24.0 + play + 2.0 * space::SM <= 88.0,
+            "a {play} pt play button does not fit the 88 pt video transport bar"
+        );
+    }
 
     #[test]
     fn accent_has_enough_contrast_against_the_surfaces() {

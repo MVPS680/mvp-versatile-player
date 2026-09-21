@@ -1146,7 +1146,10 @@ fn image_view(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens, ctx: &Context) 
 /// canvas. Images need zoom, rotate, flip and slideshow controls that the
 /// transport bar simply has no room (or meaning) for.
 fn image_toolbar(app: &mut PlayerApp, ui: &mut Ui, area: &Rect, tokens: &Tokens) {
-    let bar_height = 40.0;
+    // The sheet is "the buttons plus 6 pt of air above and below" — see the `shrink2`
+    // below — so its height follows the button size instead of staying at 40 pt. It floats
+    // over the canvas, so growing it moves nothing else.
+    let bar_height = crate::theme::button::of(40.0);
     // The bar is narrower than its design only when the canvas really is that
     // narrow; the floor stops a tiny window from producing a negative width.
     let bar_width = (area.width() - 24.0).clamp(160.0, 560.0);

@@ -457,6 +457,41 @@ pub fn toggle_tool_button(
     }
 }
 
+/// A menu button whose label is one of the painted icons instead of text.
+///
+/// `egui`'s `MenuButton` wraps a `Button`, and this project's glyphs are drawn with the painter
+/// rather than shipped as textures, so there is nothing to hand a `Button`. The button is
+/// therefore drawn the way every other transport control is ([`icons::icon_button`]) and the menu
+/// is opened on its `Response` — the route egui's own documentation gives for a custom menu
+/// button, using the same `Popup::menu` that `MenuButton` uses internally.
+///
+/// `active` paints it in the accent colour, exactly as [`toggle_tool_button`] marks a control that
+/// is switched on: of the three menus in the transport bar this is the one whose *state* the user
+/// has to be able to read at a glance, because "are subtitles on, and which track" is not
+/// something a glyph can say on its own.
+///
+/// Returns the button's `Response`, so a caller (or a test) can ask where the control ended up.
+pub fn icon_menu_button(
+    tokens: &Tokens,
+    ui: &mut Ui,
+    icon: Icon,
+    size: f32,
+    tooltip: &str,
+    active: bool,
+    content: impl FnOnce(&mut Ui),
+) -> Response {
+    let color = if active { tokens.accent } else { tokens.text_weak };
+    let hover = if active { tokens.accent_hover } else { tokens.text };
+    let background = if active {
+        tokens.accent.gamma_multiply(0.22)
+    } else {
+        tokens.hover
+    };
+    let response = icons::icon_button(ui, icon, size, color, hover, background, tokens.active);
+    egui::Popup::menu(&response).show(content);
+    response.on_hover_text(tooltip)
+}
+
 /// A labelled switch row for the settings window.
 pub fn switch_row(ui: &mut Ui, tokens: &Tokens, label: &str, value: &mut bool, hint: &str) -> bool {
     row(ui, tokens, label, hint, 40.0, |ui| {
@@ -1855,6 +1890,84 @@ mod tests {
             drawn.iter().any(|f| *f >= 7),
             "the submenu closed again immediately (drawn on frames {drawn:?})"
         );
+    }
+
+    /// The transport bar's glyph menus have to open when the glyph is clicked.
+    ///
+    /// They are not `MenuButton`s: this project's icons are painted rather than shipped as
+    /// textures, so the button is `icons::icon_button` and the popup hangs off *its*
+    /// `Response`. Handing the popup some other response — the inner `Ui`'s, say — leaves a
+    /// control that highlights on hover and does nothing when clicked, which is exactly the
+    /// bug the earlier text-plus-glyph pair had.
+    #[test]
+    fn the_icon_menu_button_opens_its_menu_on_a_click() {
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+
+        let tokens = crate::theme::Theme::default().tokens;
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(720.0, 480.0));
+
+        let ctx = egui::Context::default();
+        let opened = Rc::new(Cell::new(false));
+        let entries = Rc::new(Cell::new(0usize));
+        let rect: Rc<RefCell<egui::Rect>> = Rc::new(RefCell::new(egui::Rect::NOTHING));
+
+        for frame in 0..6 {
+            let point = rect.borrow().center();
+            let mut input = egui::RawInput::default();
+            input.screen_rect = Some(screen);
+            input.events = match frame {
+                0 | 1 => Vec::new(),
+                2 => vec![
+                    egui::Event::PointerMoved(point),
+                    egui::Event::PointerButton {
+                        pos: point,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: Default::default(),
+                    },
+                ],
+                3 => vec![egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: Default::default(),
+                }],
+                _ => Vec::new(),
+            };
+
+            let drawn = Rc::clone(&rect);
+            let shown = Rc::clone(&opened);
+            let counted = Rc::clone(&entries);
+            let _ = ctx.run(input, |ctx| {
+                egui::Area::new(egui::Id::new("mvp_icon_menu_probe")).show(ctx, |ui| {
+                    let response = icon_menu_button(
+                        &tokens,
+                        ui,
+                        Icon::Tracks,
+                        18.0,
+                        "轨道 · 音频轨道",
+                        false,
+                        |ui| {
+                            counted.set(counted.get() + 1);
+                            ui.label("条目");
+                        },
+                    );
+                    // Measured on a settled frame: an `Area` is placed from the previous
+                    // frame's size, so a rect read on the first frame is not where the
+                    // control ends up, and a guessed coordinate tests nothing.
+                    if frame == 1 {
+                        *drawn.borrow_mut() = response.rect;
+                    }
+                    if egui::Popup::is_any_open(ctx) {
+                        shown.set(true);
+                    }
+                });
+            });
+        }
+
+        assert!(opened.get(), "clicking the glyph opened no popup at all");
+        assert!(entries.get() > 0, "the popup that opened was not this menu");
     }
 
     /// Every settings row must put its control at the same right-hand edge,

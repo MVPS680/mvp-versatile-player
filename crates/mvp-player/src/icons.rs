@@ -169,6 +169,8 @@ pub enum Icon {
     Lyrics,
     /// A small grid of squares, "thumbnail strip".
     Grid,
+    /// Two lanes with a handle each, "tracks".
+    Tracks,
 }
 
 /// Draw `icon` inside `rect` using `color`.
@@ -533,14 +535,26 @@ pub fn draw(painter: &Painter, rect: Rect, icon: Icon, color: Color32) {
                 }
             }
         }
+        Icon::Tracks => {
+            // Two lanes with a handle on each: a multitrack view. Deliberately not a
+            // music note — the sidebar already uses `Music` to mean "this file is
+            // audio", while this control answers *which* stream plays.
+            for y in [8.5f32, 15.5] {
+                let lane = egui::Rect::from_min_max(c.p(3.5, y - 2.2), c.p(20.5, y + 2.2));
+                painter.rect_stroke(lane, c.s(1.4), thin, StrokeKind::Middle);
+            }
+            painter.circle_filled(c.p(8.5, 8.5), c.s(2.4), color);
+            painter.circle_filled(c.p(15.5, 15.5), c.s(2.4), color);
+        }
     }
 }
 
 /// An icon button that highlights on hover and shows a tooltip.
 ///
 /// Returns the `Response` so callers can chain `.on_hover_text(...)` or read
-/// `.clicked()`. The hit area is always at least 28x28 pt, which keeps the
-/// controls comfortable in a dark, low-contrast interface.
+/// `.clicked()`. The hit area is always at least 28x28 pt *before*
+/// [`theme::button`] scales it, which keeps the controls comfortable in a dark,
+/// low-contrast interface.
 pub fn icon_button(
     ui: &mut Ui,
     icon: Icon,
@@ -550,7 +564,11 @@ pub fn icon_button(
     bg_hover: Color32,
     bg_active: Color32,
 ) -> Response {
-    let desired = Vec2::splat(size.max(28.0));
+    // The caller passes the size the design was laid out at, and this is the one place every
+    // icon button in the player — the transport bar, the toolbars, the glyph menus — is
+    // turned into the size on screen. Nothing else in the interface goes through it.
+    let size = theme::button::of(size);
+    let desired = Vec2::splat(size.max(theme::button::of(28.0)));
     let (rect, response) = ui.allocate_exact_size(desired, Sense::click());
     let visuals = ui.style().interact(&response);
 
@@ -589,6 +607,10 @@ pub fn icon_button(
 
 /// A larger, filled transport control (play/pause), used at the centre of the
 /// control bar where the primary action deserves emphasis.
+///
+/// `diameter` is the *final* size, not a design size to be scaled: this button is not a
+/// multiple of the icon buttons, and the number lives in [`theme::button::PLAY`] with the
+/// reasoning for it.
 pub fn primary_transport_button(
     ui: &mut Ui,
     icon: Icon,
@@ -653,5 +675,110 @@ mod tests {
         let canvas = Canvas::new(rect);
         assert!(canvas.scale.is_finite());
         assert!(canvas.scale > 0.0);
+    }
+
+    /// The size the design passes in is the size *before* [`theme::button`], and an icon
+    /// button's box is what the transport-bar layout model assumes — so this is where the
+    /// two have to agree. A box that grew without the model noticing is a row of controls
+    /// drawn on top of each other.
+    #[test]
+    fn an_icon_button_box_is_scaled_by_the_button_factor() {
+        let ctx = egui::Context::default();
+        let mut rect = Rect::NOTHING;
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::Area::new(egui::Id::new("mvp_icon_size_probe")).show(ctx, |ui| {
+                let response = icon_button(
+                    ui,
+                    Icon::Play,
+                    18.0,
+                    Color32::WHITE,
+                    Color32::WHITE,
+                    Color32::TRANSPARENT,
+                    Color32::TRANSPARENT,
+                );
+                rect = response.rect;
+            });
+        });
+        let expected = theme::button::of(28.0);
+        assert!(
+            (rect.width() - expected).abs() < 0.5 && (rect.height() - expected).abs() < 0.5,
+            "an icon button measured {rect:?}, not {expected} pt square"
+        );
+    }
+
+    /// The size the design passes in is the size *before* [`theme::button`], and an icon
+    /// button's box is what the transport-bar layout model assumes — so this is where the two
+    /// have to agree. A box that grew without the model noticing is a row of controls drawn
+    /// on top of each other.
+    #[test]
+    fn an_icon_button_box_follows_the_button_size() {
+        let ctx = egui::Context::default();
+        let mut rect = Rect::NOTHING;
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::Area::new(egui::Id::new("mvp_icon_size_probe")).show(ctx, |ui| {
+                let response = icon_button(
+                    ui,
+                    Icon::Play,
+                    18.0,
+                    Color32::WHITE,
+                    Color32::WHITE,
+                    Color32::TRANSPARENT,
+                    Color32::TRANSPARENT,
+                );
+                rect = response.rect;
+            });
+        });
+        let expected = theme::button::of(28.0);
+        assert!(
+            expected > 28.0,
+            "the buttons are meant to be bigger than the design, not the same size"
+        );
+        assert!(
+            (rect.width() - expected).abs() < 0.5 && (rect.height() - expected).abs() < 0.5,
+            "an icon button measured {rect:?}, not {expected} pt square"
+        );
+    }
+
+    /// The glyphs the transport bar's menus are drawn with have to stay in their box.
+    ///
+    /// They are painted, not laid out, so nothing else would catch a glyph that reaches
+    /// past the rectangle it was given: it would either be clipped by the button or spill
+    /// onto the control beside it, and both read as "the icon is broken" rather than as a
+    /// drawing mistake.
+    #[test]
+    fn the_menu_glyphs_paint_inside_the_rectangle_they_are_given() {
+        let ctx = egui::Context::default();
+        let rect = Rect::from_min_size(Pos2::new(40.0, 60.0), Vec2::splat(18.0));
+
+        for icon in [Icon::Subtitles, Icon::Tracks, Icon::Image] {
+            let output = ctx.run(Default::default(), |ctx| {
+                // A painter of its own rather than an `Area`'s: an `Area` on its first
+                // frame has no size yet, and its clip rectangle would drop the glyph
+                // before this test could look at it — which is a fact about the harness,
+                // not about the icon.
+                let painter = Painter::new(
+                    ctx.clone(),
+                    egui::LayerId::new(
+                        egui::Order::Background,
+                        egui::Id::new(("mvp_icon_probe", icon)),
+                    ),
+                    egui::Rect::EVERYTHING,
+                );
+                draw(&painter, rect, icon, Color32::WHITE);
+            });
+            let painted: Vec<Rect> = output
+                .shapes
+                .iter()
+                .map(|shape| shape.shape.visual_bounding_rect())
+                .filter(|bounds| bounds.intersects(rect))
+                .collect();
+            assert!(!painted.is_empty(), "{icon:?} painted nothing at all");
+            for bounds in painted {
+                assert!(
+                    rect.expand(1.0).contains_rect(bounds),
+                    "{icon:?} painted outside its rectangle: {bounds:?} is not inside {rect:?}"
+                );
+            }
+        }
     }
 }

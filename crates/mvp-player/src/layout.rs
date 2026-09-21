@@ -8,6 +8,10 @@
 //! is available and drops the optional pieces, in a fixed order, until what is
 //! left fits.
 //!
+//! Only the button-sized parts follow [`theme::button`]; the widths below are quoted at
+//! the size the design was laid out at and scaled through it, so the model and the drawing
+//! cannot drift apart.
+//!
 //! All thresholds live here so a narrow window degrades the same way in every
 //! panel, and so the arithmetic can be tested: [`transport_budget`] is a pure
 //! function, and the tests walk every window width the player allows, asserting
@@ -15,14 +19,17 @@
 
 use egui::{Context, Rect};
 
-use crate::theme::{font, space};
+use crate::theme::{button, font, space};
 
 /// Gap between two controls (`style.spacing.item_spacing.x`).
 const GAP: f32 = 8.0;
-/// A tool button. `icons::icon_button` grows its hit area to 28 pt square.
-const TOOL: f32 = 28.0;
-/// The play/pause button, deliberately larger than the rest.
-const PLAY: f32 = 40.0;
+/// A tool button. `icons::icon_button` grows its hit area to 28 pt square *before*
+/// [`button`] scales it, so the width this model reserves has to be the scaled one: a
+/// model that underestimates the controls is a row that overlaps itself.
+const TOOL: f32 = button::of(28.0);
+/// The play/pause button. Its size lives in [`theme::button::PLAY`] rather than here: it is
+/// not a multiple of the icon buttons, and the two have to agree with the bar height below.
+const PLAY: f32 = button::PLAY;
 /// Width of the volume slider.
 const VOLUME_SLIDER: f32 = 90.0;
 /// Width reserved for the "100%" readout.
@@ -194,9 +201,9 @@ pub struct TransportBudget {
     pub repeat: bool,
     /// Shuffle.
     pub shuffle: bool,
-    /// Subtitle visibility.
+    /// Subtitle track picker (it used to be a plain on/off switch).
     pub subtitles: bool,
-    /// Quick audio/subtitle track pickers.
+    /// The audio track picker.
     pub tracks: bool,
     /// The aspect/rotate/mirror menu.
     pub pan_scan: bool,
