@@ -222,16 +222,19 @@ fn body(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
     );
 
     // ---- spatial -----------------------------------------------------------
-    widgets::section(ui, tokens, "空间感（实验性）");
+    widgets::section(ui, tokens, "空间感");
     {
         let s = &mut app.settings.audio_enhance;
         changed |= widgets::slider_row(ui, tokens, "立体声宽度", &mut s.width, 0.0..=2.0, percent);
         changed |= widgets::slider_row(ui, tokens, "空间残响", &mut s.room, 0.0..=1.0, percent);
     }
     ui.label(
-        RichText::new("只影响双声道输出的前两个声道；多声道音轨的其余声道保持原样。")
-            .size(font::SMALL)
-            .color(tokens.text_weak),
+        RichText::new(
+            "立体声宽度调整左右声道的比例；空间残响给声音叠上会逐渐消失的反射尾音，数值越大尾音越响、\n\
+             拖得越久（0 % 时这一级完全不介入，也不增加延迟）。只影响双声道输出的前两个声道。",
+        )
+        .size(font::SMALL)
+        .color(tokens.text_weak),
     );
 
     // ---- reset -------------------------------------------------------------

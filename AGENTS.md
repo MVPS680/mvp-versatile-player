@@ -110,8 +110,9 @@ so callers need only depend on `mvp-core`.
   "Off" means off here too, and there are two of them: the master switch keeps the chain out of
   the callback entirely, and a chain that is switched on with every control neutral returns
   before touching a sample — the tests assert both are bit-exact against the untouched buffer.
-  Latency is real and reported, not hidden: the limiter's 1 ms of look-ahead (plus 12 ms when
-  the cross-feed is on) is what `Engine::audio_enhance_latency_ms` exists for.
+  Latency is real and reported, not hidden: the limiter's 1 ms of look-ahead is what
+  `Engine::audio_enhance_latency_ms` exists for. The spatial reverb is a *wet* addition on top of
+  a dry signal it does not delay, so it contributes none — `dsp/enhance.rs`'s `Spatial` says why.
 - `mvp-player/src/app.rs` is the only place the engine, playlist, settings and
   UI state are allowed to talk to each other. `state.rs` is transient UI state
   (never persisted); `settings.rs` is the persisted document.

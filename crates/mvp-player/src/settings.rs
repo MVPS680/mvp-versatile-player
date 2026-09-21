@@ -499,7 +499,8 @@ pub struct AudioEnhanceSettings {
     pub limiter_ceiling_db: f32,
     /// Stereo width, `1.0` is untouched.
     pub width: f32,
-    /// Cross-feed amount, `0.0..=1.0`.
+    /// Amount of spatial tail: `0.0` is off, `1.0` is a large room that rings for a couple of
+    /// seconds. It moves both how loud the reverb is and how long it lasts.
     pub room: f32,
 }
 

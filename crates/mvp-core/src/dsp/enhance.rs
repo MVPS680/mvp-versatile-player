@@ -11,7 +11,7 @@
 //!
 //! ```text
 //! EQ (10 bands) → bass shelf + harmonics → clarity shelf + transients
-//!               → loudness (K-weighted) → spatial (experimental) → soft limiter
+//!               → loudness (K-weighted) → spatial (width + reverb) → soft limiter
 //! ```
 //!
 //! * the equaliser first, because it is the stage the user is looking at: the curve on
@@ -19,7 +19,7 @@
 //! * bass and clarity next, so their thresholds mean the same thing under every preset;
 //! * loudness *after* those, because it normalises what they produced — moving it earlier
 //!   would have it chase every equaliser change;
-//! * spatial before the limiter, because it can raise peaks;
+//! * spatial before the limiter, because the tail it adds can raise peaks;
 //! * and the limiter last, with nothing after it that could add gain.
 //!
 //! `dsp::apply_gain_sample` (the volume slider's own soft knee) still runs after this, so a
@@ -80,7 +80,8 @@ pub struct Snapshot {
     pub limiter_ceiling_db: f32,
     /// Stereo width, `0.0..=2.0` (`1.0` is untouched).
     pub spatial_width: f32,
-    /// Cross-feed amount, `0.0..=1.0`.
+    /// Amount of spatial tail: `0.0` is off, `1.0` is a large, long room. What it moves is both
+    /// how loud the reverb is and how long it rings.
     pub spatial_room: f32,
 }
 
@@ -510,40 +511,193 @@ impl Loudness {
     }
 }
 
-/// Experimental spatial width and a short cross-feed reflection.
+/// Comb delays in samples, quoted at 44.1 kHz: mutually prime, so their resonances do not line
+/// up into a pitched artefact.
+const COMB_TUNING: [usize; 8] = [1_116, 1_188, 1_277, 1_356, 1_422, 1_491, 1_557, 1_617];
+
+/// Allpass delays in samples at 44.1 kHz: the diffusion that turns eight echoes into a tail.
+const ALLPASS_TUNING: [usize; 4] = [556, 441, 341, 225];
+
+/// Samples added to the right channel's delays. This is what makes the tail *stereo*: two
+/// channels fed the same signal from differently tuned lines decorrelate, which is heard as the
+/// sound leaving the speakers instead of sitting between them.
+const STEREO_SPREAD: usize = 23;
+
+/// How long the tail is held back before it starts, in seconds.
+///
+/// Short enough to still read as the same event, long enough that the reflections are not a
+/// comb filter over the dry signal — which is what the previous single-tap version actually was.
+const PREDELAY_SECONDS: f32 = 0.018;
+
+/// Comb feedback at room `0.0` and at room `1.0`. The gap is the other half of what the control
+/// does: a small room stops in a tenth of a second, a large one rings for about two seconds.
+const FEEDBACK_MIN: f32 = 0.70;
+const FEEDBACK_MAX: f32 = 0.97;
+
+/// High-frequency damping inside the comb loops: the tail loses its highs as it decays, the way
+/// a real room does.
+const DAMPING: f32 = 0.25;
+
+/// Allpass feedback. Diffuses without colouring: an allpass passes every frequency at the same
+/// level and only scrambles phase.
+const ALLPASS_FEEDBACK: f32 = 0.5;
+
+/// Wet level at room `1.0`, before the room curve and the bank's own normalisation. Calibrated by
+/// `the_room_control_leaves_an_audible_tail_behind_the_sound`: at the top of the slider the tail
+/// is plainly there, and still a little under the dry signal rather than over it.
+const WET_MAX: f32 = 0.30;
+
+/// One damped comb filter: a delay line whose feedback runs through a one-pole low pass.
+struct Comb {
+    buffer: Vec<f32>,
+    write: usize,
+    damping: f32,
+    store: f32,
+}
+
+impl Comb {
+    fn new(samples: usize) -> Self {
+        Self { buffer: vec![0.0; samples.max(1)], write: 0, damping: DAMPING, store: 0.0 }
+    }
+
+    fn reset(&mut self) {
+        self.buffer.iter_mut().for_each(|sample| *sample = 0.0);
+        self.write = 0;
+        self.store = 0.0;
+    }
+
+    /// One sample in, the echo from `buffer.len()` samples ago out.
+    #[inline]
+    fn process(&mut self, input: f32, feedback: f32) -> f32 {
+        let echo = self.buffer.get(self.write).copied().unwrap_or(0.0);
+        self.store = echo * (1.0 - self.damping) + self.store * self.damping;
+        if let Some(slot) = self.buffer.get_mut(self.write) {
+            *slot = input + self.store * feedback;
+        }
+        self.advance();
+        echo
+    }
+
+    #[inline]
+    fn advance(&mut self) {
+        self.write += 1;
+        if self.write >= self.buffer.len() {
+            self.write = 0;
+        }
+    }
+}
+
+/// One allpass: flat response, scrambled phase.
+struct Allpass {
+    buffer: Vec<f32>,
+    write: usize,
+}
+
+impl Allpass {
+    fn new(samples: usize) -> Self {
+        Self { buffer: vec![0.0; samples.max(1)], write: 0 }
+    }
+
+    fn reset(&mut self) {
+        self.buffer.iter_mut().for_each(|sample| *sample = 0.0);
+        self.write = 0;
+    }
+
+    #[inline]
+    fn process(&mut self, input: f32, feedback: f32) -> f32 {
+        let buffered = self.buffer.get(self.write).copied().unwrap_or(0.0);
+        if let Some(slot) = self.buffer.get_mut(self.write) {
+            *slot = input + buffered * feedback;
+        }
+        self.write += 1;
+        if self.write >= self.buffer.len() {
+            self.write = 0;
+        }
+        buffered - input
+    }
+}
+
+/// The spatial stage: a mid/side width control and a small Schroeder reverb.
 ///
 /// Deliberately *not* an HRIR convolution: a 128-tap HRIR per ear at 48 kHz is 512 multiply
-/// accumulates per sample, twenty times the whole equaliser. This is the cheap half of the
-/// effect — a mid/side width control and one delayed cross-mix — which is the part that makes
-/// a recording sound wider than the speakers.
+/// accumulates per sample, twenty times the whole equaliser. What is here is the cheap half of
+/// "space": eight damped comb filters in parallel into four allpasses — the Schroeder layout
+/// Freeverb made popular — with the two channels' delays nudged apart so their tails do not
+/// correlate.
+///
+/// This stage used to be a single 12 ms cross-feed tap, and that is why the control could not be
+/// heard: one tap is a comb filter, not a room. On real programme material it colours the sound
+/// slightly instead of putting anything around it, and a mono source gets the *same* reflection
+/// added to both channels, which collapses straight back to the middle. A bank of reflections
+/// builds up a tail that reads as space, and per-channel tunings keep that tail wide even from a
+/// mono file.
+///
+/// It is a **wet** stage: the tail is added to a dry signal that leaves untouched, so the stage
+/// adds no delay of its own (only the limiter's look-ahead does) and a frame it does not want to
+/// change comes out identical, sample for sample.
 ///
 /// Only the first two channels are touched: a 5.1 stream keeps its centre and surrounds, which
-/// are already positioned.
+/// are already positioned. The tail is built for two channels whatever the device width is — a
+/// little over 100 kB, allocated once in [`Spatial::new`] and never in the callback.
 struct Spatial {
-    delay: Vec<f32>,
+    /// One bank of combs per channel, feeding one chain of allpasses per channel.
+    combs: [Vec<Comb>; 2],
+    allpasses: [Vec<Allpass>; 2],
+    /// Pre-delay per channel, so the reflections do not read as a doubled dry signal.
+    predelay: Vec<f32>,
     write: usize,
-    channels: usize,
     frames: usize,
+    channels: usize,
+    /// `true` while the tail is being fed. Switching the room off drops what is in the buffers
+    /// rather than leaving it to leak back the next time the control is moved.
+    ringing: bool,
 }
 
 impl Spatial {
     fn new(sample_rate: f32, channels: usize) -> Self {
-        // 12 ms: long enough to be heard as space, short enough not to smear.
-        let frames = ((sample_rate * 0.012).round() as usize).clamp(1, 8_192);
-        Self { delay: vec![0.0; frames * 2], write: 0, channels, frames }
-    }
-
-    fn latency_samples(&self) -> usize {
-        if self.channels >= 2 {
-            self.frames
-        } else {
-            0
+        // The tunings are quoted at 44.1 kHz, so a 96 kHz device needs proportionally longer
+        // lines for the same room.
+        let scale = (sample_rate / 44_100.0).max(0.05);
+        let combs = std::array::from_fn(|channel| {
+            COMB_TUNING
+                .iter()
+                .map(|tuning| Comb::new(scaled(*tuning + spread_of(channel), scale)))
+                .collect()
+        });
+        let allpasses = std::array::from_fn(|channel| {
+            ALLPASS_TUNING
+                .iter()
+                .map(|tuning| Allpass::new(scaled(*tuning + spread_of(channel), scale)))
+                .collect()
+        });
+        let frames = ((sample_rate * PREDELAY_SECONDS).round() as usize).clamp(1, 8_192);
+        Self {
+            combs,
+            allpasses,
+            predelay: vec![0.0; frames * 2],
+            write: 0,
+            frames,
+            channels,
+            ringing: false,
         }
     }
 
+    /// Drop everything in the buffers, so a switch back on starts from silence rather than from
+    /// whatever was playing when it was switched off.
     fn reset(&mut self) {
-        self.delay.iter_mut().for_each(|s| *s = 0.0);
+        for bank in &mut self.combs {
+            for comb in bank.iter_mut() {
+                comb.reset();
+            }
+        }
+        for bank in &mut self.allpasses {
+            for allpass in bank.iter_mut() {
+                allpass.reset();
+            }
+        }
+        self.predelay.iter_mut().for_each(|sample| *sample = 0.0);
         self.write = 0;
+        self.ringing = false;
     }
 
     #[inline]
@@ -551,26 +705,124 @@ impl Spatial {
         if self.channels < 2 || frame.len() < 2 {
             return;
         }
-        let (left, right) = (frame[0], frame[1]);
-        let mid = (left + right) * 0.5;
-        let side = (left - right) * 0.5 * s.spatial_width.max(0.0);
-        let mut out_left = mid + side;
-        let mut out_right = mid - side;
-
-        if s.spatial_room > 1e-4 {
-            let slot = (self.write * 2) % self.delay.len();
-            let (delayed_left, delayed_right) = (self.delay[slot], self.delay[slot + 1]);
-            self.delay[slot] = out_left;
-            self.delay[slot + 1] = out_right;
-            self.write = (self.write + 1) % self.frames;
-            let amount = s.spatial_room * 0.35;
-            out_left += delayed_right * amount;
-            out_right += delayed_left * amount;
+        // `1.0` is the untouched width, and `spatial_width` is clamped to `0.0..=2.0`.
+        let widened = (s.spatial_width - 1.0).abs() > 1e-4;
+        let reverberant = s.spatial_room > 1e-4;
+        if !widened && !reverberant {
+            // Both controls are at their do-nothing position, so the frame leaves untouched —
+            // this is what keeps "on but not spatial" identical to "off" even while the other
+            // stages are working.
+            if self.ringing {
+                self.reset();
+            }
+            return;
         }
 
-        frame[0] = out_left;
-        frame[1] = out_right;
+        let (dry_left, dry_right) = (frame[0], frame[1]);
+        let (mut left, mut right) = if widened {
+            let mid = (dry_left + dry_right) * 0.5;
+            let side = (dry_left - dry_right) * 0.5 * s.spatial_width.max(0.0);
+            (mid + side, mid - side)
+        } else {
+            (dry_left, dry_right)
+        };
+
+        if reverberant {
+            let (wet_left, wet_right) = self.reverb(left, right, s.spatial_room);
+            left += wet_left;
+            right += wet_right;
+            self.ringing = true;
+        } else if self.ringing {
+            // The room just went back to zero: drop the tail rather than leave it sitting in the
+            // buffers until the control is moved again.
+            self.reset();
+        }
+
+        frame[0] = left;
+        frame[1] = right;
     }
+
+    /// Push one frame through the reverb, returning what should be *added* to the dry signal.
+    ///
+    /// The level carries two things: the room curve, and the comb bank's own normalisation. A
+    /// comb with feedback `f` amplifies a sustained signal by about `1 / (1 - f)`, so without the
+    /// second term the control would trade tail length against loudness and the top of the slider
+    /// would come out *quieter* than the middle. It is deliberately under-normalised (see
+    /// [`comb_normalisation`]) so the reflections a listener notices first stay audible.
+    fn reverb(&mut self, left: f32, right: f32, room: f32) -> (f32, f32) {
+        let (delayed_left, delayed_right) = self.predelay_frame(left, right);
+        let feedback = FEEDBACK_MIN + (FEEDBACK_MAX - FEEDBACK_MIN) * room;
+
+        let mut wet_left = 0.0;
+        let mut wet_right = 0.0;
+        for comb in &mut self.combs[0] {
+            wet_left += comb.process(delayed_left, feedback);
+        }
+        for comb in &mut self.combs[1] {
+            wet_right += comb.process(delayed_right, feedback);
+        }
+        for allpass in &mut self.allpasses[0] {
+            wet_left = allpass.process(wet_left, ALLPASS_FEEDBACK);
+        }
+        for allpass in &mut self.allpasses[1] {
+            wet_right = allpass.process(wet_right, ALLPASS_FEEDBACK);
+        }
+
+        // Squared rather than linear: the bottom of the slider is a hint of space and the top is a
+        // hall. Measured at the top: the tail just after the sound stops is about the level of the
+        // sound itself, and half a second later it is still a fifth of it.
+        let wet = WET_MAX * (room * room) * comb_normalisation(feedback);
+        (wet_left * wet, wet_right * wet)
+    }
+
+    /// One frame in, the frame from `PREDELAY_SECONDS` ago out.
+    #[inline]
+    fn predelay_frame(&mut self, left: f32, right: f32) -> (f32, f32) {
+        let slot = self.write * 2;
+        let out = (
+            self.predelay.get(slot).copied().unwrap_or(0.0),
+            self.predelay.get(slot + 1).copied().unwrap_or(0.0),
+        );
+        if let Some(sample) = self.predelay.get_mut(slot) {
+            *sample = left;
+        }
+        if let Some(sample) = self.predelay.get_mut(slot + 1) {
+            *sample = right;
+        }
+        self.write += 1;
+        if self.write >= self.frames {
+            self.write = 0;
+        }
+        out
+    }
+}
+
+/// One tuning, scaled from the 44.1 kHz it is quoted at to this device's rate.
+fn scaled(samples: usize, scale: f32) -> usize {
+    ((samples as f32 * scale).round() as usize).max(1)
+}
+
+/// How many samples to add to a channel's delays. The left channel keeps the nominal tunings;
+/// the right one is nudged, which is what decorrelates the two tails.
+fn spread_of(channel: usize) -> usize {
+    if channel == 0 {
+        0
+    } else {
+        STEREO_SPREAD
+    }
+}
+
+/// The reciprocal of what the comb bank does to a sustained signal.
+///
+/// Eight combs with delays long enough to be mutually incoherent add in power, so the bank's gain
+/// is `sqrt(1 / (1 - f)) * sqrt(8)` in RMS. Dividing by an under-scaled version of that
+/// (`f^-0.85` rather than `f^-1`) keeps the tail's level following the room control instead of
+/// fighting it — the knob lengthens the tail *and* fills it — while leaving the first reflections
+/// a few decibels proud, which is what makes the effect audible the moment it is switched on.
+fn comb_normalisation(feedback: f32) -> f32 {
+    let per_comb = (1.0 / (1.0 - feedback).max(1e-3)).sqrt();
+    let bank = per_comb * (COMB_TUNING.len() as f32).sqrt();
+    (1.0 / bank.max(1.0)).powf(0.85)
 }
 
 /// The safety stage: a look-ahead peak limiter with a `tanh` knee.
@@ -727,15 +979,12 @@ impl EnhanceChain {
 
     /// Delay the chain adds, in milliseconds. The interface shows this.
     ///
-    /// The spatial reflection only counts when it is actually switched on: with no cross-feed
-    /// that stage is a plain copy, so it delays nothing.
+    /// Only the limiter's look-ahead counts. The spatial stage is *wet*: it adds its tail to a dry
+    /// signal it leaves alone, so it delays nothing — the 12 ms the single cross-feed tap used to
+    /// contribute was a phase offset, not latency, and reporting it told the interface to show a
+    /// number that did not describe what was heard.
     pub fn latency_ms(&self) -> f32 {
-        let spatial = if self.current.spatial_room > 1e-4 {
-            self.spatial.latency_samples()
-        } else {
-            0
-        };
-        let samples = self.limiter.latency_samples() + spatial;
+        let samples = self.limiter.latency_samples();
         samples as f32 / self.sample_rate * 1_000.0
     }
 
@@ -1066,7 +1315,7 @@ mod tests {
     }
 
     #[test]
-    fn the_chain_reports_the_latency_it_adds() {
+    fn the_chain_reports_only_the_latency_it_really_adds() {
         let params = EnhanceParams::default();
         let mut chain = EnhanceChain::new(48_000, 2);
         let look_ahead_only = chain.latency_ms();
@@ -1075,12 +1324,211 @@ mod tests {
             "the limiter's look-ahead should be about a millisecond, got {look_ahead_only}"
         );
 
-        params.publish(Snapshot { bypass: false, spatial_room: 0.5, ..Snapshot::default() });
+        // The reverb is *added* to a dry signal that keeps its timing, so switching it on must not
+        // change what the interface reports.
+        params.publish(Snapshot { bypass: false, spatial_room: 1.0, ..Snapshot::default() });
         let mut samples = tone(4_800, 0.1);
         chain.process(&mut samples, &params);
+        assert_eq!(chain.latency_ms(), look_ahead_only);
+    }
+
+    /// RMS of one channel of an interleaved stereo block.
+    fn channel_rms(samples: &[f32], channel: usize) -> f32 {
+        let mut sum = 0.0;
+        let mut count = 0usize;
+        for frame in samples.chunks(2) {
+            if let Some(sample) = frame.get(channel) {
+                sum += sample * sample;
+                count += 1;
+            }
+        }
+        if count == 0 {
+            0.0
+        } else {
+            (sum / count as f32).sqrt()
+        }
+    }
+
+    /// Broadband, deterministic and identical in both channels: a mono source, which is the case
+    /// the single cross-feed tap could do nothing for.
+    fn mono_noise(frames: usize, peak: f32) -> Vec<f32> {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut samples = vec![0.0f32; frames * 2];
+        for frame in samples.chunks_mut(2) {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            // `>> 40` leaves 24 bits, so dividing by 2^23 gives `0..2` and subtracting one lands on
+            // `-1.0..1.0`: a centred signal, with no DC for the comb loops to amplify into a common
+            // component in both channels.
+            let unit = (state >> 40) as f32 / (1u64 << 23) as f32 - 1.0;
+            frame[0] = unit * peak;
+            frame[1] = unit * peak;
+        }
+        samples
+    }
+
+    /// What the reverb leaves behind: a burst of noise, then silence, with `room` set throughout.
+    /// Returns the RMS of the burst and the whole block of silence that follows it, so a test can
+    /// look both at how loud the tail is and at how long it lasts.
+    fn burst_then_silence(
+        room: f32,
+        burst_frames: usize,
+        silence_frames: usize,
+    ) -> (f32, Vec<f32>) {
+        let params = params(Snapshot { bypass: false, spatial_room: room, ..Snapshot::default() });
+        let mut chain = EnhanceChain::new(48_000, 2);
+        let mut burst = mono_noise(burst_frames, 0.5);
+        chain.process(&mut burst, &params);
+        let mut silence = vec![0.0f32; silence_frames * 2];
+        chain.process(&mut silence, &params);
+        (channel_rms(&burst, 0), silence)
+    }
+
+    /// Correlation between the two channels of an interleaved block. `1.0` means the two channels
+    /// are the same signal — which is what a mono source stays when nothing decorrelates it.
+    fn channel_correlation(samples: &[f32]) -> f32 {
+        let mut product = 0.0;
+        let mut left = 0.0;
+        let mut right = 0.0;
+        for frame in samples.chunks(2) {
+            product += frame[0] * frame[1];
+            left += frame[0] * frame[0];
+            right += frame[1] * frame[1];
+        }
+        let norm = (left * right).sqrt();
+        if norm > 0.0 {
+            product / norm
+        } else {
+            0.0
+        }
+    }
+
+    #[test]
+    fn the_room_control_leaves_an_audible_tail_behind_the_sound() {
+        // What a listener hears, measured on a mono noise burst: the tail is the first 100 ms after
+        // the sound stops, and how *long* the room rings is the half second that follows it. Every
+        // number here is relative to the burst's own level.
+        const BURST: usize = 9_600;
+        const SILENCE: usize = 24_000;
+        let windows = |room: f32| {
+            let (burst, silence) = burst_then_silence(room, BURST, SILENCE);
+            let early = channel_rms(&silence[..4_800 * 2], 0) / burst;
+            let late = channel_rms(&silence[16_800 * 2..], 0) / burst;
+            (burst, early, late)
+        };
+
+        let (burst, early, late) = windows(1.0);
+        assert!(burst > 0.2, "the test's own burst is wrong: {burst}");
         assert!(
-            chain.latency_ms() > look_ahead_only + 8.0,
-            "the cross-feed adds twelve milliseconds and must be reported"
+            early > 0.25,
+            "a room at 100 % left only {:.1} % of the sound behind it",
+            early * 100.0
+        );
+        assert!(early < 1.2, "the tail swamps the dry signal: {:.1} %", early * 100.0);
+        assert!(late > 0.05, "the tail is gone after half a second: {:.1} %", late * 100.0);
+
+        // Every notch has to do something: a quarter of the slider is plainly there, half is
+        // obvious, and neither is what the top reaches.
+        let (_, quarter, quarter_late) = windows(0.25);
+        assert!(
+            quarter > 0.02,
+            "a quarter of the room was inaudible: {:.1} %",
+            quarter * 100.0
+        );
+        let (_, half, half_late) = windows(0.5);
+        assert!(half > 0.08, "half the room was inaudible: {:.1} %", half * 100.0);
+        assert!(
+            quarter < half && half < early * 0.8,
+            "the control does not rise: {:.1} % at 25 %, {:.1} % at 50 %, {:.1} % at 100 %",
+            quarter * 100.0,
+            half * 100.0,
+            early * 100.0
+        );
+        // Louder *and* longer: that is the other half of "a bigger room", and the half the old
+        // single tap could not do at all.
+        assert!(
+            late > half_late * 5.0 && late > quarter_late * 5.0,
+            "the tail does not lengthen: {:.2} % at 25 %, {:.2} % at 50 %, {:.2} % at 100 %",
+            quarter_late * 100.0,
+            half_late * 100.0,
+            late * 100.0
+        );
+    }
+
+    #[test]
+    fn a_flooded_room_still_respects_the_limiter() {
+        // The reverb can only add level, so the stage after it has to hold: a hot burst with the
+        // room wide open must leave the limiter inside its ceiling, not wrapped around it.
+        let params = params(Snapshot { bypass: false, spatial_room: 1.0, ..Snapshot::default() });
+        let mut chain = EnhanceChain::new(48_000, 2);
+        let mut samples = mono_noise(24_000, 0.95);
+        chain.process(&mut samples, &params);
+        let peak = samples.iter().fold(0.0f32, |worst, sample| worst.max(sample.abs()));
+        assert!(peak <= 1.0, "the chain let {peak:.4} through");
+        assert!(samples.iter().all(|sample| sample.is_finite()));
+    }
+
+    #[test]
+    fn a_mono_source_gets_a_tail_that_is_not_mono() {
+        // The single cross-feed tap this stage replaced added the *same* reflection to both
+        // channels, so a mono file stayed in the middle and the control could not be heard.
+        // Differently tuned delays have to decorrelate the two tails instead.
+        let dry = mono_noise(4_800, 0.5);
+        assert!(
+            channel_correlation(&dry) > 0.999,
+            "the test's own source is not mono: {}",
+            channel_correlation(&dry)
+        );
+
+        let (_, tail) = burst_then_silence(1.0, 9_600, 24_000);
+        let correlation = channel_correlation(&tail);
+        assert!(
+            correlation < 0.5,
+            "the two tails are the same signal (correlation {correlation:.3}), so a mono file \
+             would stay in the middle"
+        );
+    }
+
+    #[test]
+    fn a_silent_room_hands_the_frame_back_untouched() {
+        // `room == 0` with a neutral width is the do-nothing position, and the other stages being
+        // busy must not change that — this is what keeps "on but not spatial" identical to "off".
+        let mut spatial = Spatial::new(48_000.0, 2);
+        let snapshot = Snapshot { bypass: false, bass_db: 6.0, ..Snapshot::default() };
+        let mut samples = tone(512, 0.8);
+        let original = samples.clone();
+        for frame in samples.chunks_mut(2) {
+            spatial.process_frame(frame, &snapshot);
+        }
+        assert_eq!(samples, original, "a room at 0 rewrote the buffer");
+    }
+
+    #[test]
+    fn switching_the_room_off_does_not_leave_a_tail_to_leak_back() {
+        // Whatever was ringing when the control was turned down has to be dropped, or the next time
+        // it is turned up the listener hears audio from minutes ago.
+        let mut spatial = Spatial::new(48_000.0, 2);
+        let ringing = Snapshot { bypass: false, spatial_room: 1.0, ..Snapshot::default() };
+        let closed = Snapshot { bypass: false, ..Snapshot::default() };
+
+        let mut burst = mono_noise(4_800, 0.5);
+        for frame in burst.chunks_mut(2) {
+            spatial.process_frame(frame, &ringing);
+        }
+        // Room back to zero, then up again: the buffers have been emptied in between.
+        for _ in 0..64 {
+            let mut frame = [0.0f32; 2];
+            spatial.process_frame(&mut frame, &closed);
+        }
+        let mut silence = vec![0.0f32; 2_048];
+        for frame in silence.chunks_mut(2) {
+            spatial.process_frame(frame, &ringing);
+        }
+        assert!(
+            silence.iter().all(|sample| *sample == 0.0),
+            "a stale tail leaked back: {:?}",
+            &silence[..8]
         );
     }
 }
