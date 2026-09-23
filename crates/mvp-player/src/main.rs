@@ -98,6 +98,16 @@ fn main() -> eframe::Result<()> {
         }
     };
 
+    // Read the 37 MB system font stack on its own thread from here, so the I/O
+    // overlaps the window and GL context being created (~160 ms of driver
+    // initialisation `eframe` does before `PlayerApp::new`). Without this the
+    // read lands *after* the context is up and sits on the path to the first
+    // frame. Placed past the single-instance guard so a secondary process — one
+    // about to hand its file list over and exit — never pays for the read, and
+    // so ten double-clicked files cannot put that read on the disk ten times
+    // over while the primary is starting.
+    theme::prefetch_fonts();
+
     // ---- persisted window geometry --------------------------------------
     //
     // Fitted to the screen *before* the window exists. The size on disk was
@@ -162,7 +172,7 @@ fn main() -> eframe::Result<()> {
         "MVP-Versatile-Player",
         options,
         Box::new(move |cc| {
-            let mut app = PlayerApp::new(cc, args, instance, ipc_rx, process_start);
+            let mut app = PlayerApp::new(cc, args, instance, ipc_rx, process_start, settings);
             if start_fullscreen {
                 app.ui.fullscreen = true;
             }

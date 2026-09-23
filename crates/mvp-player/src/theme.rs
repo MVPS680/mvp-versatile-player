@@ -19,8 +19,10 @@
 //!    decoration. Selection fills use [`Tokens::accent_soft`] so text on top of
 //!    them keeps its contrast.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 
 use egui::{
     Color32, Context, CornerRadius, FontFamily, FontId, Stroke, TextStyle, Visuals,
@@ -487,6 +489,87 @@ fn font_dir() -> &'static Path {
     })
 }
 
+/// One font file read off the disk, with the face index already clamped.
+struct PrefetchedFont {
+    path: PathBuf,
+    bytes: Vec<u8>,
+    face: u32,
+}
+
+/// The font files being read ahead of the first frame.
+///
+/// The stack is 37 MB across five files, and reading it is ~18 ms of disk I/O
+/// that used to sit *after* `eframe` had finished bringing the GL context up —
+/// on the critical path to the first frame. [`prefetch_fonts`] reads it on its
+/// own thread, started from `main`, so the I/O overlaps the driver's own ~160 ms
+/// of GL initialisation and the install finds the bytes already in memory.
+static FONT_PREFETCH: OnceLock<
+    crossbeam_channel::Receiver<Vec<(&'static str, PrefetchedFont)>>,
+> = OnceLock::new();
+
+/// The candidate files for one font slot, with the face to use inside each.
+///
+/// Built from the `*_CANDIDATES` constants so the background read and
+/// [`install_fonts`] can never disagree about which files are wanted.
+fn font_slots() -> [(&'static str, Vec<(&'static str, u32)>); 5] {
+    let plain = |list: &[&'static str]| list.iter().map(|file| (*file, 0)).collect();
+    [
+        ("ui", plain(UI_FONT_CANDIDATES)),
+        ("mono", plain(MONO_FONT_CANDIDATES)),
+        ("cjk", CJK_FONT_CANDIDATES.to_vec()),
+        ("ui_bold", plain(BOLD_FONT_CANDIDATES)),
+        ("cjk_bold", CJK_BOLD_FONT_CANDIDATES.to_vec()),
+    ]
+}
+
+/// Start reading the font stack on a background thread.
+///
+/// Called once from `main`, before `eframe::run_native`, so the read runs while
+/// the window and GL context are being created. Safe to call more than once —
+/// only the first call spawns.
+pub fn prefetch_fonts() {
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    if FONT_PREFETCH.set(rx).is_err() {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("mvp-fonts".into())
+        .spawn(move || {
+            let dir = font_dir();
+            let loaded: Vec<_> = font_slots()
+                .iter()
+                .filter_map(|(key, candidates)| {
+                    read_first(dir, candidates).map(|font| (*key, font))
+                })
+                .collect();
+            let _ = tx.send(loaded);
+        });
+}
+
+/// Read the first candidate that exists, clamping the face index to the file.
+fn read_first(dir: &Path, candidates: &[(&str, u32)]) -> Option<PrefetchedFont> {
+    for (file, wanted) in candidates {
+        let path = dir.join(file);
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let face = if *wanted < face_count(&bytes) { *wanted } else { 0 };
+        return Some(PrefetchedFont { path, bytes, face });
+    }
+    None
+}
+
+/// Take the prefetched files, waiting for the background thread if it is still
+/// running. Absent when [`prefetch_fonts`] was never called (a test, or a caller
+/// that installs the theme on its own); the install then reads from disk.
+fn take_prefetched() -> HashMap<&'static str, PrefetchedFont> {
+    FONT_PREFETCH
+        .get()
+        .and_then(|rx| rx.recv().ok())
+        .map(|list| list.into_iter().collect())
+        .unwrap_or_default()
+}
+
 /// How many faces a font file holds.
 ///
 /// Asking for a face that is not there makes `epaint` panic while parsing the
@@ -499,42 +582,38 @@ fn face_count(bytes: &[u8]) -> u32 {
     1
 }
 
-/// Register the first single-face candidate that loads, under `key`.
+/// Register `key`'s font from the prefetched bytes, or read the first candidate
+/// that exists when the prefetch did not find one.
 ///
-/// Returns `false` when none of them exist. The caller then simply leaves the
-/// font out of its family, so a missing fallback degrades to the next entry in
-/// the chain instead of aborting start-up.
-fn load_font(fonts: &mut egui::FontDefinitions, key: &str, candidates: &[&str]) -> bool {
-    let faces: Vec<(&str, u32)> = candidates.iter().map(|file| (*file, 0)).collect();
-    load_faces(fonts, key, &faces)
-}
-
-/// [`load_font`], for files that may hold more than one face.
-fn load_faces(fonts: &mut egui::FontDefinitions, key: &str, candidates: &[(&str, u32)]) -> bool {
-    let dir = font_dir();
-    for (file, wanted) in candidates {
-        let path = dir.join(file);
-        let Ok(bytes) = std::fs::read(&path) else {
-            continue;
-        };
-        // Clamped rather than trusted: a Windows build that ships a single-face
-        // `msyh.ttc` must still start, not abort on a bad face index.
-        let face = if *wanted < face_count(&bytes) { *wanted } else { 0 };
-        let kilobytes = bytes.len() / 1024;
-        let mut data = egui::FontData::from_owned(bytes);
-        data.index = face;
-        fonts
-            .font_data
-            .insert(key.to_owned(), std::sync::Arc::new(data));
-        log::info!(
-            "已加载字体 {key}: {} ({kilobytes} KB, 第 {face} 个字面)",
-            path.display()
-        );
-        return true;
-    }
-    let names: Vec<&str> = candidates.iter().map(|(file, _)| *file).collect();
-    log::warn!("系统字体缺失，{key} 的回退链 {names:?} 全部不可用");
-    false
+/// Returns `false` when no candidate exists at all. The caller then simply
+/// leaves the font out of its family, so a missing fallback degrades to the next
+/// entry in the chain instead of aborting start-up.
+fn load_faces(
+    fonts: &mut egui::FontDefinitions,
+    key: &str,
+    candidates: &[(&str, u32)],
+    prefetched: Option<PrefetchedFont>,
+) -> bool {
+    // Clamped rather than trusted: a Windows build that ships a single-face
+    // `msyh.ttc` must still start, not abort on a bad face index.
+    let font = prefetched.or_else(|| read_first(font_dir(), candidates));
+    let Some(font) = font else {
+        let names: Vec<&str> = candidates.iter().map(|(file, _)| *file).collect();
+        log::warn!("系统字体缺失，{key} 的回退链 {names:?} 全部不可用");
+        return false;
+    };
+    let kilobytes = font.bytes.len() / 1024;
+    let mut data = egui::FontData::from_owned(font.bytes);
+    data.index = font.face;
+    fonts
+        .font_data
+        .insert(key.to_owned(), std::sync::Arc::new(data));
+    log::info!(
+        "已加载字体 {key}: {} ({kilobytes} KB, 第 {} 个字面)",
+        font.path.display(),
+        font.face
+    );
+    true
 }
 
 static FONTS_INSTALLED: std::sync::Once = std::sync::Once::new();
@@ -557,30 +636,36 @@ fn install_fonts(ctx: &Context) {
 
         let mut proportional = Vec::new();
         let mut monospace = Vec::new();
+        let mut bold = Vec::new();
 
         // `epaint` walks a family in order and takes the first font that has a
         // glyph, so this reads as a primary followed by its fallbacks: Latin
         // first, then CJK for anything the Latin face does not cover.
-        if load_font(&mut fonts, "ui", UI_FONT_CANDIDATES) {
-            proportional.push("ui".to_owned());
-        }
-        if load_font(&mut fonts, "mono", MONO_FONT_CANDIDATES) {
-            monospace.push("mono".to_owned());
-        }
-        if load_faces(&mut fonts, "cjk", CJK_FONT_CANDIDATES) {
-            proportional.push("cjk".to_owned());
-            monospace.push("cjk".to_owned());
-        }
-
-        // Headings. Registered as a family of its own rather than as a replacement
-        // for the body font, because only some text — titles, section headings,
-        // the one number a dialog is about — is meant to be heavy.
-        let mut bold = Vec::new();
-        if load_font(&mut fonts, "ui_bold", BOLD_FONT_CANDIDATES) {
-            bold.push("ui_bold".to_owned());
-        }
-        if load_faces(&mut fonts, "cjk_bold", CJK_BOLD_FONT_CANDIDATES) {
-            bold.push("cjk_bold".to_owned());
+        //
+        // The bytes come from the background read `main` started before the
+        // window existed; `take_prefetched` waits for it to finish, which it has
+        // by now — the GL context took longer to come up than the read.
+        let mut prefetched = take_prefetched();
+        for (key, candidates) in font_slots() {
+            if !load_faces(&mut fonts, key, &candidates, prefetched.remove(key)) {
+                continue;
+            }
+            match key {
+                "ui" => proportional.push("ui".to_owned()),
+                "mono" => monospace.push("mono".to_owned()),
+                // The CJK face backs both families.
+                "cjk" => {
+                    proportional.push("cjk".to_owned());
+                    monospace.push("cjk".to_owned());
+                }
+                // Headings. Registered as a family of its own rather than as a
+                // replacement for the body font, because only some text — titles,
+                // section headings, the one number a dialog is about — is meant to
+                // be heavy.
+                "ui_bold" => bold.push("ui_bold".to_owned()),
+                "cjk_bold" => bold.push("cjk_bold".to_owned()),
+                _ => {}
+            }
         }
         if !bold.is_empty() {
             fonts

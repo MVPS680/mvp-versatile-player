@@ -211,8 +211,11 @@ impl PlayerApp {
         instance: Option<AppInstance>,
         ipc_rx: crossbeam_channel::Receiver<IpcMessage>,
         process_start: Instant,
+        settings: Settings,
     ) -> Self {
-        let mut settings = Settings::load();
+        // The document `main` already read for the window geometry: re-reading
+        // the same file here was pure duplicate work on the start-up path.
+        let mut settings = settings;
         // Snapshot the document before the command line is folded in: the values
         // that came from `settings.json` are the ones that belong there.
         let baseline = settings.clone();

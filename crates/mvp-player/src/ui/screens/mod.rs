@@ -38,6 +38,25 @@ pub(super) fn draw(app: &mut PlayerApp, ctx: &Context) {
     }
 }
 
+/// Paint the picture area alone: the first, cheap frame.
+///
+/// The window `eframe` creates stays hidden until a frame is painted, so a
+/// cheaper first frame is a window that appears sooner. This deliberately skips
+/// the text-heavy chrome — the menu, the sidebar and the transport — which the
+/// caller requests on the very next frame. The picture is what a media player
+/// should lead with, and at this point in start-up it is the only thing there is
+/// to show.
+pub(super) fn draw_canvas_only(app: &mut PlayerApp, ctx: &Context) {
+    match app.mode {
+        Mode::Video => canvas::draw_video(app, ctx),
+        Mode::Audio => canvas::draw_audio(app, ctx),
+        Mode::Image => canvas::draw_image(app, ctx),
+        // Nothing open yet: there is no picture to lead with, so the window
+        // background alone, which is also the cheapest possible first frame.
+        Mode::Empty => {}
+    }
+}
+
 /// The floating transport, drawn over the picture in fullscreen.
 ///
 /// Images have no timeline, so fullscreen is the picture and nothing else —

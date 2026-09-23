@@ -556,6 +556,13 @@ pub struct UiState {
     /// The window should be closed at the end of this frame.
     pub close_requested: bool,
 
+    /// `false` until the first full frame has been painted.
+    ///
+    /// `eframe` keeps the window hidden until a frame is painted, so the first
+    /// frame leads with the picture alone and the chrome follows on the frame
+    /// right after — a cheaper first frame is a window that appears sooner.
+    pub chrome_ready: bool,
+
     /// Milliseconds from process start to the first painted frame.
     pub startup_ms: f32,
     /// What actually reached the screen, as opposed to what was decoded.
@@ -709,6 +716,7 @@ impl Default for UiState {
             fullscreen: false,
             last_reported_fullscreen: None,
             close_requested: false,
+            chrome_ready: false,
             startup_ms: 0.0,
             present: PresentStats::default(),
             ffmpeg_version: String::new(),

@@ -52,6 +52,22 @@ pub fn draw(app: &mut PlayerApp, ctx: &Context) {
     handle_pointer_idle(app, ctx);
     app.ui.tick_toast();
 
+    // The first frame leads with the picture and nothing else.
+    //
+    // `eframe` creates the window hidden and only shows it once a frame has been
+    // painted, so the cost of that first frame *is* the delay before the user
+    // sees anything. Painting the picture alone makes it cheap; the chrome — the
+    // menu, the sidebar, the transport, every overlay — is deferred to the frame
+    // requested right here, which follows within one presentation interval. Every
+    // later frame runs the whole interface below, so the panels' order contract
+    // and the interaction they carry are untouched.
+    if !app.ui.chrome_ready {
+        app.ui.chrome_ready = true;
+        screens::draw_canvas_only(app, ctx);
+        ctx.request_repaint();
+        return;
+    }
+
     // ---- panel order ----------------------------------------------------
     //
     // Every panel has to claim its strip of the window *before* the central
