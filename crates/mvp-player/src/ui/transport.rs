@@ -903,6 +903,20 @@ fn video_button_row(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
 /// the same tracks in one bar is how a viewer ends up changing the wrong one.
 fn track_menu(app: &mut PlayerApp, ui: &mut Ui) {
     ui.set_min_width(220.0);
+    // First, and the one entry here that is not about the file at all: the enhancement
+    // belongs to the output device, so it is offered even while the tracks are still being
+    // read. This menu is where a listener looks for "make the sound different", exactly as
+    // 「画面」's menu is where they look for the picture — and its own menu opens the
+    // picture panel the same way.
+    if ui
+        .button(RichText::new("音效增强…").size(font::SMALL))
+        .clicked()
+    {
+        app.open_audio_enhance();
+        ui.close();
+    }
+    ui.separator();
+
     let info = app.media_info();
 
     ui.label(
