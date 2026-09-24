@@ -1296,6 +1296,19 @@ fn send_source(tx: &Sender<SourceFrame>, mut msg: SourceFrame, shared: &Shared) 
 /// while the decode thread owns the codec.
 fn run_video_converter(shared: Arc<Shared>, rx: Receiver<SourceFrame>, fallback_step: f64) {
     let mut converter = RgbaConverter::new();
+    // The file's Dolby Vision record is known as soon as the demuxer has
+    // described it, which is before this thread is spawned, and the converter
+    // needs it to decide what the base layer is coded with — the record's
+    // compatibility id is what makes an HLG-compatible base layer HLG rather
+    // than the PQ a Dolby Vision stream is often assumed to be.
+    converter.set_dovi_config(
+        shared
+            .info
+            .lock()
+            .as_ref()
+            .and_then(|info| info.primary_video())
+            .and_then(|video| video.hdr.dovi),
+    );
     let mut serial = 0u64;
 
     loop {
@@ -1339,6 +1352,7 @@ fn run_video_converter(shared: Arc<Shared>, rx: Receiver<SourceFrame>, fallback_
         // The preference can change while a file plays, so it is re-read for
         // every frame; the converter only rebuilds its tables when it flips.
         converter.set_tone_map(shared.hdr_tone_map.load(Ordering::Relaxed));
+        converter.set_dv_reshape(shared.dv_reshape.load(Ordering::Relaxed));
         let convert_started = Instant::now();
         let data = match converter.convert(src, width, height, &shared.pool) {
             Ok(data) => data,

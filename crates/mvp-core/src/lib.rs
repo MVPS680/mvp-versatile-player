@@ -19,6 +19,7 @@
 pub mod audio;
 pub mod bitmap_subtitle;
 pub mod dsp;
+pub mod dolby;
 pub mod engine;
 pub mod error;
 pub mod hdr;
@@ -32,8 +33,9 @@ pub use engine::{
     Clock, Engine, EngineConfig, EngineEvent, EngineSnapshot, MediaSource, PlaybackState,
 };
 pub use bitmap_subtitle::{BitmapCue, BitmapRect, BitmapSubtitle};
+pub use dolby::{DvColorSpace, DvPlan, DvRender, DvRpu, DvSignal};
 pub use error::{MediaError, Result};
-pub use hdr::{DoviConfig, HdrInfo, HdrKind, ToneMapper};
+pub use hdr::{pq_code_to_nits, DoviConfig, HdrInfo, HdrKind, ToneMapper};
 pub use image_view::{FitMode, ImageDoc, ImageFrame, ImageView};
 pub use info::{AudioStreamInfo, ChapterInfo, MediaInfo, SubtitleStreamInfo, VideoStreamInfo};
 pub use playlist::{Playlist, PlaylistItem, RepeatMode};

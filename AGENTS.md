@@ -21,6 +21,7 @@ on `PATH`. Use the wrapper instead of bare `cargo`:
 | Registry tests (writes HKCU) | `.\scripts\dev.ps1 test -p mvp-platform --test registry_live -- --ignored --test-threads=1` |
 | Package | `.\scripts\package.ps1` → `dist\MVP-Versatile-Player\` |
 | Probe one file/URL | `cargo run -p mvp-core --example seek_probe -- <file-or-url> [seconds]` |
+| Probe Dolby Vision | `cargo run -p mvp-core --example dv_probe -- <file> [frames]` |
 
 `crates/mvp-core/examples/seek_probe.rs` is the smallest working example of
 driving the engine (open → poll events → take frames → seek → stop); start there
@@ -84,6 +85,23 @@ so callers need only depend on `mvp-core`.
   `clock` / `queue` / `workers`; `engine/` has no `mod.rs`. `engine.rs` holds the
   public API (`Engine`, `EngineConfig`, `EngineSnapshot`, `Shared`), `workers.rs`
   holds the demux/decode loops.
+- **Dolby Vision is `dolby.rs` (+ `dolby/reshape.rs`), and it is the only place
+  that decides what to do with such a file.** `dolby.rs` mirrors the parts of
+  `libavutil/dovi_meta.h` the bindings do not generate (offsets asserted in
+  tests, every read bounded by the side data's size) and resolves a `DvPlan`
+  that the converter, the information panel and the open-time notice all ask —
+  so they cannot disagree. The base layer's transfer function comes from the
+  record's *compatibility id*, not from an assumption that DV is PQ: an
+  HLG-compatible base layer (Profile 8.4) run through the PQ curve is a
+  washed-out picture. `dolby/reshape.rs` implements the RPU's reshaping curves
+  (polynomial, MMR, and the NLQ an enhancement layer's residual needs); it is
+  **off by default** because only the luma half has been checked against
+  libplacebo (28.5 dB against its 29.4 dB) — see its module docs for the
+  measurements, and `tmp/dv-compare.ps1` + `examples/dv_reshape_dump.rs` for the
+  harness. Decoding an enhancement layer, Profile 5's IPT and any RPU reaching
+  the display are **deliberately not done**; the first needs a Profile 7 sample
+  to verify against. Do not flip the reshaping default on, and do not add a
+  half-verified version of any of the others.
 - **Threads:** one demuxer (`mvp-demux`), one video (`mvp-video`) and one audio
   (`mvp-audio`) worker, each 1 MiB stack; plus cpal's realtime callback and
   scoped tone-map threads. **Subtitles have no worker** — they are decoded inline
@@ -142,7 +160,14 @@ so callers need only depend on `mvp-core`.
 - `canvas::draw` clears `ui.picture` at the top of every frame. A view that
   handles the pointer *before* publishing its geometry gets `None` and silently
   does nothing.
-- Do not rely on egui to arbitrate between overlapping widgets; the minimap asks
+- **The interface palette is a persisted setting** (`theme::Palette`; 设置 → 常规 → 外观).
+  `theme.rs` is the only place that knows the colours: `Tokens::for_palette` is the single
+  entry point, each palette's translucent fills are derived from its own `wash` colour at the
+  shared alphas in `alpha` (`Recipe`), and `Palette::Blue` — the original, kept as an option —
+  is exempt from the chroma ceilings through `Palette::is_muted` but not from the contrast
+  floors. A palette change is an *install* (`PlayerApp::install_palette`), not a field the next
+  frame reads.
+- **Do not rely on egui to arbitrate between overlapping widgets**; the minimap asks
   the canvas from inside the canvas's own pointer handling for this reason.
 
 ## Conventions

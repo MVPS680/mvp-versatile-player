@@ -1,23 +1,43 @@
 //! Visual design tokens and the `egui` style the whole player is built from.
 //!
-//! The palette follows Apple's dark system appearance: a ramp of layered greys
-//! (`bg` → `panel` → `elevated` → `sunken`), one blue accent that carries every
-//! interactive highlight, and a small set of semantic colours (success, warning,
-//! danger) that are only ever used for state. A media player is watched next to
-//! its own picture, so the chrome stays quiet and the *picture* stays the
-//! brightest thing on screen.
+//! The player ships **five palettes** and the user picks one in the settings page
+//! ([`Palette`]): the original blue-on-neutral-grey it started with, and four
+//! Morandi ones. A Morandi palette is a ramp of warm, low-chroma greys
+//! (`bg` → `panel` → `elevated` → `sunken`), one dusty accent that carries every
+//! interactive highlight, and a small set of muted semantic colours (success,
+//! warning, danger) used only for state. Nothing in one is as saturated as it
+//! could be, and that is the point: a media player is watched next to its own
+//! picture, so the chrome stays quiet and the *picture* stays the brightest, most
+//! colourful thing on screen. Their greys are warm (a hint of brown rather than
+//! the blue of a system dark mode) and their translucent state fills are their
+//! own white, so no cold grey appears next to them. The
+//! `no_colour_in_the_palette_shouts` test at the bottom of this file is what keeps
+//! that property from being eroded one "cleanup" at a time; it asks
+//! `Palette::is_muted` rather than listing exceptions, so a new Morandi palette is
+//! held to it the moment it is added.
+//!
+//! A palette is a choice of **chrome**, never of hierarchy: switching one changes
+//! hues and nothing else. That is why the translucent fills are derived from each
+//! palette's own white at *shared* alphas ([`Recipe`]) instead of being spelled
+//! out five times — and why [`Palette::Blue`] has to keep passing every contrast
+//! floor. It is exempt from the chroma ceilings alone, which is exactly what
+//! "keep the original" means.
 //!
 //! Three rules taken from the Human Interface Guidelines hold the whole file
 //! together:
 //!
 //! 1. **Hierarchy comes from colour, not from lines.** Surfaces are separated by
-//!    a translucent white hairline ([`Tokens::separator`]) rather than a grey
+//!    a translucent hairline ([`Tokens::separator`]) rather than a grey
 //!    stroke, so a separator is correct on any surface it is drawn on.
 //! 2. **Everything is measured on a 4 pt grid** ([`space`]) with Apple's corner
 //!    radii ([`radius`]), so unrelated panels still line up with each other.
 //! 3. **The accent means "this is interactive, or this is current."** It is never
 //!    decoration. Selection fills use [`Tokens::accent_soft`] so text on top of
 //!    them keeps its contrast.
+//!
+//! Geometry, type and spacing are deliberately untouched by a palette: choosing
+//! one is a recolouring, not a redesign, and the layout tests still pin the same
+//! values they did before.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -27,6 +47,7 @@ use std::sync::OnceLock;
 use egui::{
     Color32, Context, CornerRadius, FontFamily, FontId, Stroke, TextStyle, Visuals,
 };
+use serde::{Deserialize, Serialize};
 
 /// A colour with an alpha channel, built from a hex literal at compile time.
 /// A colour without an alpha channel, built from a hex literal at compile time.
@@ -42,8 +63,120 @@ fn rgba(r: u8, g: u8, b: u8, a: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(r, g, b, a)
 }
 
+/// A colour straight from the literal a palette is written as — `0xRRGGBB`, the
+/// shape the values are read off a design in.
+///
+/// Palettes are long enough that a row of `rgb(0x1E, 0x1D, 0x19)`s hides the
+/// differences between them; one hex number per colour keeps a palette readable as
+/// the table it is.
+const fn hex(value: u32) -> Color32 {
+    rgb((value >> 16) as u8, (value >> 8) as u8, value as u8)
+}
+
+/// The colour palettes the player ships with, one at a time.
+///
+/// [`Palette::Blue`] is what the player looked like before this was a setting, kept
+/// because that look is a legitimate preference. The rest are Morandi ones, which
+/// is what the interface is designed around; [`Palette::Clay`] is the default.
+///
+/// Every variant is a *dark* palette. There is deliberately no light one and no
+/// "follow the system": `Theme::install` documents what following the OS theme
+/// used to do to this interface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum Palette {
+    /// The original: Apple blue on neutral, faintly blue-grey surfaces.
+    Blue,
+    /// Warm grey with a dusty clay accent.
+    #[default]
+    Clay,
+    /// Warm grey with a muted sage-green accent.
+    Sage,
+    /// Cool grey with a dusty slate-blue accent.
+    Slate,
+    /// Warm grey with a muted mauve accent.
+    Mauve,
+}
+
+impl Palette {
+    /// The marker a label carries when its palette is the default one.
+    ///
+    /// Only the tests read this. A `&'static str` cannot be assembled at run time, so
+    /// the marker has to sit in the label literal itself — and this constant is what
+    /// `every_palette_is_offered_once` compares that literal against, so the two
+    /// cannot drift apart.
+    #[cfg(test)]
+    pub const DEFAULT_MARK: &'static str = "（默认）";
+
+    /// Every palette, in the order the settings page offers them.
+    ///
+    /// The original comes first: a user who wants the old look back should not have
+    /// to read four Chinese colour names to find it.
+    pub fn all() -> [Palette; 5] {
+        [
+            Palette::Blue,
+            Palette::Clay,
+            Palette::Sage,
+            Palette::Slate,
+            Palette::Mauve,
+        ]
+    }
+
+    /// The name shown in the settings page.
+    ///
+    /// The default carries its own marker, and `the_default_palette_says_so` keeps
+    /// the marker on the palette that is actually the default.
+    pub fn label(self) -> &'static str {
+        match self {
+            Palette::Blue => "原版蓝",
+            Palette::Clay => "陶土灰（默认）",
+            Palette::Sage => "灰绿",
+            Palette::Slate => "雾蓝",
+            Palette::Mauve => "藕紫",
+        }
+    }
+
+    /// The same list in the shape `widgets::combo_row` wants.
+    pub fn choices() -> [(Palette, &'static str); 5] {
+        Self::all().map(|palette| (palette, palette.label()))
+    }
+
+    /// Whether the palette promises that every colour in it is muted.
+    ///
+    /// True of the Morandi palettes and false of [`Palette::Blue`], whose accent is
+    /// a fully saturated blue — that *is* what choosing the original look means.
+    /// The chromatic ceilings in `no_colour_in_the_palette_shouts` ask this instead
+    /// of listing exceptions, so anything added here is held to them by default.
+    ///
+    /// Only the tests ask: nothing the player ships draws a verdict on its own
+    /// palette, and this is here so that the answer lives next to the palettes rather
+    /// than in the test that happens to need it.
+    #[cfg(test)]
+    pub fn is_muted(self) -> bool {
+        !matches!(self, Palette::Blue)
+    }
+
+    /// The light surround the image viewer paints behind a still that does not fill
+    /// the window, as RGB.
+    ///
+    /// Part of the palette rather than one constant, because a surround is judged
+    /// against the chrome around it: the warm mat that suits the Morandi greys
+    /// reads as a colour cast under the blue one, and the neutral grey the original
+    /// shipped with reads as a cold frame around them. Only the *light* surround is
+    /// here — black and the checkerboard are choices about judging a picture, not
+    /// colours.
+    pub fn light_surround(self) -> [u8; 3] {
+        match self {
+            Palette::Blue => [214, 214, 216],
+            Palette::Clay => [216, 211, 202],
+            Palette::Sage => [211, 214, 205],
+            Palette::Slate => [206, 210, 216],
+            Palette::Mauve => [214, 209, 215],
+        }
+    }
+}
+
 /// Every colour the interface uses.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tokens {
     /// Window background, behind everything.
     pub bg: Color32,
@@ -107,42 +240,260 @@ pub struct Tokens {
     pub danger_soft: Color32,
 }
 
-impl Default for Tokens {
-    fn default() -> Self {
-        Self {
-            bg: rgb(0x0D, 0x0E, 0x11),
-            panel: rgb(0x16, 0x18, 0x1C),
-            elevated: rgb(0x1E, 0x21, 0x26),
-            sunken: rgb(0x0A, 0x0B, 0x0D),
-            hover: rgba(0xFF, 0xFF, 0xFF, 0x14),
-            active: rgba(0xFF, 0xFF, 0xFF, 0x24),
-            border: rgba(0xFF, 0xFF, 0xFF, 0x14),
-            border_strong: rgba(0xFF, 0xFF, 0xFF, 0x2E),
-            text: rgb(0xF5, 0xF5, 0xF7),
-            text_weak: rgb(0xA1, 0xA7, 0xB3),
-            // 3.7:1 on the panel was not enough for an 11 pt caption, and the
-            // settings page draws every explanation in this colour, where a busy
-            // backdrop makes it worse rather than better. At this value it clears
-            // WCAG AA on the panel and still sits a clear step below `text_weak`, so
-            // the three text levels stay distinguishable.
-            text_muted: rgb(0x7E, 0x83, 0x8D),
-            accent: rgb(0x0A, 0x84, 0xFF),
-            accent_hover: rgb(0x3D, 0x9B, 0xFF),
+/// The colours of one palette, before the translucent fills are derived.
+///
+/// The fills are deliberately *not* here: they are the palette's own white
+/// ([`Recipe::wash`]) at the alphas in [`alpha`], and the accent at two more. How
+/// strong a hover is, how loud a selection is and how visible a focus ring is are
+/// decisions about the *shape* of the interface, and they must not change when the
+/// user picks a different hue — which is exactly what re-deriving them per palette
+/// would have allowed.
+struct Recipe {
+    /// Window background, behind everything.
+    bg: Color32,
+    /// Side bars and toolbars.
+    panel: Color32,
+    /// Cards, popups and the settings window.
+    elevated: Color32,
+    /// Inset areas such as the seek bar trough.
+    sunken: Color32,
+    /// The palette's white.
+    ///
+    /// Every translucent fill is this colour at some alpha, so a palette keeps one
+    /// temperature: the warm greys with a pure-white wash over them are a cold
+    /// smudge, which is what sharing one white across the palettes would give.
+    wash: Color32,
+    /// Primary text.
+    text: Color32,
+    /// Secondary text, labels and captions.
+    text_weak: Color32,
+    /// Disabled text, and the settings page's explanations.
+    text_muted: Color32,
+    /// The one accent colour.
+    accent: Color32,
+    /// The accent under the pointer.
+    accent_hover: Color32,
+    /// The accent under the pointer's finger.
+    accent_pressed: Color32,
+    /// Positive state (volume, connected).
+    success: Color32,
+    /// Warnings (A–B loop armed, unsupported track).
+    warning: Color32,
+    /// Errors and destructive actions.
+    danger: Color32,
+}
+
+/// How strong each translucent fill is, on every palette.
+///
+/// Shared numbers rather than per-palette ones — see [`Recipe`] — and how they
+/// relate to each other is a property the tests at the bottom of this file hold: a
+/// skeleton is quieter than the separator that replaces it, which is quieter than
+/// the band that travels across it.
+mod alpha {
+    /// Hover fill for list rows and icon buttons.
+    pub const HOVER: u8 = 0x14;
+    /// Active/pressed fill.
+    pub const ACTIVE: u8 = 0x24;
+    /// Hairline separators.
+    pub const BORDER: u8 = 0x14;
+    /// Stronger separators and outlines.
+    pub const BORDER_STRONG: u8 = 0x2E;
+    /// Seek bar trough.
+    pub const TRACK: u8 = 0x1F;
+    /// Hairline between rows of a grouped list.
+    pub const SEPARATOR: u8 = 0x17;
+    /// Placeholder fill of a skeleton row.
+    pub const SKELETON: u8 = 0x0F;
+    /// The band that travels across a skeleton row.
+    pub const SKELETON_HIGHLIGHT: u8 = 0x26;
+    /// The accent at list-selection strength.
+    pub const ACCENT_SOFT: u8 = 0x3D;
+    /// Keyboard-focus ring.
+    pub const ACCENT_RING: u8 = 0x8C;
+    /// Error, at banner strength.
+    pub const DANGER_SOFT: u8 = 0x33;
+}
+
+/// `colour` at `alpha`, for the translucent fills.
+fn faint(colour: Color32, alpha: u8) -> Color32 {
+    rgba(colour.r(), colour.g(), colour.b(), alpha)
+}
+
+impl Recipe {
+    /// Expand into every colour the interface uses.
+    fn tokens(self) -> Tokens {
+        Tokens {
+            bg: self.bg,
+            panel: self.panel,
+            elevated: self.elevated,
+            sunken: self.sunken,
+            hover: faint(self.wash, alpha::HOVER),
+            active: faint(self.wash, alpha::ACTIVE),
+            border: faint(self.wash, alpha::BORDER),
+            border_strong: faint(self.wash, alpha::BORDER_STRONG),
+            text: self.text,
+            text_weak: self.text_weak,
+            text_muted: self.text_muted,
+            accent: self.accent,
+            accent_hover: self.accent_hover,
+            // A constant rather than a fifteenth thing each palette could get wrong:
+            // every palette's accent is dark enough to carry white text, and
+            // `every_palette_has_enough_contrast` measures that ratio for each of
+            // them.
             on_accent: rgb(0xFF, 0xFF, 0xFF),
-            progress: rgb(0x0A, 0x84, 0xFF),
-            track: rgba(0xFF, 0xFF, 0xFF, 0x1F),
-            success: rgb(0x32, 0xD7, 0x4B),
-            warning: rgb(0xFF, 0x9F, 0x0A),
-            danger: rgb(0xFF, 0x45, 0x3A),
+            // Progress is the accent: the seek bar is the loudest "here is where you
+            // are" element on screen, so it speaks the interactive colour.
+            progress: self.accent,
+            track: faint(self.wash, alpha::TRACK),
+            success: self.success,
+            warning: self.warning,
+            danger: self.danger,
+            // The one colour no palette chooses: the black a cinema letterboxes
+            // with. A letterbox that followed a palette would tint the bars around a
+            // film, which is the opposite of what they are for.
             letterbox: rgb(0x00, 0x00, 0x00),
-            separator: rgba(0xFF, 0xFF, 0xFF, 0x17),
-            accent_soft: rgba(0x0A, 0x84, 0xFF, 0x3D),
-            accent_pressed: rgb(0x06, 0x70, 0xE0),
-            focus_ring: rgba(0x0A, 0x84, 0xFF, 0x8C),
-            skeleton: rgba(0xFF, 0xFF, 0xFF, 0x0F),
-            skeleton_highlight: rgba(0xFF, 0xFF, 0xFF, 0x26),
-            danger_soft: rgba(0xFF, 0x45, 0x3A, 0x33),
+            separator: faint(self.wash, alpha::SEPARATOR),
+            accent_soft: faint(self.accent, alpha::ACCENT_SOFT),
+            accent_pressed: self.accent_pressed,
+            focus_ring: faint(self.accent, alpha::ACCENT_RING),
+            skeleton: faint(self.wash, alpha::SKELETON),
+            skeleton_highlight: faint(self.wash, alpha::SKELETON_HIGHLIGHT),
+            danger_soft: faint(self.danger, alpha::DANGER_SOFT),
         }
+    }
+}
+
+impl Palette {
+    /// The colours of this palette.
+    fn recipe(self) -> Recipe {
+        // The semantic trio does not change between the Morandi palettes: success,
+        // warning and danger mean the same thing in all of them, so a palette is a
+        // choice of chrome rather than a re-skin of state. The green is deliberately
+        // *lighter* than the sage accent rather than a different hue — a success mark
+        // and an interactive highlight that read as the same green are worse than two
+        // greens that differ in weight.
+        const MUTED: (u32, u32, u32) = (0x8FA88B, 0xC2A578, 0xB07468);
+        match self {
+            // The palette the player shipped with, value for value.
+            Palette::Blue => Recipe {
+                bg: hex(0x0D0E11),
+                panel: hex(0x16181C),
+                elevated: hex(0x1E2126),
+                sunken: hex(0x0A0B0D),
+                wash: hex(0xFFFFFF),
+                text: hex(0xF5F5F7),
+                text_weak: hex(0xA1A7B3),
+                text_muted: hex(0x7E838D),
+                accent: hex(0x0A84FF),
+                accent_hover: hex(0x3D9BFF),
+                accent_pressed: hex(0x0670E0),
+                // The one palette that does not use the muted trio: this is the
+                // system colour set it was designed with.
+                success: hex(0x32D74B),
+                warning: hex(0xFF9F0A),
+                danger: hex(0xFF453A),
+            },
+            // Warm near-black, warm panel, warm card: the ramp is the same shape a
+            // system dark mode's — three steps plus an inset — but the hue is pulled
+            // towards brown rather than blue, which is what makes the chrome sit
+            // quietly next to a picture instead of tinting it.
+            Palette::Clay => Recipe {
+                bg: hex(0x151412),
+                panel: hex(0x1E1D19),
+                elevated: hex(0x272520),
+                sunken: hex(0x11100E),
+                wash: hex(0xECE7DE),
+                text: hex(0xECE7DE),
+                text_weak: hex(0xABA59A),
+                // 3.7:1 on the panel was not enough for an 11 pt caption, and the
+                // settings page draws every explanation in this colour. At this value
+                // it clears WCAG AA on the panel and still sits a clear step below
+                // `text_weak`, so the three levels stay distinguishable.
+                text_muted: hex(0x918B80),
+                // Dusty clay: dark enough for white text on it and for itself to read
+                // against the background, muted enough to be a Morandi tone rather
+                // than a warning sign.
+                accent: hex(0xA67A66),
+                accent_hover: hex(0xB98E76),
+                accent_pressed: hex(0x8E6A58),
+                success: hex(MUTED.0),
+                warning: hex(MUTED.1),
+                danger: hex(MUTED.2),
+            },
+            // The same greys with a hint of green, and a sage accent. The green is in
+            // the surfaces too: a *cool* neutral under a green accent reads as two
+            // decisions rather than one.
+            Palette::Sage => Recipe {
+                bg: hex(0x131512),
+                panel: hex(0x1B1E1A),
+                elevated: hex(0x242722),
+                sunken: hex(0x0F110E),
+                wash: hex(0xE9EDE5),
+                text: hex(0xE9EDE5),
+                text_weak: hex(0xA9B0A2),
+                text_muted: hex(0x8C9484),
+                accent: hex(0x66836A),
+                accent_hover: hex(0x79957D),
+                accent_pressed: hex(0x547057),
+                success: hex(MUTED.0),
+                warning: hex(MUTED.1),
+                danger: hex(MUTED.2),
+            },
+            // The one cool palette: a blue-grey ramp, but a *dusty* slate accent
+            // rather than the original's saturated blue. This is the Morandi answer
+            // for someone who finds the warm ones muddy.
+            Palette::Slate => Recipe {
+                bg: hex(0x121317),
+                panel: hex(0x1A1C21),
+                elevated: hex(0x23262C),
+                sunken: hex(0x0E0F12),
+                wash: hex(0xE7E9EE),
+                text: hex(0xE7E9EE),
+                text_weak: hex(0xA6ABB5),
+                text_muted: hex(0x8B919C),
+                accent: hex(0x6F7F9B),
+                accent_hover: hex(0x8291A9),
+                accent_pressed: hex(0x5E6C84),
+                success: hex(MUTED.0),
+                warning: hex(MUTED.1),
+                danger: hex(MUTED.2),
+            },
+            // Warm greys with a violet cast and a mauve accent. The accent is the
+            // furthest of the four from the brick-red danger, which is why it is a
+            // mauve rather than a rose.
+            Palette::Mauve => Recipe {
+                bg: hex(0x151316),
+                panel: hex(0x1D1B20),
+                elevated: hex(0x26232A),
+                sunken: hex(0x100F12),
+                wash: hex(0xEBE7EE),
+                text: hex(0xEBE7EE),
+                text_weak: hex(0xACA5B2),
+                text_muted: hex(0x918A97),
+                accent: hex(0x9A7C94),
+                accent_hover: hex(0xAD8EA6),
+                accent_pressed: hex(0x83677D),
+                success: hex(MUTED.0),
+                warning: hex(MUTED.1),
+                danger: hex(MUTED.2),
+            },
+        }
+    }
+}
+
+impl Tokens {
+    /// Every colour the interface uses, for `palette`.
+    pub fn for_palette(palette: Palette) -> Self {
+        palette.recipe().tokens()
+    }
+}
+
+impl Default for Tokens {
+    /// The default palette. Every colour is [`Tokens::for_palette`]'s answer for
+    /// [`Palette::default`] — written once, so "the default palette" cannot come to
+    /// mean two different things.
+    fn default() -> Self {
+        Self::for_palette(Palette::default())
     }
 }
 
@@ -242,12 +593,24 @@ pub struct Theme {
     pub tokens: Tokens,
 }
 
-
 impl Theme {
+    /// The style for `palette`.
+    ///
+    /// The palette is a *setting*, so a theme is not built once and kept: this is
+    /// what `PlayerApp::install_palette` calls on start-up and again whenever the
+    /// user picks a different one.
+    pub fn of(palette: Palette) -> Self {
+        Self {
+            tokens: Tokens::for_palette(palette),
+        }
+    }
+
     /// Install the theme into `ctx`, including the CJK-capable font stack.
     ///
-    /// The player is dark-only — one palette, no light counterpart — so this
-    /// pins the theme instead of following the system.
+    /// Every palette is a dark one — no light counterpart, and nothing that follows
+    /// the system — so this pins the theme rather than tracking it. Cheap to call
+    /// again: the fonts go through a `OnceLock`, so a palette change only rewrites
+    /// the style.
     pub fn install(&self, ctx: &Context) {
         install_fonts(ctx);
 
@@ -708,6 +1071,53 @@ pub fn row_fill(tokens: &Tokens, selected: bool, hovered: bool) -> Color32 {
 mod tests {
     use super::*;
 
+    /// WCAG relative luminance.
+    fn luminance(colour: Color32) -> f32 {
+        let channel = |v: u8| {
+            let v = v as f32 / 255.0;
+            if v <= 0.03928 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(colour.r()) + 0.7152 * channel(colour.g()) + 0.0722 * channel(colour.b())
+    }
+
+    /// WCAG contrast ratio between two colours.
+    fn contrast(a: Color32, b: Color32) -> f32 {
+        let (la, lb) = (luminance(a), luminance(b));
+        let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    /// How much colour a colour carries: `(max - min) / max`.
+    ///
+    /// Measured against the strongest stored channel, which is the cheap, monotone
+    /// reading of "how much colour is in here".
+    fn chroma(colour: Color32) -> f32 {
+        let max = colour.r().max(colour.g()).max(colour.b()) as f32;
+        let min = colour.r().min(colour.g()).min(colour.b()) as f32;
+        if max == 0.0 {
+            0.0
+        } else {
+            (max - min) / max
+        }
+    }
+
+    /// Every palette with its tokens, so a test can state its property once.
+    fn every_palette() -> Vec<(Palette, Tokens)> {
+        Palette::all()
+            .into_iter()
+            .map(|palette| (palette, Tokens::for_palette(palette)))
+            .collect()
+    }
+
+    /// A channel sum, as a stand-in for lightness in the ordering checks.
+    fn lightness(colour: Color32) -> u32 {
+        u32::from(colour.r()) + u32::from(colour.g()) + u32::from(colour.b())
+    }
+
     /// The play button has to fit the transport bar it sits in, and stay the biggest control
     /// in it. The bar is 88 pt: 24 pt of seek row and gap, the button, and the 8 pt frame
     /// above and below. Scaling the button without doing this arithmetic is how it ended up
@@ -728,31 +1138,30 @@ mod tests {
         );
     }
 
+    /// Every palette has to be *legible*, the original included: the contrast
+    /// floors are what makes this interface readable, and a palette is allowed to
+    /// change the hue of a colour, never its weight.
     #[test]
-    fn accent_has_enough_contrast_against_the_surfaces() {
-        let t = Tokens::default();
-        // Relative luminance, sRGB approximation: the accessible pair must be
-        // far enough apart that the accent reads as a distinct element.
-        let lum = |c: Color32| {
-            let f = |v: u8| {
-                let v = v as f32 / 255.0;
-                if v <= 0.03928 {
-                    v / 12.92
-                } else {
-                    ((v + 0.055) / 1.055).powf(2.4)
-                }
-            };
-            0.2126 * f(c.r()) + 0.7152 * f(c.g()) + 0.0722 * f(c.b())
-        };
-        let ratio = |a: Color32, b: Color32| {
-            let (la, lb) = (lum(a), lum(b));
-            let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
-            (hi + 0.05) / (lo + 0.05)
-        };
-        assert!(ratio(t.text, t.bg) > 12.0, "body text must be very legible");
-        assert!(ratio(t.text_weak, t.panel) > 4.5, "captions must pass WCAG AA");
-        assert!(ratio(t.accent, t.bg) > 3.0, "the accent must be visible");
-        assert!(ratio(t.on_accent, t.accent) > 3.5);
+    fn every_palette_has_enough_contrast() {
+        for (palette, t) in every_palette() {
+            let name = palette.label();
+            assert!(
+                contrast(t.text, t.bg) > 12.0,
+                "{name}: body text must be very legible"
+            );
+            assert!(
+                contrast(t.text_weak, t.panel) > 4.5,
+                "{name}: captions must pass WCAG AA"
+            );
+            assert!(
+                contrast(t.accent, t.bg) > 3.0,
+                "{name}: the accent must be visible"
+            );
+            assert!(
+                contrast(t.on_accent, t.accent) > 3.5,
+                "{name}: text on the accent has to stay readable"
+            );
+        }
     }
 
     /// The *third* level of text has to be readable too.
@@ -765,43 +1174,39 @@ mod tests {
     /// not a step below the contrast floor.
     #[test]
     fn the_quietest_text_still_passes_wcag_aa() {
-        let t = Tokens::default();
-        let lum = |c: Color32| {
-            let f = |v: u8| {
-                let v = v as f32 / 255.0;
-                if v <= 0.03928 {
-                    v / 12.92
-                } else {
-                    ((v + 0.055) / 1.055).powf(2.4)
-                }
-            };
-            0.2126 * f(c.r()) + 0.7152 * f(c.g()) + 0.0722 * f(c.b())
-        };
-        let ratio = |a: Color32, b: Color32| {
-            let (la, lb) = (lum(a), lum(b));
-            let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
-            (hi + 0.05) / (lo + 0.05)
-        };
-
-        assert!(
-            ratio(t.text_muted, t.panel) >= 4.5,
-            "the muted colour is used for 11 pt captions"
-        );
-        assert!(
-            ratio(t.text_weak, t.panel) >= 4.5,
-            "and the weak colour for captions on top of it"
-        );
-        // The levels stay distinguishable: a caption must not become body text.
-        assert!(ratio(t.text, t.panel) > ratio(t.text_weak, t.panel));
-        assert!(ratio(t.text_weak, t.panel) > ratio(t.text_muted, t.panel));
+        for (palette, t) in every_palette() {
+            let name = palette.label();
+            assert!(
+                contrast(t.text_muted, t.panel) >= 4.5,
+                "{name}: the muted colour is used for 11 pt captions"
+            );
+            assert!(
+                contrast(t.text_weak, t.panel) >= 4.5,
+                "{name}: and the weak colour for captions on top of it"
+            );
+            // The levels stay distinguishable: a caption must not become body text.
+            assert!(contrast(t.text, t.panel) > contrast(t.text_weak, t.panel));
+            assert!(contrast(t.text_weak, t.panel) > contrast(t.text_muted, t.panel));
+        }
     }
 
     #[test]
     fn surfaces_step_up_in_lightness() {
-        let t = Tokens::default();
-        let l = |c: Color32| c.r() as u32 + c.g() as u32 + c.b() as u32;
-        assert!(l(t.bg) < l(t.panel), "panel must sit above the background");
-        assert!(l(t.panel) < l(t.elevated), "elevated must sit above the panel");
+        for (palette, t) in every_palette() {
+            let name = palette.label();
+            assert!(
+                lightness(t.sunken) < lightness(t.bg),
+                "{name}: the trough has to sit below the background"
+            );
+            assert!(
+                lightness(t.bg) < lightness(t.panel),
+                "{name}: panel must sit above the background"
+            );
+            assert!(
+                lightness(t.panel) < lightness(t.elevated),
+                "{name}: elevated must sit above the panel"
+            );
+        }
     }
 
     #[test]
@@ -896,22 +1301,6 @@ mod tests {
     /// selection look like a different window.
     #[test]
     fn state_fills_are_translucent_and_keep_their_hue() {
-        let t = Tokens::default();
-        for soft in [
-            t.hover,
-            t.active,
-            t.separator,
-            t.border,
-            t.border_strong,
-            t.track,
-            t.accent_soft,
-            t.focus_ring,
-            t.skeleton,
-            t.skeleton_highlight,
-            t.danger_soft,
-        ] {
-            assert!(soft.a() > 0 && soft.a() < 255, "expected a translucent fill");
-        }
         // The soft variants are the same colour as their solid counterpart, only
         // quieter. `Color32` stores *premultiplied* channels, so an opacity of
         // 61/255 scales the channels stored for a translucent colour: they have
@@ -935,8 +1324,29 @@ mod tests {
                 "{what}: {a:?} is not the same hue as {b:?}"
             );
         };
-        same_hue(t.accent_soft, t.accent, "accent_soft");
-        same_hue(t.danger_soft, t.danger, "danger_soft");
+        for (palette, t) in every_palette() {
+            for soft in [
+                t.hover,
+                t.active,
+                t.separator,
+                t.border,
+                t.border_strong,
+                t.track,
+                t.accent_soft,
+                t.focus_ring,
+                t.skeleton,
+                t.skeleton_highlight,
+                t.danger_soft,
+            ] {
+                assert!(
+                    soft.a() > 0 && soft.a() < 255,
+                    "{}: expected a translucent fill",
+                    palette.label()
+                );
+            }
+            same_hue(t.accent_soft, t.accent, "accent_soft");
+            same_hue(t.danger_soft, t.danger, "danger_soft");
+        }
     }
 
     /// A skeleton is a *hint* of content: visible against the surface, quieter
@@ -957,62 +1367,298 @@ mod tests {
     /// as the same button being held down rather than as a different control.
     #[test]
     fn the_pressed_accent_is_the_accent_one_step_darker() {
-        let t = Tokens::default();
-        let lum = |c: Color32| c.r() as u32 + c.g() as u32 + c.b() as u32;
-        assert!(lum(t.accent_pressed) < lum(t.accent), "a press must darken");
-        assert!(
-            t.accent_hover.b() >= t.accent.b(),
-            "hovering must not lose the blue"
-        );
-        // All three states are blues: the blue channel is the strongest in each,
-        // so hover and press change the weight of the accent, never its hue.
-        for state in [t.accent, t.accent_hover, t.accent_pressed] {
+        for (palette, t) in every_palette() {
+            let name = palette.label();
             assert!(
-                state.b() > state.g() && state.g() > state.r(),
-                "the accent must stay blue"
+                lightness(t.accent_pressed) < lightness(t.accent),
+                "{name}: a press must darken"
+            );
+            // Hovering must not *lose* the accent's colour: the channel it leads with
+            // gets brighter, not duller. Written on the leading channel rather than on
+            // blue, because a Morandi accent is not blue.
+            let lead = |c: Color32| c.r().max(c.g()).max(c.b());
+            assert!(
+                lead(t.accent_hover) >= lead(t.accent),
+                "{name}: hovering must not lose the accent's colour"
+            );
+            // All three states are the *same hue family*: hover and press change the
+            // weight of the accent, never which channel leads it. This used to be
+            // spelled `b > g > r` — "the accent must stay blue" — while the accent was
+            // Apple blue; what that stood for is the property pinned here, and it is
+            // what every palette has to keep, the original included.
+            let family = |c: Color32| ((c.r() > c.g()) as u8) | (((c.g() > c.b()) as u8) << 1);
+            let expected = family(t.accent);
+            for state in [t.accent_hover, t.accent_pressed] {
+                assert_eq!(
+                    family(state),
+                    expected,
+                    "{name}: hover and press must not change the accent's hue"
+                );
+            }
+        }
+    }
+
+    /// Nothing in a Morandi palette shouts: every colour in one is a *muted* one.
+    ///
+    /// This is the property that makes a palette Morandi rather than "a dark theme
+    /// with a nicer blue", and it is the one that gets eroded first: a single
+    /// saturated accent added later makes everything around it look dirty. Chroma is
+    /// measured against the strongest stored channel — `(max - min) / max` — which is
+    /// the cheap, monotone reading of "how much colour is in here". Surfaces and text
+    /// are the most restrained, the accent family carries the most and still stays
+    /// under 42 %, and the semantic trio is allowed a little more than the surfaces
+    /// because a warning has to be recognisable as one.
+    ///
+    /// Which palettes the ceilings apply to is [`Palette::is_muted`]'s answer rather
+    /// than a list here: the original blue palette is exempt because a saturated
+    /// accent is what "the original" *is*, and a palette added later is held to them
+    /// by default.
+    #[test]
+    fn no_colour_in_the_palette_shouts() {
+        for (palette, t) in every_palette() {
+            let name = palette.label();
+            // The letterbox is not a colour: it is the black a cinema letterboxes
+            // with, and it is that on every palette.
+            assert_eq!(t.letterbox, Color32::BLACK, "{name}");
+            if !palette.is_muted() {
+                continue;
+            }
+            for (what, colour) in [
+                ("bg", t.bg),
+                ("panel", t.panel),
+                ("elevated", t.elevated),
+                ("sunken", t.sunken),
+                ("text", t.text),
+                ("text_weak", t.text_weak),
+                ("text_muted", t.text_muted),
+            ] {
+                assert!(
+                    chroma(colour) <= 0.25,
+                    "{name}: {what} is too colourful for a Morandi palette: {:.2}",
+                    chroma(colour)
+                );
+            }
+            for (what, colour) in [
+                ("accent", t.accent),
+                ("accent_hover", t.accent_hover),
+                ("accent_pressed", t.accent_pressed),
+            ] {
+                assert!(
+                    chroma(colour) <= 0.42,
+                    "{name}: {what} carries more colour than the accent is allowed: {:.2}",
+                    chroma(colour)
+                );
+            }
+            for (what, colour) in [
+                ("success", t.success),
+                ("warning", t.warning),
+                ("danger", t.danger),
+            ] {
+                assert!(
+                    chroma(colour) <= 0.45,
+                    "{name}: {what} must stay muted: {:.2}",
+                    chroma(colour)
+                );
+            }
+        }
+    }
+
+    /// Switching palettes must not change the *shape* of the interface.
+    ///
+    /// Every translucent fill is its palette's own white at one of these alphas, so
+    /// how strong a hover is, how loud a selection is and how visible a focus ring is
+    /// are the same on all five. That is what makes this setting a recolouring rather
+    /// than five interfaces to keep in step, and it is what the derived fills in
+    /// [`Recipe`] are built on.
+    #[test]
+    fn every_palette_draws_its_fills_at_the_same_strength() {
+        for (palette, t) in every_palette() {
+            for (what, colour, wanted) in [
+                ("hover", t.hover, alpha::HOVER),
+                ("active", t.active, alpha::ACTIVE),
+                ("border", t.border, alpha::BORDER),
+                ("border_strong", t.border_strong, alpha::BORDER_STRONG),
+                ("track", t.track, alpha::TRACK),
+                ("separator", t.separator, alpha::SEPARATOR),
+                ("skeleton", t.skeleton, alpha::SKELETON),
+                (
+                    "skeleton_highlight",
+                    t.skeleton_highlight,
+                    alpha::SKELETON_HIGHLIGHT,
+                ),
+                ("accent_soft", t.accent_soft, alpha::ACCENT_SOFT),
+                ("focus_ring", t.focus_ring, alpha::ACCENT_RING),
+                ("danger_soft", t.danger_soft, alpha::DANGER_SOFT),
+            ] {
+                assert_eq!(
+                    colour.a(),
+                    wanted,
+                    "{}: {what} is not drawn at the shared strength",
+                    palette.label()
+                );
+            }
+        }
+    }
+
+    /// The palette the player shipped with, pinned value for value.
+    ///
+    /// [`Palette::Blue`] exists so that a user who liked the interface before this
+    /// was a setting can have it back, and "the original" can only mean one thing.
+    /// Changing a value here is therefore a decision to change what the original
+    /// *is*, which is exactly the kind of change that should have to be made on
+    /// purpose.
+    #[test]
+    fn the_original_palette_is_kept_verbatim() {
+        let t = Tokens::for_palette(Palette::Blue);
+        for (what, actual, original) in [
+            ("bg", t.bg, 0x0D0E11),
+            ("panel", t.panel, 0x16181C),
+            ("elevated", t.elevated, 0x1E2126),
+            ("sunken", t.sunken, 0x0A0B0D),
+            ("text", t.text, 0xF5F5F7),
+            ("text_weak", t.text_weak, 0xA1A7B3),
+            ("text_muted", t.text_muted, 0x7E838D),
+            ("accent", t.accent, 0x0A84FF),
+            ("accent_hover", t.accent_hover, 0x3D9BFF),
+            ("accent_pressed", t.accent_pressed, 0x0670E0),
+            ("success", t.success, 0x32D74B),
+            ("warning", t.warning, 0xFF9F0A),
+            ("danger", t.danger, 0xFF453A),
+        ] {
+            assert_eq!(
+                actual,
+                hex(original),
+                "the original palette's {what} is not the colour it shipped with"
             );
         }
+        // Its translucent fills were a pure white, which is what `wash` carries.
+        assert_eq!(t.hover, rgba(0xFF, 0xFF, 0xFF, alpha::HOVER));
+        assert_eq!(t.separator, rgba(0xFF, 0xFF, 0xFF, alpha::SEPARATOR));
+    }
+
+    /// Every palette is offered exactly once, and the default says so.
+    ///
+    /// The settings page builds its dropdown from [`Palette::choices`], and either a
+    /// duplicate or a variant missing from it is a palette the user cannot reach.
+    #[test]
+    fn every_palette_is_offered_once() {
+        let mut labels: Vec<&str> = Vec::new();
+        for (palette, label) in Palette::choices() {
+            assert!(!label.trim().is_empty(), "a palette has no name");
+            assert!(
+                !labels.contains(&label),
+                "two palettes share the name {label}"
+            );
+            labels.push(label);
+            assert!(
+                Palette::all().contains(&palette),
+                "{label} is offered but is not in `Palette::all`"
+            );
+        }
+        assert_eq!(labels.len(), Palette::all().len());
+
+        // The marker follows the default, so `Palette::default()` can be changed
+        // without leaving "（默认）" on the wrong row.
+        let marked: Vec<&str> = labels
+            .iter()
+            .copied()
+            .filter(|label| label.contains(Palette::DEFAULT_MARK))
+            .collect();
+        assert_eq!(
+            marked,
+            vec![Palette::default().label()],
+            "exactly the default palette carries the marker"
+        );
+    }
+
+    /// The default is a Morandi palette: what the interface is designed around is
+    /// what a fresh install gets, and the original is the opt-in.
+    #[test]
+    fn the_default_palette_is_a_morandi_one() {
+        assert!(Palette::default().is_muted());
+        assert_eq!(Tokens::default(), Tokens::for_palette(Palette::default()));
+    }
+
+    /// A palette reaches egui's own widgets, not just the hand-painted ones.
+    ///
+    /// The bug this pins down: egui keeps one `Style` per theme and resolves
+    /// `ThemePreference::System` from the OS report on every frame. `install`
+    /// used to write the palette with `set_visuals`/`set_style`, which only
+    /// touch the slot that is active at the time — and at start-up, before any
+    /// frame has carried a report, that is always the dark slot. A light-themed
+    /// Windows therefore ran the rest of the session on egui's stock light
+    /// visuals: everything coloured by hand from `Tokens` stayed dark while
+    /// every surface egui draws itself took the light palette. The visible
+    /// symptom was a white menu popup with our own light text on top of it.
+    ///
+    /// Run for every palette, because the fix — pinning the theme and filling both
+    /// slots — is also what makes switching palettes work at all.
+    /// A palette can be installed *while* a frame is being drawn.
+    ///
+    /// Which is exactly what the settings row does: `widgets::combo_row` runs inside
+    /// the frame that is painting the sheet, and `PlayerApp::set_palette` installs the
+    /// new colours there and then. egui allows the style to be rewritten mid-frame —
+    /// the frame being built keeps what it started with — so what has to hold is that
+    /// nothing panics and that the *next* frame is the new palette.
+    #[test]
+    fn a_palette_can_be_installed_while_a_frame_is_being_drawn() {
+        let ctx = Context::default();
+        Theme::of(Palette::Blue).install(&ctx);
+        let mauve = Tokens::for_palette(Palette::Mauve);
+
+        let during = Theme::of(Palette::Mauve);
+        let _ = ctx.run(Default::default(), |ctx| {
+            during.install(ctx);
+        });
+
+        let _ = ctx.run(Default::default(), |ctx| {
+            let visuals = &ctx.style().visuals;
+            assert_eq!(
+                visuals.panel_fill, mauve.panel,
+                "the frame after a mid-frame install has to be the new palette"
+            );
+            assert_eq!(visuals.window_fill, mauve.elevated);
+            assert_eq!(visuals.override_text_color, Some(mauve.text));
+        });
     }
 
     #[test]
     fn a_light_system_theme_cannot_replace_the_palette() {
-        // The bug this pins down: egui keeps one `Style` per theme and resolves
-        // `ThemePreference::System` from the OS report on every frame. `install`
-        // used to write the palette with `set_visuals`/`set_style`, which only
-        // touch the slot that is active at the time — and at start-up, before any
-        // frame has carried a report, that is always the dark slot. A light-themed
-        // Windows therefore ran the rest of the session on egui's stock light
-        // visuals: everything coloured by hand from `Tokens` stayed dark while
-        // every surface egui draws itself took the light palette. The visible
-        // symptom was a white menu popup with our own light text on top of it.
-        let theme = Theme::default();
-        let ctx = Context::default();
-        theme.install(&ctx);
-
         let input = egui::RawInput {
             system_theme: Some(egui::Theme::Light),
             ..Default::default()
         };
-        let _ = ctx.run(input, |ctx| {
-            assert_eq!(
-                ctx.theme(),
-                egui::Theme::Dark,
-                "the player is dark-only and must not follow the OS theme"
-            );
-            let visuals = &ctx.style().visuals;
-            assert_eq!(
-                visuals.panel_fill, theme.tokens.panel,
-                "panels must keep the player's palette"
-            );
-            assert_eq!(
-                visuals.window_fill, theme.tokens.elevated,
-                "windows and menu popups must keep the player's palette"
-            );
-            assert_eq!(
-                visuals.override_text_color,
-                Some(theme.tokens.text),
-                "text must stay legible against those surfaces"
-            );
-        });
+        for (palette, tokens) in every_palette() {
+            let theme = Theme::of(palette);
+            let ctx = Context::default();
+            theme.install(&ctx);
+
+            let _ = ctx.run(input.clone(), |ctx| {
+                assert_eq!(
+                    ctx.theme(),
+                    egui::Theme::Dark,
+                    "the player is dark-only and must not follow the OS theme"
+                );
+                let visuals = &ctx.style().visuals;
+                assert_eq!(
+                    visuals.panel_fill,
+                    tokens.panel,
+                    "{}: panels must keep the player's palette",
+                    palette.label()
+                );
+                assert_eq!(
+                    visuals.window_fill,
+                    tokens.elevated,
+                    "{}: windows and menu popups must keep the player's palette",
+                    palette.label()
+                );
+                assert_eq!(
+                    visuals.override_text_color,
+                    Some(tokens.text),
+                    "{}: text must stay legible against those surfaces",
+                    palette.label()
+                );
+            });
+        }
     }
 }

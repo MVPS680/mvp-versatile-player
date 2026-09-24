@@ -1093,12 +1093,13 @@ fn image_view(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens, ctx: &Context) 
 
     // What the photograph sits on. A transparent PNG reveals the checkerboard;
     // any other file reveals the chosen surround where it does not reach the
-    // window edges.
+    // window edges. The light surround is the palette's, so it matches the chrome
+    // around it — see `Palette::light_surround`.
     match app.settings.image_background {
         ImageBackground::Dark => {}
         ImageBackground::Checkerboard => paint_checkerboard(ui.painter(), area, tokens),
         other => {
-            if let Some(rgb) = crate::settings::background_fill(other) {
+            if let Some(rgb) = crate::settings::background_fill(other, app.settings.palette) {
                 ui.painter().rect_filled(
                     area,
                     egui::CornerRadius::ZERO,
@@ -1319,7 +1320,7 @@ fn paint_checkerboard(painter: &egui::Painter, rect: Rect, tokens: &Tokens) {
         egui::pos2(snap(rect.max.x), snap(rect.max.y)),
     );
 
-    painter.rect_filled(rect, egui::CornerRadius::ZERO, Color32::from_gray(28));
+    painter.rect_filled(rect, egui::CornerRadius::ZERO, tokens.sunken);
     let cols = (rect.width() / cell).ceil() as i32;
     let rows = (rect.height() / cell).ceil() as i32;
     for row in 0..rows {
@@ -1330,11 +1331,10 @@ fn paint_checkerboard(painter: &egui::Painter, rect: Rect, tokens: &Tokens) {
             let min = rect.min + Vec2::new(col as f32 * cell, row as f32 * cell);
             let square = Rect::from_min_size(min, Vec2::splat(cell)).intersect(rect);
             if square.width() > 0.5 && square.height() > 0.5 {
-                painter.rect_filled(square, egui::CornerRadius::ZERO, Color32::from_gray(36));
+                painter.rect_filled(square, egui::CornerRadius::ZERO, tokens.panel);
             }
         }
     }
-    let _ = tokens;
 }
 
 // ---------------------------------------------------------------------------

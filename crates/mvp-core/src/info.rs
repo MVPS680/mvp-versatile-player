@@ -12,6 +12,7 @@ use std::time::Duration;
 use ffmpeg_next as ffmpeg;
 use ffmpeg::format::stream::Disposition;
 
+use crate::dolby::DvPlan;
 use crate::error::{MediaError, Result};
 use crate::hdr::HdrInfo;
 use crate::util::{self, MediaKind};
@@ -647,13 +648,19 @@ pub fn info_rows(info: &MediaInfo) -> Vec<(String, String)> {
         if v.hdr.kind.is_hdr() || v.hdr.dovi.is_some() {
             rows.push((format!("{prefix}动态范围"), v.hdr.label()));
         }
-        if v.hdr.needs_dolby_renderer() {
+        // What this file is, as Dolby Vision sees it — the same decision the
+        // renderer and the open-time notice ask for (`dolby::DvPlan`), so the
+        // panel cannot end up describing a file the player is treating
+        // differently. The one thing the panel cannot say is whether the frame is
+        // being tone mapped; that is a preference, and it is shown by the notice.
+        if let Some(plan) = DvPlan::resolve(v.hdr.dovi, None, v.hdr.kind) {
             rows.push((
-                format!("{prefix}提示"),
-                "杜比视界 Profile 5 使用 IPT 编码的基底层，本播放器无法还原杜比视界的映射，\
-                 颜色可能不正确"
-                    .to_string(),
+                format!("{prefix}杜比视界"),
+                format!("{} · 基底层 {}", plan.render.label(), plan.transfer.label()),
             ));
+            for caveat in plan.caveats() {
+                rows.push((format!("{prefix}提示"), caveat));
+            }
         }
         if v.frames > 0 {
             rows.push((format!("{prefix}总帧数"), v.frames.to_string()));

@@ -17,6 +17,8 @@ use mvp_core::playlist::{PlaylistItem, RepeatMode};
 use mvp_platform::assoc::FileKinds;
 use serde::{Deserialize, Serialize};
 
+use crate::theme::Palette;
+
 /// Product name, used for the settings folder and the registry ProgID.
 pub const APP_NAME: &str = "MVP-Versatile-Player";
 
@@ -355,11 +357,17 @@ impl ImageBackground {
 
 /// An RGB fill for the canvas, for everything but the checkerboard (which draws
 /// itself) and the default (which leaves the panel's own background alone).
-pub fn background_fill(background: ImageBackground) -> Option<[u8; 3]> {
+///
+/// The light surround is the *palette's* light grey rather than one fixed value: it
+/// sits inside the window next to the chrome, where a warm mat under a cool palette
+/// reads as a colour cast and a neutral grey under the warm ones reads as a cold
+/// frame — see [`Palette::light_surround`]. Black stays black on every palette: a
+/// black surround is a deliberate choice about judging a picture, not a colour.
+pub fn background_fill(background: ImageBackground, palette: Palette) -> Option<[u8; 3]> {
     match background {
         ImageBackground::Dark => None,
         ImageBackground::Black => Some([0, 0, 0]),
-        ImageBackground::Light => Some([214, 214, 216]),
+        ImageBackground::Light => Some(palette.light_surround()),
         ImageBackground::Checkerboard => None,
     }
 }
@@ -588,6 +596,16 @@ impl AudioEnhanceSettings {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    // ---- appearance ------------------------------------------------------
+    /// The colour palette the interface is drawn with.
+    ///
+    /// A setting rather than a constant since there is more than one palette: it is
+    /// installed into egui's own style at start-up and again on every change, which
+    /// is what `PlayerApp::install_palette` exists for. A document written before
+    /// this existed has no key, and `#[serde(default)]` gives it the default
+    /// palette — the Morandi one the interface is designed around.
+    pub palette: Palette,
+
     // ---- audio -----------------------------------------------------------
     /// Linear volume, `0.0..=2.0`.
     pub volume: f32,
@@ -620,6 +638,13 @@ pub struct Settings {
     /// Bring HDR (PQ / HLG) and Dolby Vision frames into the range an SDR
     /// display can show.
     pub hdr_tone_map: bool,
+    /// Apply the Dolby Vision reshaping the RPU describes.
+    ///
+    /// Off by default, and deliberately so: see `mvp_core::dolby::reshape`. The
+    /// luma curve has been checked against libplacebo on real material and the
+    /// chroma curve has not, so turning this on is a decision the user makes
+    /// knowing the file may look different from a Dolby Vision device.
+    pub dv_reshape: bool,
     /// How the frame is fitted to the window.
     pub aspect: AspectMode,
     /// Extra rotation in degrees (0/90/180/270).
@@ -749,6 +774,8 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            palette: Palette::default(),
+
             volume: 1.0,
             muted: false,
             audio_device: None,
@@ -764,6 +791,7 @@ impl Default for Settings {
 
             hardware_decoding: true,
             hdr_tone_map: true,
+            dv_reshape: false,
             aspect: AspectMode::Fit,
             rotation: 0,
             flip_h: false,
@@ -1630,5 +1658,91 @@ mod tests {
         let asked: Settings =
             serde_json::from_str(r#"{"snapshot_includes_picture": true}"#).expect("parses");
         assert!(asked.snapshot_includes_picture);
+    }
+
+    /// A settings file written before the palette was a setting still loads, and
+    /// gives the user the palette the interface is designed around.
+    #[test]
+    fn a_document_from_before_the_palette_existed_gets_the_default_one() {
+        assert_eq!(Palette::default(), Settings::default().palette);
+
+        let old: Settings = serde_json::from_str(r#"{"volume": 0.4}"#).expect("parses");
+        assert_eq!(old.volume, 0.4, "the rest of the document survived");
+        assert_eq!(
+            old.palette,
+            Palette::default(),
+            "an absent palette is not a reason to reset the document"
+        );
+    }
+
+    /// The chosen palette is written to `settings.json` and read back.
+    ///
+    /// The palette is a choice the user makes once, so it has to survive a restart —
+    /// and it goes through the same document as everything else rather than being
+    /// kept somewhere only the UI can see. The name it is stored under is the variant
+    /// name, which is the only thing a file written today can offer a future build.
+    #[test]
+    fn the_chosen_palette_survives_a_round_trip() {
+        for palette in Palette::all() {
+            let settings = Settings {
+                palette,
+                volume: 0.42,
+                ..Settings::default()
+            };
+            let text = serde_json::to_string(&settings).expect("serialises");
+            let stored: serde_json::Value = serde_json::from_str(&text).expect("is valid json");
+            assert_eq!(
+                stored["palette"],
+                serde_json::json!(format!("{palette:?}")),
+                "the palette has to be stored under a name an old file could contain"
+            );
+            let back: Settings = serde_json::from_str(&text).expect("parses");
+            assert_eq!(back.palette, palette);
+            assert_eq!(back.volume, 0.42, "and nothing else moved");
+        }
+    }
+
+    /// The light image surround is the palette's, and nothing else about the
+    /// background depends on which palette is chosen.
+    #[test]
+    fn the_light_surround_follows_the_palette() {
+        for palette in Palette::all() {
+            assert_eq!(
+                background_fill(ImageBackground::Light, palette),
+                Some(palette.light_surround()),
+                "{}: the light surround is not the palette's",
+                palette.label()
+            );
+            assert_eq!(
+                background_fill(ImageBackground::Black, palette),
+                Some([0, 0, 0])
+            );
+            assert_eq!(background_fill(ImageBackground::Dark, palette), None);
+            assert_eq!(
+                background_fill(ImageBackground::Checkerboard, palette),
+                None
+            );
+        }
+        // The original's neutral grey is part of what "the original" means, so it is
+        // pinned here rather than left to the palette table alone.
+        assert_eq!(
+            background_fill(ImageBackground::Light, Palette::Blue),
+            Some([214, 214, 216])
+        );
+        // Every other surround is on the same side of neutral as its palette's own
+        // white — the warm palettes get a warm mat and the one cool palette a cool
+        // one, which is the whole reason this is a palette method rather than a
+        // single constant. (This assertion is what caught `Slate` being handed a warm
+        // surround when the value first became palette-dependent.)
+        for palette in Palette::all() {
+            let text = crate::theme::Tokens::for_palette(palette).text;
+            let [r, _, b] = palette.light_surround();
+            assert_eq!(
+                r > b,
+                text.r() > text.b(),
+                "{}: the surround is on the wrong side of neutral for its palette",
+                palette.label()
+            );
+        }
     }
 }

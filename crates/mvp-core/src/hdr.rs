@@ -13,6 +13,11 @@
 //! 2. **Showing it anyway.** [`ToneMapper`] brings the highlights back into
 //!    range so the picture looks like the grade rather than like a faded copy.
 //!
+//! The Dolby Vision half of that first problem — what a configuration record
+//! actually means, the reference picture unit a frame carries, and what the
+//! player is going to do about either — is [`crate::dolby`]. This module reads
+//! the container's record, decides how much to map, and maps it.
+//!
 //! The mapping is deliberately approximate and cheap: a per-pixel
 //! luminance-preserving curve plus the BT.2020 → BT.709 matrix, applied to the
 //! RGBA buffer that has already been converted and scaled for display. Doing it
@@ -101,6 +106,40 @@ impl DoviConfig {
         self.profile == 5
     }
 
+    /// The transfer function the *base layer* is coded with, given the
+    /// transfer function the container tagged it with.
+    ///
+    /// The compatibility id is Dolby Vision's own statement about the base
+    /// layer, and it beats the container's tags for the same reason the record
+    /// beats them everywhere else: a Dolby Vision elementary stream frequently
+    /// carries no tags of its own. Getting this wrong is not cosmetic — an
+    /// HLG-compatible base layer (id `4`) run through the PQ curve of
+    /// [`HdrKind::Pq`] is exactly the "washed out Dolby Vision file" this
+    /// module exists to avoid.
+    ///
+    /// The two ids that name no transfer function fall back to `tagged` rather
+    /// than overruling it, and only a container that said nothing at all is
+    /// given the PQ curve the Dolby Vision specification codes its own base
+    /// layers with.
+    pub fn base_layer_kind(&self, tagged: HdrKind) -> HdrKind {
+        match self.bl_compatibility_id {
+            // HDR10: `1` is the streaming flavour, `6` the Blu-ray one.
+            1 | 6 => HdrKind::Pq,
+            // HLG.
+            4 => HdrKind::Hlg,
+            // `2` says the base layer is an SDR picture; `0` says it has no
+            // compatibility layer at all (Profile 5, which is IPT-PQ).
+            2 => tagged,
+            _ => {
+                if tagged.is_hdr() {
+                    tagged
+                } else {
+                    HdrKind::Pq
+                }
+            }
+        }
+    }
+
     /// Human readable summary, e.g. `Profile 7（双层 · HDR10 兼容）`.
     pub fn label(&self) -> String {
         let layer = match (self.el_present, self.rpu_present) {
@@ -170,9 +209,10 @@ impl HdrInfo {
                     let bytes = std::slice::from_raw_parts(entry.data, entry.size);
                     if let Some(config) = DoviConfig::parse(bytes) {
                         info.dovi = Some(config);
-                        // A Dolby Vision base layer is always PQ in BT.2020,
-                        // even when the container forgot to say so.
-                        info.kind = HdrKind::Pq;
+                        // The record, not the container's tags, says what the
+                        // base layer is coded with — and that is HLG for an
+                        // HLG-compatible layer, not PQ.
+                        info.kind = config.base_layer_kind(info.kind);
                         info.bt2020 = true;
                         break;
                     }
@@ -230,6 +270,12 @@ impl HdrInfo {
     }
 }
 
+// The Dolby Vision reference picture unit — the levels FFmpeg attaches to a
+// decoded frame, the colour metadata and the reshaping curves that come with
+// them — lives in [`crate::dolby`], which is also where the player's policy for
+// such a file is decided. What is left here is the container's record, the
+// decision of how much to map, and the mapping itself.
+
 /// Linear luminance the mapper treats as SDR reference white (ITU-R BT.2408).
 ///
 /// Content at or below this level passes through untouched, which is what makes
@@ -259,6 +305,32 @@ const TONE_KNEE: f32 = 0.75;
 /// separated from reference white, but not clipped.
 const SHOULDER: f32 = 3.0;
 
+/// Where a scene's own peak lands in the display range, when the mapper is
+/// aimed at that peak.
+///
+/// Just short of white: the brightest sample of the scene stays visibly the
+/// brightest thing on screen, and nothing above it can reach the code ceiling.
+const TARGET_PEAK: f32 = 0.95;
+
+/// Shoulder softness that puts `peak_nits` at [`TARGET_PEAK`].
+///
+/// The knee stays where it is, so only the shoulder is re-solved; what moves is
+/// the material above the knee. A scene that never exceeds 400 nits then keeps
+/// more of the SDR range for its own highlights instead of being compressed by
+/// a curve sized for 10 000-nit material. [`SHOULDER`] is what a frame without
+/// dynamic metadata gets, and it is what this returns for a peak so low the
+/// shoulder is meaningless.
+fn shoulder_for_peak(peak_nits: f32) -> f32 {
+    let x = (peak_nits / SDR_WHITE_NITS).max(0.0);
+    if x <= TONE_KNEE + 0.05 {
+        return 0.05;
+    }
+    // tone_curve(peak) = TARGET_PEAK solved for the shoulder:
+    // TARGET = KNEE + (1 - KNEE) * (1 - exp(-(x - KNEE) / shoulder)).
+    let ratio = ((1.0 - TARGET_PEAK) / (1.0 - TONE_KNEE)).clamp(1e-4, 0.999);
+    ((x - TONE_KNEE) / -ratio.ln()).clamp(0.05, 100.0)
+}
+
 /// BT.2020 → BT.709 primaries, for linear light with a D65 white point.
 ///
 /// Without this, a BT.2020 picture shown on an sRGB display comes out
@@ -286,14 +358,33 @@ pub struct ToneMapper {
     gain: Vec<f32>,
     /// Linear display light (`0..=1`) → 8-bit code value.
     encode: [u8; 1025],
+    /// Shoulder softness the `gain` table was built with.
+    shoulder: f32,
+    /// The peak the mapper was aimed at, when it came from dynamic metadata.
+    scene_peak: Option<f32>,
 }
 
 impl ToneMapper {
-    /// Build the tables for `info`.
+    /// Build the fixed tables for `info`.
     ///
     /// The tables depend only on the transfer function and the primaries, so a
-    /// single mapper serves a whole file.
+    /// single mapper serves a whole file. This is what a frame with no dynamic
+    /// metadata gets.
     pub fn new(info: HdrInfo) -> Self {
+        Self::with_scene_peak(info, None)
+    }
+
+    /// Build the tables for `info`, aiming the highlight roll-off at a Dolby
+    /// Vision scene whose brightest sample is `scene_peak_nits`.
+    ///
+    /// The knee stays fixed and only the shoulder moves: a scene that never
+    /// exceeds 400 nits keeps more of the SDR range for its own highlights
+    /// instead of being compressed by a curve sized for 10 000-nit material.
+    /// Material above the knee therefore adapts from scene to scene, which is
+    /// the point of dynamic metadata. `None` means the fixed [`SHOULDER`],
+    /// which is what a plain HDR10 frame gets.
+    pub fn with_scene_peak(info: HdrInfo, scene_peak_nits: Option<f32>) -> Self {
+        let shoulder = scene_peak_nits.map(shoulder_for_peak).unwrap_or(SHOULDER);
         let mut to_linear = [0.0f32; 256];
         for (code, slot) in to_linear.iter_mut().enumerate() {
             let e = code as f32 / 255.0;
@@ -311,7 +402,7 @@ impl ToneMapper {
         for i in 0..=steps {
             let nits = GAIN_LUT_MAX_NITS * i as f32 / steps as f32;
             gain.push(if nits > 0.0 {
-                tone_curve(nits) / nits
+                tone_curve(nits, shoulder) / nits
             } else {
                 1.0 / SDR_WHITE_NITS
             });
@@ -328,7 +419,23 @@ impl ToneMapper {
             to_linear,
             gain,
             encode,
+            shoulder,
+            scene_peak: scene_peak_nits,
         }
+    }
+
+    /// The peak, in nits, this mapper was aimed at, when it was built from
+    /// Dolby Vision dynamic metadata.
+    pub fn scene_peak_nits(&self) -> Option<f32> {
+        self.scene_peak
+    }
+
+    /// Shoulder softness the highlight roll-off was built with.
+    ///
+    /// A plain HDR10 mapper reports [`SHOULDER`]; a Dolby Vision scene reports
+    /// the value [`shoulder_for_peak`] derived from its own peak.
+    pub fn shoulder(&self) -> f32 {
+        self.shoulder
     }
 
     /// The dynamic range this mapper was built for.
@@ -388,7 +495,7 @@ impl ToneMapper {
 }
 
 /// PQ (SMPTE ST 2084) code value in `0..=1` → absolute light, in nits.
-fn pq_to_nits(e: f32) -> f32 {
+pub(crate) fn pq_to_nits(e: f32) -> f32 {
     const M1: f32 = 0.159_301_757_812_5;
     const M2: f32 = 78.843_75;
     const C1: f32 = 0.835_937_5;
@@ -401,6 +508,18 @@ fn pq_to_nits(e: f32) -> f32 {
         return 0.0;
     }
     10_000.0 * (numerator / denominator).powf(1.0 / M1)
+}
+
+/// Full scale of the 12-bit PQ code value a Dolby Vision RPU level is coded in.
+pub const PQ_12BIT_MAX: f32 = 4095.0;
+
+/// A 12-bit PQ code value, as a Dolby Vision RPU codes luminance → nits.
+///
+/// The RPU's levels are code values rather than nits, and this is the one place
+/// the conversion is written down so the tone mapper and the information panel
+/// cannot disagree about it.
+pub fn pq_code_to_nits(code: u16) -> f32 {
+    pq_to_nits(f32::from(code) / PQ_12BIT_MAX)
 }
 
 /// HLG (BT.2100) code value in `0..=1` → light on a 1000-nit display, in nits.
@@ -422,14 +541,15 @@ fn hlg_to_nits(e: f32) -> f32 {
 ///
 /// Identity below the knee, then a soft shoulder that approaches — but never
 /// reaches — white: highlights keep their separation instead of clipping to a
-/// flat plate the way a hard clamp would.
-fn tone_curve(nits: f32) -> f32 {
+/// flat plate the way a hard clamp would. The shoulder is per-scene for Dolby
+/// Vision content; see [`shoulder_for_peak`].
+fn tone_curve(nits: f32, shoulder: f32) -> f32 {
     let x = (nits / SDR_WHITE_NITS).max(0.0);
     if x <= TONE_KNEE {
         return x;
     }
     let over = x - TONE_KNEE;
-    TONE_KNEE + (1.0 - TONE_KNEE) * (1.0 - (-over / SHOULDER).exp())
+    TONE_KNEE + (1.0 - TONE_KNEE) * (1.0 - (-over / shoulder.max(1e-4)).exp())
 }
 
 /// Linear display light (`0..=1`) → 8-bit sRGB / BT.709 code value.
@@ -495,24 +615,94 @@ mod tests {
 
     #[test]
     fn the_tone_curve_never_folds_back() {
-        let mut previous = tone_curve(0.0);
+        let mut previous = tone_curve(0.0, SHOULDER);
         for step in 1..=2000 {
             let nits = step as f32 * 5.0;
-            let value = tone_curve(nits);
+            let value = tone_curve(nits, SHOULDER);
             assert!(value >= previous, "the curve went backwards at {nits} nits");
             assert!(value <= 1.0, "the curve overshot white at {nits} nits");
             previous = value;
         }
         // Reference white (203 nits) keeps its separation from the highlights
         // above it, and a 1000-nit highlight stays inside the code range.
-        let white = tone_curve(SDR_WHITE_NITS);
+        let white = tone_curve(SDR_WHITE_NITS, SHOULDER);
         assert!((0.70..0.85).contains(&white), "203 nits maps to {white}");
-        let highlight = tone_curve(1000.0);
+        let highlight = tone_curve(1000.0, SHOULDER);
         assert!(
             highlight > white && highlight < 1.0,
             "a 1000-nit highlight maps to {highlight}"
         );
-        assert!(tone_curve(10_000.0) <= 1.0, "nothing may exceed white");
+        assert!(
+            tone_curve(10_000.0, SHOULDER) <= 1.0,
+            "nothing may exceed white"
+        );
+    }
+
+    #[test]
+    fn a_scene_peak_aims_the_shoulder_at_the_top_of_the_range() {
+        // Every peak the RPU can report is put just short of white, while the
+        // mid-tones only shift within the band the fixed curve already uses.
+        for peak in [300.0f32, 1_000.0, 4_000.0, 10_000.0] {
+            let shoulder = shoulder_for_peak(peak);
+            let landed = tone_curve(peak, shoulder);
+            assert!(
+                (TARGET_PEAK - 0.02..=TARGET_PEAK + 0.02).contains(&landed),
+                "a {peak}-nit peak landed at {landed}"
+            );
+            // Mid-tones adapt with the scene, but only gently: reference white
+            // stays inside the band the fixed curve already leaves it in.
+            let white = tone_curve(SDR_WHITE_NITS, shoulder);
+            assert!(
+                (0.70..=0.90).contains(&white),
+                "reference white moved to {white} for a {peak}-nit scene"
+            );
+        }
+        // A dimmer scene is not compressed as hard as the fixed curve would be:
+        // that is the whole point of reading level 1.
+        let dim = shoulder_for_peak(400.0);
+        assert!(tone_curve(400.0, dim) > tone_curve(400.0, SHOULDER));
+    }
+
+    #[test]
+    fn a_scene_peak_reaches_the_mapper() {
+        let info = HdrInfo {
+            kind: HdrKind::Pq,
+            bt2020: true,
+            dovi: None,
+        };
+        let plain = ToneMapper::new(info);
+        assert_eq!(plain.shoulder(), SHOULDER);
+        assert!(plain.scene_peak_nits().is_none());
+
+        let aimed = ToneMapper::with_scene_peak(info, Some(600.0));
+        assert_eq!(aimed.scene_peak_nits(), Some(600.0));
+        assert!(aimed.shoulder() < plain.shoulder());
+    }
+
+    #[test]
+    fn a_dolby_vision_record_names_the_base_layer_transfer() {
+        let record = |compatibility: u8| DoviConfig {
+            version_major: 1,
+            version_minor: 0,
+            profile: 8,
+            level: 9,
+            rpu_present: true,
+            el_present: false,
+            bl_present: true,
+            bl_compatibility_id: compatibility,
+        };
+        // The compatibility id beats a container that said nothing, and it beats
+        // one that said the wrong thing: an HLG base layer is HLG.
+        assert_eq!(record(4).base_layer_kind(HdrKind::Sdr), HdrKind::Hlg);
+        assert_eq!(record(4).base_layer_kind(HdrKind::Pq), HdrKind::Hlg);
+        assert_eq!(record(1).base_layer_kind(HdrKind::Sdr), HdrKind::Pq);
+        assert_eq!(record(6).base_layer_kind(HdrKind::Sdr), HdrKind::Pq);
+        // `2` (SDR) and `0` (DV only) name no transfer function, so the tags
+        // stand — except that a DV-only base layer with no tags at all is the
+        // PQ-coded signal the specification defines.
+        assert_eq!(record(2).base_layer_kind(HdrKind::Hlg), HdrKind::Hlg);
+        assert_eq!(record(0).base_layer_kind(HdrKind::Hlg), HdrKind::Hlg);
+        assert_eq!(record(0).base_layer_kind(HdrKind::Sdr), HdrKind::Pq);
     }
 
     #[test]

@@ -159,6 +159,10 @@ pub struct EngineConfig {
     pub hardware_decoding: bool,
     /// Bring HDR (PQ / HLG) frames into the range an SDR display can show.
     pub hdr_tone_map: bool,
+    /// Apply the Dolby Vision reshaping the RPU describes (see
+    /// `mvp_core::dolby::reshape`; off by default because only half of it has
+    /// been checked against a reference).
+    pub dv_reshape: bool,
     /// Open the audio device and play sound.
     pub audio_enabled: bool,
     /// Output device name; `None` means the system default.
@@ -188,6 +192,7 @@ impl Default for EngineConfig {
         Self {
             hardware_decoding: true,
             hdr_tone_map: true,
+            dv_reshape: false,
             audio_enabled: true,
             audio_device: None,
             volume: 1.0,
@@ -342,6 +347,8 @@ pub(crate) struct Shared {
     pub hw_decoding: AtomicBool,
     /// Bring HDR frames into SDR range on the way to the screen.
     pub hdr_tone_map: AtomicBool,
+    /// Apply the Dolby Vision reshaping on the way to the screen.
+    pub dv_reshape: AtomicBool,
     pub audio_delay_bits: AtomicU64,
     pub subtitle_delay_bits: AtomicU64,
     pub ab_loop: Mutex<Option<(f64, f64)>>,
@@ -415,6 +422,7 @@ impl Shared {
             looping: AtomicBool::new(false),
             hw_decoding: AtomicBool::new(config.hardware_decoding),
             hdr_tone_map: AtomicBool::new(config.hdr_tone_map),
+            dv_reshape: AtomicBool::new(config.dv_reshape),
             audio_delay_bits: AtomicU64::new(0.0f64.to_bits()),
             subtitle_delay_bits: AtomicU64::new(0.0f64.to_bits()),
             ab_loop: Mutex::new(None),
@@ -1077,6 +1085,20 @@ impl Engine {
     /// `true` when HDR frames are being tone mapped for display.
     pub fn hdr_tone_map(&self) -> bool {
         self.shared.hdr_tone_map.load(Ordering::Relaxed)
+    }
+
+    /// Turn the Dolby Vision reshaping on or off.
+    ///
+    /// Takes effect on the next frame, like [`Engine::set_hdr_tone_map`], and
+    /// costs nothing while it is off: the converter never enters the reshaping
+    /// pass at all.
+    pub fn set_dv_reshape(&self, enabled: bool) {
+        self.shared.dv_reshape.store(enabled, Ordering::Relaxed);
+    }
+
+    /// `true` when the Dolby Vision reshaping is being applied.
+    pub fn dv_reshape(&self) -> bool {
+        self.shared.dv_reshape.load(Ordering::Relaxed)
     }
 
     /// Tell the engine the size the video is displayed at, so frames can be

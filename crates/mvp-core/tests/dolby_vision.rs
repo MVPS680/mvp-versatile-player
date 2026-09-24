@@ -137,9 +137,90 @@ fn probes_a_dolby_vision_file() {
         info.primary_video().is_some(),
         "a Dolby Vision file still has a base layer"
     );
+    // The base layer's transfer function comes from the record's compatibility
+    // id, not from an assumption that Dolby Vision is always PQ: a Profile 8.4
+    // file is an HLG file, and tone mapping it with the PQ curve is what made it
+    // look washed out.
+    let video = info.primary_video();
+    let record = video.and_then(|video| video.hdr.dovi);
+    if let (Some(video), Some(record)) = (video, record) {
+        assert_eq!(
+            video.hdr.kind,
+            record.base_layer_kind(mvp_core::HdrKind::Sdr),
+            "{} is compatibility id {}",
+            record.label(),
+            record.bl_compatibility_id
+        );
+        eprintln!(
+            "  dolby vision: {} -> base layer {}",
+            record.label(),
+            video.hdr.kind.label()
+        );
+    }
     for (label, value) in mvp_core::info::info_rows(&info) {
         eprintln!("  row: {label} = {value}");
     }
+}
+
+/// The reference picture units of the file, read straight from its frames.
+///
+/// `dolby::probe_rpus` is what the player's Dolby Vision path is built on and
+/// what `examples/dv_probe.rs` prints, so it is checked against a real stream
+/// rather than only against a hand-built record: a header's bit depths, the
+/// signal an RPU names and the reshaping it carries are facts a file either has
+/// or does not.
+#[test]
+fn reads_the_reference_picture_units_of_a_dolby_vision_file() {
+    let Some(path) = sample() else {
+        return;
+    };
+    let rpus = mvp_core::dolby::probe_rpus(&path, 4).expect("the sample decodes");
+    assert!(
+        !rpus.is_empty(),
+        "not one of the first four frames carried a reference picture unit, \
+         so the file is not Dolby Vision or the reader lost it"
+    );
+
+    for rpu in &rpus {
+        let header = rpu.header.expect("an RPU carries a header");
+        assert!(
+            (8..=16).contains(&header.bl_bit_depth)
+                && (8..=16).contains(&header.vdr_bit_depth),
+            "bit depths out of range: {header:?}"
+        );
+        assert!(rpu.color.is_some(), "an RPU carries colour metadata");
+        assert!(rpu.mapping.is_some(), "an RPU carries a mapping");
+        let signal = rpu.signal().expect("the colour metadata reads");
+        assert!((8..=16).contains(&signal.bit_depth), "{signal:?}");
+        assert!(
+            rpu.peak_nits().is_some(),
+            "neither level 1 nor the master's window named a luminance"
+        );
+    }
+
+    // And the decision the renderer makes from that metadata, with the file's own
+    // record in hand as the renderer has it: a base layer with a transfer
+    // function of its own, rather than a file that cannot be shown.
+    let record = mvp_core::info::probe(&path)
+        .expect("probe must succeed")
+        .primary_video()
+        .and_then(|video| video.hdr.dovi);
+    let plan = mvp_core::DvPlan::resolve(record, rpus.first(), mvp_core::HdrKind::Sdr)
+        .expect("a frame with an RPU is Dolby Vision");
+    assert_eq!(plan.render, mvp_core::DvRender::BaseLayer);
+    assert!(plan.transfer.is_hdr(), "{}", plan.transfer.label());
+    if let Some(record) = record {
+        assert_eq!(
+            plan.transfer,
+            record.base_layer_kind(mvp_core::HdrKind::Sdr)
+        );
+    }
+    eprintln!("  plan: {}", plan.summary(true));
+    for caveat in plan.caveats() {
+        eprintln!("  caveat: {caveat}");
+    }
+    eprintln!("  scene: {:?}", rpus[0].scene());
+    eprintln!("  mapping: {:?}", rpus[0].mapping);
 }
 
 /// Software decoding of the base layer must produce real pixels.
@@ -209,7 +290,17 @@ fn seeks_inside_a_dolby_vision_file() {
     let engine = engine(false);
     engine.open(MediaSource::Path(path)).expect("open");
     let info = wait_for_open(&engine, Duration::from_secs(20));
-    assert!(info.duration > 10.0, "sample is too short to seek in");
+    // A phone-length clip cannot demonstrate a seek, and the fixture is the
+    // caller's; skipping says so, where failing would only report the length of
+    // somebody's sample.
+    if info.duration <= 10.0 {
+        eprintln!(
+            "skipping: the sample is {:.1}s long, too short to seek inside",
+            info.duration
+        );
+        engine.stop();
+        return;
+    }
 
     let started = Instant::now();
     let frames = collect_frames(&engine, 2, Duration::from_secs(30));

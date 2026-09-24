@@ -12,7 +12,7 @@ use crate::icons::Icon;
 use crate::settings::{AspectMode, EndAction};
 use crate::state::SettingsTab;
 use crate::state::{Overlay, Toast};
-use crate::theme::{font, space, Tokens};
+use crate::theme::{font, space, Palette, Tokens};
 use crate::ui::surface;
 use crate::ui::widgets;
 
@@ -155,6 +155,16 @@ pub fn draw(app: &mut PlayerApp, ctx: &Context) {
 }
 
 fn general_page(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
+    widgets::section(ui, tokens, "外观");
+    // The whole interface recolours the moment this changes, which is why it is the
+    // first row on the page: it is the one setting whose effect needs no explanation.
+    let mut palette = app.settings.palette;
+    if widgets::combo_row(ui, tokens, "主题配色", &mut palette, &Palette::choices()) {
+        // Not only a field: the colours are installed into egui's own style, and
+        // `set_palette` is what does that and remembers the choice in `settings.json`.
+        app.set_palette(ui.ctx(), palette);
+    }
+
     widgets::section(ui, tokens, "启动与播放");
     let mut changed = false;
     changed |= widgets::switch_row(
@@ -275,7 +285,21 @@ fn video_page(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
         &mut app.settings.hdr_tone_map,
         "把 HDR10 / 杜比视界的 PQ、HLG 画面压到 SDR 显示范围：\
          203 尼特以下原样保留，高光柔和收敛，避免整幅画面发灰。\
-         若显示器本身支持 HDR，建议关闭。",
+         关闭后不做任何色调映射，直接输出原片信号（原片直通），\
+         适合外接 HDR 显示设备或交给后续处理。\
+         杜比视界的基底层传输函数由文件自身的兼容层决定（HLG 文件按 HLG 处理），\
+         与这个开关无关。",
+    );
+
+    changed |= widgets::switch_row(
+        ui,
+        tokens,
+        "杜比视界重塑",
+        &mut app.settings.dv_reshape,
+        "按 RPU 描述的重塑曲线还原基底层（Dolby Vision 的色调整形）。\
+         默认关闭：亮度曲线已与 libplacebo 在真实素材上对照（效果量级一致），\
+         色度曲线尚未通过对照，开启后画面可能与杜比视界设备不同。\
+         关闭时完全不进入该处理，开销为零。",
     );
 
     widgets::section(ui, tokens, "画面调节");

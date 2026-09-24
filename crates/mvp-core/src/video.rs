@@ -11,8 +11,9 @@ use ffmpeg_next as ffmpeg;
 use ffmpeg::ffi;
 use parking_lot::Mutex;
 
+use crate::dolby::{DvMappingSummary, DvPlan, DvReshape, DvRpu};
 use crate::error::{MediaError, Result};
-use crate::hdr::{HdrInfo, ToneMapper};
+use crate::hdr::{DoviConfig, HdrInfo, ToneMapper};
 
 /// One decoded, display-ready video frame.
 #[derive(Debug, Clone)]
@@ -169,6 +170,381 @@ impl Geometry {
     }
 }
 
+/// What happened to the Dolby Vision reshaping on the frames arriving now.
+///
+/// The interface reports it — the information panel and the open-time notice —
+/// so a file whose reshaping could *not* be applied says so rather than looking
+/// like a file that needed none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DvReshapeState {
+    /// The preference is off, so nothing was attempted.
+    #[default]
+    Disabled,
+    /// The frames carry no reshaping, or one that provably changes nothing.
+    NotNeeded,
+    /// Applied to every frame as it arrives.
+    Applied,
+    /// The RPU describes a reshaping this player cannot apply to this stream.
+    Unsupported(&'static str),
+}
+
+/// One component's position inside a pixel of its plane.
+#[derive(Debug, Clone, Copy, Default)]
+struct ComponentLayout {
+    /// Which plane of the frame the component lives in.
+    plane: usize,
+    /// Byte offset within that plane's pixel.
+    byte: usize,
+    /// How many bytes the sample occupies.
+    bytes: usize,
+    /// Bits to shift the loaded word down by.
+    shift: u32,
+    /// Bits kept, once shifted.
+    mask: u32,
+}
+
+/// The pixel layout of a format the reshaping can be applied to.
+///
+/// Read from FFmpeg's own pixel-format descriptor, so 8, 10 and 12-bit samples,
+/// planar, semi-planar and packed arrangements all take the same path: a table
+/// of formats written out by hand here would be a table of formats to get wrong.
+#[derive(Debug, Clone, Copy)]
+struct FormatLayout {
+    /// Base layer plane, then Cb and Cr.
+    components: [ComponentLayout; 3],
+    /// Bytes one column step advances within each plane.
+    plane_pixel: [usize; 3],
+    /// Chroma is subsampled by `1 << log2_chroma_w` horizontally.
+    log2_chroma_w: u32,
+    /// And vertically.
+    log2_chroma_h: u32,
+}
+
+impl FormatLayout {
+    /// The code value a component holds at `(x, y)`.
+    ///
+    /// # Safety
+    ///
+    /// Every plane pointer must be the first byte of the corresponding plane of
+    /// a frame this layout was read from, with `strides` as the line sizes, and
+    /// `(x, y)` inside the frame.
+    unsafe fn sample(
+        &self,
+        component: usize,
+        planes: &[*const u8; 3],
+        strides: &[isize; 3],
+        x: usize,
+        y: usize,
+    ) -> f32 {
+        let layout = self.components[component];
+        let pixel = self.plane_pixel[layout.plane];
+        let stride = strides[layout.plane] as usize;
+        // SAFETY: the caller guarantees the plane and that `(x, y)` is inside it.
+        let address = unsafe {
+            planes[layout.plane].add(y.wrapping_mul(stride).wrapping_add(x * pixel + layout.byte))
+        };
+        // SAFETY: as above, plus: the descriptor says how many bytes the sample
+        // occupies at that address. It is unaligned on purpose — a packed
+        // format's third component sits at an odd byte.
+        let word = unsafe {
+            match layout.bytes {
+                1 => u32::from(*address),
+                _ => u32::from(std::ptr::read_unaligned(address as *const u16)),
+            }
+        };
+        ((word >> layout.shift) & layout.mask) as f32
+    }
+
+    /// Write a component's code value back at `(x, y)`, leaving whatever shares
+    /// the word with it alone.
+    ///
+    /// # Safety
+    ///
+    /// As [`FormatLayout::sample`], with a writable plane pointer.
+    unsafe fn store(
+        &self,
+        component: usize,
+        planes: &[*mut u8; 3],
+        strides: &[isize; 3],
+        x: usize,
+        y: usize,
+        value: f32,
+    ) {
+        let layout = self.components[component];
+        let pixel = self.plane_pixel[layout.plane];
+        let stride = strides[layout.plane] as usize;
+        // SAFETY: the caller guarantees the plane and that `(x, y)` is inside it.
+        let address = unsafe {
+            planes[layout.plane].add(y.wrapping_mul(stride).wrapping_add(x * pixel + layout.byte))
+        };
+        let code = ((value.clamp(0.0, 1.0) * layout.mask as f32).round() as u32) & layout.mask;
+        let shifted = layout.mask << layout.shift;
+        // SAFETY: as for `sample`; the read-modify-write keeps whatever else
+        // shares this word.
+        unsafe {
+            match layout.bytes {
+                1 => {
+                    let old = u32::from(*address);
+                    *address = ((old & !shifted) | (code << layout.shift)) as u8;
+                }
+                _ => {
+                    let word = u32::from(std::ptr::read_unaligned(address as *const u16));
+                    std::ptr::write_unaligned(
+                        address as *mut u16,
+                        ((word & !shifted) | (code << layout.shift)) as u16,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The layout of `format`, when the reshaping can be applied to it.
+///
+/// `None` for anything that is not three components of one sample each: RGB,
+/// paletted, bitstream and hardware formats, and any format whose samples span
+/// more than two bytes or whose chroma is subsampled by more than four.
+fn layout_for(format: ffi::AVPixelFormat) -> Option<FormatLayout> {
+    // SAFETY: `av_pix_fmt_desc_get` returns a pointer into a table owned by
+    // FFmpeg, or null for a format it does not know; every field read below is a
+    // plain scalar.
+    let desc = unsafe { ffi::av_pix_fmt_desc_get(format) };
+    if desc.is_null() {
+        return None;
+    }
+    let desc = unsafe { &*desc };
+    let rejected = ffi::AV_PIX_FMT_FLAG_RGB as u64
+        | ffi::AV_PIX_FMT_FLAG_PAL as u64
+        | ffi::AV_PIX_FMT_FLAG_BITSTREAM as u64
+        | ffi::AV_PIX_FMT_FLAG_HWACCEL as u64;
+    if desc.nb_components != 3 || (desc.flags & rejected) != 0 {
+        return None;
+    }
+    let mut components = [ComponentLayout::default(); 3];
+    for (c, slot) in components.iter_mut().enumerate() {
+        let comp = desc.comp[c];
+        // `depth` 0 means "not set"; more than 16 bits cannot be read as two
+        // bytes, and the third plane is as far as any format in use goes.
+        if comp.depth <= 0 || comp.depth > 16 || comp.plane < 0 || comp.plane > 2 || comp.offset < 0
+        {
+            return None;
+        }
+        let bytes = ((comp.offset & 7) + comp.depth + 7) / 8;
+        if bytes > 2 {
+            return None;
+        }
+        *slot = ComponentLayout {
+            plane: comp.plane as usize,
+            byte: (comp.offset / 8) as usize,
+            bytes: bytes as usize,
+            shift: comp.shift as u32,
+            mask: (1u32 << comp.depth) - 1,
+        };
+    }
+    let mut plane_pixel = [0usize; 3];
+    for layout in &components {
+        plane_pixel[layout.plane] = plane_pixel[layout.plane].max(layout.byte + layout.bytes);
+    }
+    if desc.log2_chroma_w > 2 || desc.log2_chroma_h > 2 {
+        return None;
+    }
+    Some(FormatLayout {
+        components,
+        plane_pixel,
+        log2_chroma_w: u32::from(desc.log2_chroma_w),
+        log2_chroma_h: u32::from(desc.log2_chroma_h),
+    })
+}
+
+/// Rewrite a frame's components through `reshape`.
+///
+/// `Err` carries the reason this stream cannot be rewritten, in Chinese, for the
+/// interface to show: a reshaping that silently did nothing would leave the user
+/// comparing a picture to a Dolby Vision device's with no idea why they differ.
+fn apply_reshape(
+    reshape: &DvReshape,
+    src: &ffmpeg::frame::Video,
+) -> std::result::Result<Option<ffmpeg::frame::Video>, &'static str> {
+    let Some(layout) = layout_for(src.format().into()) else {
+        return Err("像素格式不支持重塑");
+    };
+    // The pivots are coded in the base layer's bit depth, so a stream whose
+    // samples are a different depth would need the two domains reconciled;
+    // guessing that mapping could only make the picture wrong.
+    let depth = layout.components[0].mask.count_ones() as u8;
+    if depth != reshape.base_layer_bit_depth() {
+        return Err("位深与 RPU 声明不一致");
+    }
+    // A frame whose lines are shorter than a row, or absurdly long, is not
+    // something this reader can walk: `stride()` reports FFmpeg's "unknown"
+    // `-1` as a huge `usize`, and a row it does not cover would read another
+    // plane's memory.
+    const MAX_PADDING: usize = 64 * 1024;
+    let row_bytes = [
+        (src.width() as usize) * layout.plane_pixel[0],
+        ((src.width() as usize) >> layout.log2_chroma_w) * layout.plane_pixel[1],
+        ((src.width() as usize) >> layout.log2_chroma_w) * layout.plane_pixel[2],
+    ];
+    for (plane, row) in row_bytes.into_iter().enumerate() {
+        let stride = src.stride(plane);
+        if stride < row || stride > row + MAX_PADDING {
+            return Err("行跨距不支持重塑");
+        }
+    }
+    let mut out = ffmpeg::frame::Video::new(src.format(), src.width(), src.height());
+    // SAFETY: both frames are alive and have the same format and geometry, which
+    // is what `av_frame_copy` requires. The copy is also what makes the
+    // read-modify-write of a packed format's shared word safe.
+    unsafe {
+        ffi::av_frame_copy(out.as_mut_ptr(), src.as_ptr());
+    }
+    reshape_components(&layout, reshape, src, &mut out);
+    Ok(Some(out))
+}
+
+/// Rewrite every component of a frame through the Dolby Vision reshaping.
+///
+/// `out` must already hold a copy of `src`: a packed or semi-planar format has
+/// components sharing a word, and the write-back keeps the bits that belong to
+/// the others.
+///
+/// The chroma is reshaped at its own resolution, using the co-sited luma sample
+/// — the top-left of the group it serves — which is where a decoder's own
+/// reshaping stage sits: the curves belong to the decoded components, and the
+/// conversion to RGB that follows is what upsamples them.
+fn reshape_components(
+    layout: &FormatLayout,
+    reshape: &DvReshape,
+    src: &ffmpeg::frame::Video,
+    out: &mut ffmpeg::frame::Video,
+) {
+    let width = src.width() as usize;
+    let height = src.height() as usize;
+    // SAFETY: both frames are alive for the call, have the same format and
+    // geometry, and the loops stay inside `width x height` — and inside the
+    // chroma planes, which are that divided by the subsampling.
+    unsafe {
+        let src_planes = [
+            src.data(0).as_ptr(),
+            plane_ptr(src, 1),
+            plane_ptr(src, 2),
+        ];
+        let strides = [
+            src.stride(0) as isize,
+            src.stride(1) as isize,
+            src.stride(2) as isize,
+        ];
+        let out_planes = [
+            out.data_mut(0).as_mut_ptr(),
+            plane_ptr_mut(out, 1),
+            plane_ptr_mut(out, 2),
+        ];
+
+        // The base layer: every luma sample, with the chroma co-sited to it.
+        for y in 0..height {
+            for x in 0..width {
+                let cx = x >> layout.log2_chroma_w;
+                let cy = y >> layout.log2_chroma_h;
+                let bl = codes(layout, &src_planes, &strides, x, y, cx, cy);
+                let reshaped = reshape.apply(bl, None);
+                layout.store(0, &out_planes, &strides, x, y, reshaped[0]);
+            }
+        }
+
+        // The chroma: every chroma sample, with the base-layer sample it serves.
+        let chroma_width = width >> layout.log2_chroma_w;
+        let chroma_height = height >> layout.log2_chroma_h;
+        for cy in 0..chroma_height {
+            for cx in 0..chroma_width {
+                let (lx, ly) = (cx << layout.log2_chroma_w, cy << layout.log2_chroma_h);
+                let bl = codes(layout, &src_planes, &strides, lx, ly, cx, cy);
+                let reshaped = reshape.apply(bl, None);
+                layout.store(1, &out_planes, &strides, cx, cy, reshaped[1]);
+                layout.store(2, &out_planes, &strides, cx, cy, reshaped[2]);
+            }
+        }
+    }
+}
+
+/// One pixel's three components, normalized the way the RPU's coefficients
+/// expect: the code value over the component's own full scale, with no range
+/// expansion and no chroma centring — see `dolby/reshape.rs` for why that is the
+/// domain the pivots live in.
+///
+/// # Safety
+///
+/// As [`FormatLayout::sample`].
+unsafe fn codes(
+    layout: &FormatLayout,
+    planes: &[*const u8; 3],
+    strides: &[isize; 3],
+    x: usize,
+    y: usize,
+    cx: usize,
+    cy: usize,
+) -> [f32; 3] {
+    let mut out = [0.0f32; 3];
+    for (component, slot) in out.iter_mut().enumerate() {
+        let (sx, sy) = if component == 0 { (x, y) } else { (cx, cy) };
+        // SAFETY: the caller guarantees the planes and the coordinates.
+        let code = unsafe { layout.sample(component, planes, strides, sx, sy) };
+        *slot = code / layout.components[component].mask as f32;
+    }
+    out
+}
+
+/// A plane's first byte, or null when the format has no such plane.
+///
+/// # Safety
+///
+/// `frame` must be alive. The pointer is only dereferenced by the layout reader,
+/// which is told how many planes the format has.
+unsafe fn plane_ptr(frame: &ffmpeg::frame::Video, index: usize) -> *const u8 {
+    let plane = frame.data(index);
+    if plane.is_empty() {
+        std::ptr::null()
+    } else {
+        plane.as_ptr()
+    }
+}
+
+/// A plane's first byte, writable, or null when the format has no such plane.
+///
+/// # Safety
+///
+/// As [`plane_ptr`], and the pointer must not be used to write anywhere another
+/// borrow of the frame still holds.
+unsafe fn plane_ptr_mut(frame: &mut ffmpeg::frame::Video, index: usize) -> *mut u8 {
+    if frame.data(index).is_empty() {
+        return std::ptr::null_mut();
+    }
+    frame.data_mut(index).as_mut_ptr()
+}
+
+///
+/// At the 24–30 fps of real material this is a time constant of roughly a third
+/// of a second: fast enough to follow a scene cut, slow enough that per-frame
+/// metadata noise cannot make the brightness pump.
+const SCENE_SMOOTHING: f32 = 0.12;
+
+/// The luminance step, in nits, that a Dolby Vision mapper rebuild is
+/// quantised to.
+///
+/// The tables themselves are cheap, but rebuilding them for every frame would
+/// still be wasted work when level 1 wobbles by a nit; a bucket also keeps the
+/// build from being observable as flicker.
+const SCENE_PEAK_STEP: f32 = 32.0;
+
+/// A tone mapper together with the dynamic range and scene it was built for.
+struct MappedScene {
+    /// The frame's dynamic range; a change means a new mapper regardless.
+    info: HdrInfo,
+    /// Quantised scene peak, `0` when the frame carries no dynamic metadata.
+    bucket: u16,
+    /// The mapper itself.
+    mapper: ToneMapper,
+}
+
 /// Colour conversion + scaling from any FFmpeg pixel format to packed RGBA.
 ///
 /// The underlying `SwsContext` is cached across frames and only rebuilt when a
@@ -185,8 +561,41 @@ pub struct RgbaConverter {
     src_range: i32,
     /// Bring HDR frames into SDR range (the interface's preference).
     tone_map: bool,
-    /// Mapper built for the dynamic range of the frames currently arriving.
-    mapper: Option<(HdrInfo, ToneMapper)>,
+    /// Apply the Dolby Vision reshaping (the interface's preference, off by
+    /// default — see `dolby/reshape.rs`).
+    dv_reshape: bool,
+    /// Mapper built for the dynamic range and the scene currently arriving.
+    ///
+    /// A Dolby Vision file carries per-frame brightness metadata, so the mapper
+    /// is rebuilt when the *scene* changes rather than once per file; the
+    /// bucket quantises that so a fluctuating measurement cannot rebuild it on
+    /// every frame.
+    mapper: Option<MappedScene>,
+    /// Smoothed peak luminance of the Dolby Vision scene, in nits.
+    ///
+    /// Level 1 changes from frame to frame, and a tone curve that chased every
+    /// change would make the picture breathe. This is the smoothed value the
+    /// mapper is actually built from.
+    scene_peak: Option<f32>,
+    /// The file's Dolby Vision configuration record, when the container declares
+    /// one.
+    ///
+    /// It is set once per file and used as the fallback answer for what the base
+    /// layer is coded with: the record's compatibility id names an HLG base layer
+    /// as HLG, which neither the container's tags nor a "Dolby Vision is always
+    /// PQ" assumption does. See [`crate::dolby`].
+    dovi: Option<DoviConfig>,
+    /// The Dolby Vision reshaping the file describes, ready to apply.
+    ///
+    /// The curves do not change from frame to frame — only the brightness
+    /// metadata does — so they are built once and kept until the RPU's mapping
+    /// changes, which is a once-per-file event.
+    reshape: Option<DvReshape>,
+    /// The mapping [`Self::reshape`] was built from, so a change can be noticed
+    /// without rebuilding five kilobytes of coefficients every frame.
+    reshape_source: Option<DvMappingSummary>,
+    /// What happened to the reshaping on the frames arriving now.
+    reshape_state: DvReshapeState,
     /// Threads the tone map may use. See [`Self::spread_over_threads`].
     bands: usize,
     /// Milliseconds the last [`Self::convert`] spent tone mapping.
@@ -214,9 +623,28 @@ impl RgbaConverter {
             colorspace: 0,
             src_range: -1,
             tone_map: true,
+            dv_reshape: false,
             mapper: None,
+            scene_peak: None,
+            dovi: None,
+            reshape: None,
+            reshape_source: None,
+            reshape_state: DvReshapeState::default(),
             bands: tone_map_bands(),
             last_tone_map_ms: 0.0,
+        }
+    }
+
+    /// Declare what the file's Dolby Vision record says, if the container has one.
+    ///
+    /// Called once per opened file, before the first frame is converted. It is a
+    /// setter rather than a constructor argument for the same reason
+    /// [`Self::set_tone_map`] is: the record is known only once the demuxer has
+    /// described the file, and the converter already exists by then.
+    pub fn set_dovi_config(&mut self, config: Option<DoviConfig>) {
+        if self.dovi != config {
+            self.dovi = config;
+            self.mapper = None;
         }
     }
 
@@ -237,6 +665,15 @@ impl RgbaConverter {
         self.tone_map
     }
 
+    /// Turn the Dolby Vision reshaping on or off.
+    ///
+    /// Off by default, and off means *off*: the pass is not entered at all, so a
+    /// file whose reshaping is not wanted costs exactly what it did before this
+    /// existed. See `dolby/reshape.rs` for why the default is off.
+    pub fn set_dv_reshape(&mut self, enabled: bool) {
+        self.dv_reshape = enabled;
+    }
+
     /// Milliseconds the last conversion spent tone mapping, `0.0` when the
     /// frame needed none.
     pub fn last_tone_map_ms(&self) -> f32 {
@@ -254,11 +691,61 @@ impl RgbaConverter {
         dst_height: u32,
         pool: &FramePool,
     ) -> Result<Vec<u8>> {
-        let geometry = self.prepare(src, dst_width, dst_height)?;
+        // The Dolby Vision reshaping is applied to the *components*, so it
+        // happens before the scaler converts them to RGB and is a pass of its
+        // own: `pixels` is a rewritten copy of `src` when the file needs one.
+        // The metadata the tone map reads stays on `src` either way, because the
+        // copy carries no side data.
+        let reshaped = self.reshape_frame(src);
+        let pixels = reshaped.as_ref().unwrap_or(src);
+        let geometry = self.prepare(pixels, dst_width, dst_height)?;
         let mut out = pool.acquire(geometry.dst_bytes());
-        self.scale(src, &mut out, dst_width)?;
+        self.scale(pixels, &mut out, dst_width)?;
         self.apply_tone_map(src, &mut out);
         Ok(out)
+    }
+
+    /// What the reshaping is doing on the frames arriving now, for the interface
+    /// to report.
+    pub fn dv_reshape_state(&self) -> DvReshapeState {
+        self.reshape_state
+    }
+
+    /// Apply the file's Dolby Vision reshaping to `src`, if it describes one.
+    ///
+    /// `None` means "scale `src` as it is": either the file needs no reshaping
+    /// (the common case — most profiles leave the base layer alone) or this
+    /// stream cannot be rewritten, which [`DvReshapeState`] then says out loud
+    /// rather than leaving the user with a picture nobody can explain.
+    fn reshape_frame(&mut self, src: &ffmpeg::frame::Video) -> Option<ffmpeg::frame::Video> {
+        if !self.dv_reshape {
+            // Off means off: no RPU parsing, no copy, no pass.
+            self.reshape_state = DvReshapeState::Disabled;
+            return None;
+        }
+        let rpu = DvRpu::from_frame(src);
+        let mapping = rpu.as_ref().and_then(|rpu| rpu.mapping.as_ref());
+        let Some(mapping) = mapping else {
+            self.reshape = None;
+            self.reshape_source = None;
+            self.reshape_state = DvReshapeState::NotNeeded;
+            return None;
+        };
+        if self.reshape_source.as_ref() != Some(mapping) {
+            self.reshape_source = Some(mapping.clone());
+            self.reshape = DvReshape::from_mapping(mapping, rpu.as_ref().and_then(|r| r.header.as_ref()));
+        }
+
+        let (frame, state) = match self.reshape.as_ref() {
+            None => (None, DvReshapeState::Unsupported("映射无法解析")),
+            Some(reshape) if reshape.is_identity() => (None, DvReshapeState::NotNeeded),
+            Some(reshape) => match apply_reshape(reshape, src) {
+                Ok(frame) => (frame, DvReshapeState::Applied),
+                Err(reason) => (None, DvReshapeState::Unsupported(reason)),
+            },
+        };
+        self.reshape_state = state;
+        frame
     }
 
     /// Validate the frame, choose the colour matrix and make sure `self.ctx` is
@@ -399,8 +886,9 @@ impl RgbaConverter {
     ///
     /// This happens on the buffer the screen is about to show, rather than in
     /// the decoder: that buffer is already scaled to the window, so the cost
-    /// follows the display rather than the source. The mapper is rebuilt only
-    /// when a frame arrives with a different dynamic range.
+    /// follows the display rather than the source. The mapper is rebuilt when a
+    /// frame arrives with a different dynamic range, and — for Dolby Vision —
+    /// when the scene's own brightness has moved enough to matter.
     ///
     /// The work is per-pixel with no reads outside the pixel, so the buffer is
     /// split between threads — see [`RgbaConverter::tone_map_bands`] — and
@@ -411,19 +899,67 @@ impl RgbaConverter {
         if !self.tone_map {
             return;
         }
-        let info = HdrInfo::from_frame(src);
+        let mut info = HdrInfo::from_frame(src);
+        let rpu = DvRpu::from_frame(src);
+        // A Dolby Vision file decides its own dynamic range: the RPU is the most
+        // specific statement about a frame, the container's record is the next,
+        // and the tags the frame carries are the last resort. That is what makes
+        // an HLG-compatible base layer (Profile 8.4) an HLG file — running its
+        // code values through the PQ curve is what used to make such a file look
+        // washed out — and it is also what tells the player that a Profile 5 base
+        // layer is not a picture in any transfer function at all.
+        let plan = DvPlan::resolve(self.dovi, rpu.as_ref(), info.kind);
+        if let Some(plan) = &plan {
+            info.kind = plan.transfer;
+            info.bt2020 = true;
+        }
         if !info.needs_tone_map() {
             return;
         }
-        if self.mapper.as_ref().map(|(built, _)| *built) != Some(info) {
-            self.mapper = Some((info, ToneMapper::new(info)));
+        let peak = self.smoothed_scene_peak(rpu.as_ref().and_then(|rpu| rpu.peak_nits()));
+        let bucket = match peak {
+            Some(nits) => (nits / SCENE_PEAK_STEP).round().clamp(0.0, 30_000.0) as u16 + 1,
+            None => 0,
+        };
+        let needs_build = self
+            .mapper
+            .as_ref()
+            .map(|m| m.info != info || m.bucket != bucket)
+            .unwrap_or(true);
+        if needs_build {
+            self.mapper = Some(MappedScene {
+                info,
+                bucket,
+                mapper: ToneMapper::with_scene_peak(info, peak),
+            });
         }
-        let Some((_, mapper)) = &self.mapper else {
+        let Some(mapped) = &self.mapper else {
             return;
         };
         let started = std::time::Instant::now();
-        self.spread_over_threads(mapper, dst);
+        self.spread_over_threads(&mapped.mapper, dst);
         self.last_tone_map_ms = started.elapsed().as_secs_f32() * 1000.0;
+    }
+
+    /// Move the smoothed scene peak towards `target`, in nits.
+    ///
+    /// `None` means the frame carried no dynamic metadata; that resets the
+    /// adaptation rather than holding a peak that belongs to another scene.
+    fn smoothed_scene_peak(&mut self, target: Option<f32>) -> Option<f32> {
+        match target {
+            Some(target) if target.is_finite() && target > 0.0 => {
+                let smoothed = match self.scene_peak {
+                    Some(previous) => previous + (target - previous) * SCENE_SMOOTHING,
+                    None => target,
+                };
+                self.scene_peak = Some(smoothed);
+                Some(smoothed)
+            }
+            _ => {
+                self.scene_peak = None;
+                None
+            }
+        }
     }
 
     /// Run `mapper` over `dst`, on `self.bands` threads when it is worth it.

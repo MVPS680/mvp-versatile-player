@@ -10,7 +10,7 @@ use egui::{Context, TextureHandle, TextureOptions};
 use mvp_core::engine::{EngineConfig, EngineEvent, MediaSource, PlaybackState};
 use mvp_core::playlist::{self, Playlist, PlaylistItem};
 use mvp_core::util::MediaKind;
-use mvp_core::{Engine, ImageView, MediaInfo};
+use mvp_core::{DvPlan, Engine, ImageView, MediaInfo};
 use mvp_platform::power::SleepBlocker;
 use mvp_platform::single_instance::{AppInstance, IpcMessage};
 use mvp_subtitle::Subtitle;
@@ -22,7 +22,7 @@ use crate::state::{
     FrameHistory, InfoRow, Mode, Overlay, SettingsTab, ShownFrame, ThumbCache, Toast, ToastKind,
     UiState,
 };
-use crate::theme::Theme;
+use crate::theme::{Palette, Theme};
 
 /// Options the player was started with.
 #[derive(Debug, Clone, Default)]
@@ -225,12 +225,16 @@ impl PlayerApp {
         };
         settings.apply_launch_overrides(&launch);
 
-        let theme = Theme::default();
+        // The palette the user chose last time. Installed here rather than through
+        // `install_palette` because there is no `Self` yet — everything from here on
+        // is built with the colours already in place.
+        let theme = Theme::of(settings.palette);
         theme.install(&cc.egui_ctx);
 
         let engine_config = EngineConfig {
             hardware_decoding: settings.hardware_decoding,
             hdr_tone_map: settings.hdr_tone_map,
+            dv_reshape: settings.dv_reshape,
             audio_enabled: !args.no_audio,
             audio_device: settings.audio_device.clone(),
             volume: settings.volume,
@@ -252,6 +256,7 @@ impl PlayerApp {
         engine.set_subtitle_delay(settings.subtitle_delay);
         engine.set_hardware_decoding(settings.hardware_decoding);
         engine.set_hdr_tone_map(settings.hdr_tone_map);
+        engine.set_dv_reshape(settings.dv_reshape);
         // Published before the first file is opened: the sink is built later, and it
         // reads this block, so a persisted curve is in force from the first sample.
         engine.set_audio_enhance(settings.audio_enhance.snapshot());
@@ -973,6 +978,7 @@ impl PlayerApp {
         self.engine
             .set_looping(self.settings.repeat == playlist::RepeatMode::One);
         self.engine.set_hdr_tone_map(self.settings.hdr_tone_map);
+        self.engine.set_dv_reshape(self.settings.dv_reshape);
         self.playlist.set_repeat(self.settings.repeat);
         self.playlist.set_shuffle(self.settings.shuffle);
     }
@@ -1196,22 +1202,35 @@ impl PlayerApp {
     /// like a washed-out transfer. Saying what it is — and whether the player is
     /// tone mapping it — is the difference between "this player is broken" and
     /// "this player is doing what it can".
+    ///
+    /// A Dolby Vision file is described by [`DvPlan`], the same decision the
+    /// renderer makes per frame, so the notice cannot contradict the picture. It
+    /// is a warning when the file asks for something the player cannot do —
+    /// Profile 5's IPT base layer, a dual-layer file's enhancement layer, a
+    /// reshaping that is not applied — and an informational line otherwise.
     fn announce_dynamic_range(&mut self, info: &MediaInfo) {
         let Some(video) = info.primary_video() else {
             return;
         };
-        if !video.hdr.kind.is_hdr() && video.hdr.dovi.is_none() {
+        if let Some(plan) = DvPlan::resolve(video.hdr.dovi, None, video.hdr.kind) {
+            // The preference is not the same thing as the outcome: an SDR base
+            // layer is never mapped, whatever the switch says.
+            let tone_mapped = self.settings.hdr_tone_map && plan.transfer.is_hdr();
+            let summary = plan.summary(tone_mapped);
+            match plan.caveats().first() {
+                Some(caveat) => self.toast(Toast::warning(format!("{summary} · {caveat}"))),
+                None => self.toast(Toast::info(summary)),
+            }
+            return;
+        }
+        if !video.hdr.kind.is_hdr() {
             return;
         }
         let label = video.hdr.label();
-        if video.hdr.needs_dolby_renderer() {
-            self.toast(Toast::warning(format!(
-                "{label}：基底层为 IPT 编码，需要杜比视界渲染器才能正确还原，颜色可能不正确"
-            )));
-        } else if video.hdr.needs_tone_map() && self.settings.hdr_tone_map {
+        if self.settings.hdr_tone_map {
             self.toast(Toast::info(format!("{label} · 已做 HDR→SDR 色调映射")));
         } else {
-            self.toast(Toast::info(label));
+            self.toast(Toast::info(format!("{label} · 未做色调映射，原片直通")));
         }
     }
 
@@ -1326,6 +1345,35 @@ impl PlayerApp {
         ));
         self.engine
             .set_hardware_decoding(self.settings.hardware_decoding);
+        // The palette lives in egui's own `Style` rather than in the document the
+        // settings window edits, so anything that replaces the document wholesale —
+        // "reset all settings" — has to re-install it, or the interface keeps the old
+        // colours until the next launch.
+        self.install_palette(ctx);
+        self.store.mark_dirty();
+    }
+
+    /// Apply the palette the document names, now.
+    ///
+    /// The colours are baked into egui's `Style` by [`Theme::install`], so they are
+    /// not a field the next frame reads: a change takes effect through here or not at
+    /// all. Called on start-up, when the user picks a different palette, and after the
+    /// document is replaced wholesale — the three ways it can change.
+    pub fn install_palette(&mut self, ctx: &Context) {
+        self.theme = Theme::of(self.settings.palette);
+        self.theme.install(ctx);
+        // The frame being built has already read the old style, so ask for the next
+        // one rather than waiting for the pointer to move.
+        ctx.request_repaint();
+    }
+
+    /// Switch the interface palette, and remember the choice.
+    pub fn set_palette(&mut self, ctx: &Context, palette: Palette) {
+        if self.settings.palette == palette {
+            return;
+        }
+        self.settings.palette = palette;
+        self.install_palette(ctx);
         self.store.mark_dirty();
     }
 
