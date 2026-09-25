@@ -32,6 +32,10 @@ image.workspace = true
 mvp-core = { path = "../mvp-core" }
 mvp-platform = { path = "../mvp-platform" }
 mvp-subtitle = { path = "../mvp-subtitle" }
+# The check half of the updater: transport, version maths and the API model.
+# `default-features = false` keeps the zip reader and CRC32 (the `apply` half)
+# out of the player, which never unpacks a package itself.
+mvp-updater = { path = "../mvp-updater", default-features = false, features = ["check"] }
 
 [build-dependencies]
 embed-resource = "3"

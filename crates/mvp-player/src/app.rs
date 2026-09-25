@@ -14,13 +14,14 @@ use mvp_core::{Engine, ImageView, MediaInfo};
 use mvp_platform::power::SleepBlocker;
 use mvp_platform::single_instance::{AppInstance, IpcMessage};
 use mvp_subtitle::Subtitle;
+use mvp_updater::UpdateInfo;
 
 use crate::gl::picture_pass::{self, Adjusted, PicturePass, SnapshotJob, SnapshotSender};
 use crate::picture::{self, EnhanceState, PictureUniforms};
 use crate::settings::{LaunchOverrides, PictureSettings, Settings, SettingsStore};
 use crate::state::{
     FrameHistory, InfoRow, Mode, Overlay, SettingsTab, ShownFrame, ThumbCache, Toast, ToastKind,
-    UiState,
+    UiState, UpdateCheck, UpdateEvent, UpdateUi,
 };
 use crate::theme::Theme;
 
@@ -123,6 +124,18 @@ pub struct PlayerApp {
     /// answering for as long as it is up: no picture, no sidebar, no shortcuts, and Windows
     /// calling the process "not responding". `None` when no dialog is open.
     dialog_rx: Option<crossbeam_channel::Receiver<DialogResult>>,
+
+    /// The update check running on a thread of its own; its answer arrives here.
+    update_check_rx: Option<crossbeam_channel::Receiver<UpdateCheck>>,
+    /// The package download running on a thread of its own; progress and the
+    /// final result arrive here.
+    update_download_rx: Option<crossbeam_channel::Receiver<UpdateEvent>>,
+    /// When the one silent start-up check should run (`None` once it has, or
+    /// when the setting is off).
+    update_check_at: Option<Instant>,
+    /// The release the service last offered, kept so a failed download can be
+    /// retried without asking the service again.
+    last_update: Option<UpdateInfo>,
 
     /// The playlist.
     pub playlist: Playlist,
@@ -283,6 +296,10 @@ impl PlayerApp {
             snapshot_tx,
             snapshot_rx,
             dialog_rx: None,
+            update_check_rx: None,
+            update_download_rx: None,
+            update_check_at: None,
+            last_update: None,
             playlist,
             image: ImageView::new(),
             mode: Mode::Empty,
@@ -319,6 +336,13 @@ impl PlayerApp {
         app.ui.ffmpeg_config = mvp_core::ffmpeg_configuration();
         app.image.slideshow_interval = app.settings.slideshow_interval;
         app.image.animation_playing = app.settings.animate_images;
+        // One silent check a couple of seconds in: late enough not to compete
+        // with the first frame, early enough to be useful before the user looks
+        // for it.
+        app.update_check_at = app
+            .settings
+            .check_updates_on_startup
+            .then(|| Instant::now() + Duration::from_secs(2));
 
         // Apply the persisted window level once; sending it every frame would
         // make the window manager re-evaluate the stacking order 60 times a
@@ -1606,6 +1630,263 @@ impl PlayerApp {
     }
 
     // -----------------------------------------------------------------------
+    // Updates
+    // -----------------------------------------------------------------------
+
+    /// Ask the update service whether a newer release exists, on a thread of its own.
+    ///
+    /// `silent` is the start-up check: it says nothing unless there is something
+    /// to install. A manual check shows the dialog at once and answers "already
+    /// up to date" when there is nothing.
+    pub fn check_updates_async(&mut self, silent: bool) {
+        if self.update_check_rx.is_some() || self.update_download_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        self.update_check_rx = Some(rx);
+        if !silent {
+            self.ui.update = UpdateUi::Checking;
+            self.ui.open_overlay(Overlay::Update);
+        }
+        // The player's own version, which is what the service compares against.
+        let client = env!("CARGO_PKG_VERSION").to_string();
+        let _ = std::thread::Builder::new()
+            .name("mvp-update-check".to_owned())
+            .spawn(move || {
+                let check = match mvp_updater::api::fetch_latest_for(&client) {
+                    Ok(Some(info)) if info.update_is_available(&client) => {
+                        UpdateCheck::Available(info)
+                    }
+                    Ok(_) => UpdateCheck::UpToDate,
+                    Err(err) => UpdateCheck::Failed(format!("{err:#}")),
+                };
+                let _ = tx.send(check);
+            });
+    }
+
+    /// Start downloading the release the service offered.
+    pub fn start_update(&mut self) {
+        if self.update_download_rx.is_some() {
+            return;
+        }
+        let Some(info) = self.last_update.clone() else {
+            // Nothing remembered to install: asking the service again is the
+            // only sensible thing a "retry" can do.
+            self.check_updates_async(false);
+            return;
+        };
+        if self.updater_path().is_none() {
+            self.ui.update = UpdateUi::Failed(
+                "未找到更新器 updater.exe，请手动下载完整安装包解压覆盖（一次性）。".to_string(),
+            );
+            return;
+        }
+        let dest_dir = mvp_updater::config::download_dir();
+        if let Err(err) = std::fs::create_dir_all(&dest_dir) {
+            self.ui.update = UpdateUi::Failed(format!("无法创建更新目录：{err}"));
+            return;
+        }
+        let package = dest_dir.join(package_file_name(&info));
+
+        self.ui.update = UpdateUi::Downloading {
+            received: 0,
+            total: info.file_size,
+        };
+        let (tx, rx) = crossbeam_channel::unbounded();
+        self.update_download_rx = Some(rx);
+
+        let _ = std::thread::Builder::new()
+            .name("mvp-update-get".to_owned())
+            .spawn(move || {
+                // Progress is throttled: a 120 MB package is thousands of
+                // chunks, and the dialog only needs a handful of updates a
+                // second to look alive.
+                let mut last = Instant::now();
+                let computed = mvp_updater::net::download_to_file(
+                    &info.download_url,
+                    &package,
+                    &mut |received, total| {
+                        if last.elapsed() >= Duration::from_millis(100) {
+                            last = Instant::now();
+                            let _ = tx.send(UpdateEvent::Progress { received, total });
+                        }
+                    },
+                );
+                let done = match computed {
+                    Ok(digest) => match info.expected_sha256() {
+                        Some(expected) if !digest.eq_ignore_ascii_case(expected) => {
+                            let _ = std::fs::remove_file(&package);
+                            Err("下载的安装包校验失败（SHA-256 不匹配）".to_string())
+                        }
+                        _ => Ok(package),
+                    },
+                    Err(err) => Err(format!("{err:#}")),
+                };
+                let _ = tx.send(UpdateEvent::Done(done));
+            });
+    }
+
+    /// Dismiss the update dialog without updating.
+    pub fn dismiss_update(&mut self) {
+        self.ui.update = UpdateUi::Idle;
+        self.ui.close_overlay();
+    }
+
+    /// Pick up whatever the check or download thread has said, if anything.
+    fn poll_update(&mut self) {
+        self.poll_update_check();
+        self.poll_update_download();
+    }
+
+    fn poll_update_check(&mut self) {
+        let Some(rx) = self.update_check_rx.take() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(check) => match check {
+                UpdateCheck::Available(info) => {
+                    let forced = info.is_forced();
+                    self.last_update = Some(info.clone());
+                    self.ui.update = if forced {
+                        UpdateUi::ForceAvailable(info)
+                    } else {
+                        UpdateUi::Available(info)
+                    };
+                    self.ui.open_overlay(Overlay::Update);
+                }
+                UpdateCheck::UpToDate => {
+                    // Only a check the user asked for deserves an answer; the
+                    // start-up one was told to keep quiet.
+                    if matches!(self.ui.update, UpdateUi::Checking) {
+                        self.ui.update = UpdateUi::Idle;
+                        self.ui.close_overlay();
+                        self.toast(Toast::info("已是最新版本"));
+                    }
+                }
+                UpdateCheck::Failed(message) => {
+                    if matches!(self.ui.update, UpdateUi::Checking) {
+                        self.ui.update = UpdateUi::Failed(message);
+                    } else {
+                        log::warn!("检查更新失败：{message}");
+                    }
+                }
+            },
+            Err(crossbeam_channel::TryRecvError::Empty) => {
+                self.update_check_rx = Some(rx);
+            }
+            // The thread died without answering; drop the receiver.
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {}
+        }
+    }
+
+    fn poll_update_download(&mut self) {
+        let Some(rx) = self.update_download_rx.take() else {
+            return;
+        };
+        loop {
+            match rx.try_recv() {
+                Ok(UpdateEvent::Progress { received, total }) => {
+                    self.ui.update = UpdateUi::Downloading { received, total };
+                }
+                Ok(UpdateEvent::Done(result)) => {
+                    self.finish_update(result);
+                    return;
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => {
+                    self.update_download_rx = Some(rx);
+                    return;
+                }
+                Err(crossbeam_channel::TryRecvError::Disconnected) => return,
+            }
+        }
+    }
+
+    /// React to a finished download: launch the external updater, or show why
+    /// it could not be launched.
+    fn finish_update(&mut self, result: Result<PathBuf, String>) {
+        match result {
+            Ok(package) => match self.launch_updater(&package) {
+                Ok(()) => {
+                    self.ui.update = UpdateUi::Launching;
+                    // Flush the session before the updater restarts the player,
+                    // so the next launch restores where the user was.
+                    self.save_session();
+                    self.ui.close_requested = true;
+                }
+                Err(message) => self.ui.update = UpdateUi::Failed(message),
+            },
+            Err(message) => self.ui.update = UpdateUi::Failed(message),
+        }
+    }
+
+    /// Hand the verified package to the external updater and let it outlive us.
+    fn launch_updater(&self, package: &Path) -> Result<(), String> {
+        let exe = std::env::current_exe().map_err(|err| format!("无法定位程序：{err}"))?;
+        let target_dir = exe
+            .parent()
+            .ok_or_else(|| "无法定位安装目录".to_string())?
+            .to_path_buf();
+        let updater = target_dir.join("mvp-updater.exe");
+        if !updater.exists() {
+            return Err(
+                "未找到更新器 updater.exe，请手动下载完整安装包解压覆盖（一次性）。".to_string(),
+            );
+        }
+
+        // Run from a copy in the update directory: the updater replaces the
+        // executable in the install directory, and a running image cannot be
+        // replaced. The copy is what is safe to overwrite.
+        let work = mvp_updater::config::update_dir();
+        std::fs::create_dir_all(&work).map_err(|err| format!("无法创建更新目录：{err}"))?;
+        let updater_copy = work.join("mvp-updater.exe");
+        std::fs::copy(&updater, &updater_copy).map_err(|err| format!("无法准备更新器：{err}"))?;
+
+        let mut command = std::process::Command::new(&updater_copy);
+        command.arg("--target-dir").arg(&target_dir);
+        command.arg("--package").arg(package);
+        if let Some(sha) = self
+            .last_update
+            .as_ref()
+            .and_then(UpdateInfo::expected_sha256)
+        {
+            command.arg("--sha256").arg(sha);
+        }
+        command.arg("--parent-pid").arg(std::process::id().to_string());
+        if let Some(info) = self.last_update.as_ref() {
+            command.arg("--version").arg(&info.version);
+        }
+        command.arg("--restart").arg(&exe);
+        command
+            .spawn()
+            .map_err(|err| format!("无法启动更新器：{err}"))?;
+        Ok(())
+    }
+
+    /// Path of `mvp-updater.exe` beside the running player, if it is there.
+    fn updater_path(&self) -> Option<PathBuf> {
+        let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+        let path = dir.join("mvp-updater.exe");
+        path.exists().then_some(path)
+    }
+
+    /// The one start-up check, once the window has been up for a moment.
+    fn maybe_start_update_check(&mut self, ctx: &Context) {
+        let Some(at) = self.update_check_at else {
+            return;
+        };
+        let now = Instant::now();
+        if now < at {
+            // Nothing else is repainting yet; ask for the frame that fires it.
+            ctx.request_repaint_after(at - now);
+            return;
+        }
+        self.update_check_at = None;
+        if self.settings.check_updates_on_startup {
+            self.check_updates_async(true);
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Small media actions shared by the menu, the toolbar and the shortcuts
     // -----------------------------------------------------------------------
 
@@ -2321,6 +2602,17 @@ pub fn toast_color(theme: &Theme, kind: ToastKind) -> egui::Color32 {
     }
 }
 
+/// A sensible file name for the update package, taken from its download URL.
+fn package_file_name(info: &UpdateInfo) -> String {
+    info.download_url
+        .rsplit('/')
+        .next()
+        .map(|segment| segment.split(['?', '#']).next().unwrap_or(""))
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("MVP-Versatile-Player{}.zip", info.version))
+}
+
 impl eframe::App for PlayerApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.handle_ipc();
@@ -2353,6 +2645,13 @@ impl eframe::App for PlayerApp {
         // all this has to do here is pick its answer up.
         self.poll_dialog();
         if self.dialog_rx.is_some() {
+            ctx.request_repaint();
+        }
+        // The update flow runs on its own threads; all this does is start the
+        // timed start-up check and collect whatever they have said.
+        self.poll_update();
+        self.maybe_start_update_check(ctx);
+        if self.update_check_rx.is_some() || self.update_download_rx.is_some() {
             ctx.request_repaint();
         }
         // A minimized window has no picture to update, and a frame that is

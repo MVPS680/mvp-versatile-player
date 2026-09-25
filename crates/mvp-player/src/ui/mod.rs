@@ -318,7 +318,7 @@ fn handle_pointer_idle(app: &mut PlayerApp, ctx: &Context) {
 /// aside so typing a URL works normally.
 fn handle_keyboard(app: &mut PlayerApp, ctx: &Context) {
     if ctx.wants_keyboard_input() {
-        if ctx.input(|i| i.key_pressed(Key::Escape)) {
+        if ctx.input(|i| i.key_pressed(Key::Escape)) && !app.ui.update.blocks_close() {
             app.ui.close_overlay();
         }
         return;
@@ -364,7 +364,13 @@ fn handle_keyboard(app: &mut PlayerApp, ctx: &Context) {
             (Key::Space, false, _) => app.engine.toggle_pause(),
             (Key::K, false, _) => app.engine.toggle_pause(),
             (Key::Escape, _, _) => {
-                if app.ui.has_overlay() {
+                if app.ui.overlay == Overlay::Update {
+                    // A forced update, or one that is already downloading, has no
+                    // way out; the dialog says so and this agrees with it.
+                    if !app.ui.update.blocks_close() {
+                        app.dismiss_update();
+                    }
+                } else if app.ui.has_overlay() {
                     app.ui.close_overlay();
                 } else if app.ui.fullscreen {
                     app.toggle_fullscreen(ctx);

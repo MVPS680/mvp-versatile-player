@@ -184,6 +184,13 @@ fn general_page(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
         &mut app.settings.restore_playlist,
         "下次启动时恢复播放列表与选项",
     );
+    changed |= widgets::switch_row(
+        ui,
+        tokens,
+        "启动时检查更新",
+        &mut app.settings.check_updates_on_startup,
+        "启动后自动检查是否有新版本",
+    );
 
     widgets::section(ui, tokens, "播放结束");
     changed |= widgets::combo_row(
@@ -897,7 +904,7 @@ fn about_page(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
     ui.horizontal(|ui| {
         if ui.button(RichText::new("项目主页").size(font::SMALL)).clicked() {
             let _ = mvp_platform::shell::open_url(
-                "https://github.com/mvp-versatile-player/mvp-versatile-player",
+                "https://gitee.com/mvp-group1/mvp-versatile-player",
             );
         }
         if ui.button(RichText::new("查看快捷键").size(font::SMALL)).clicked() {

@@ -120,6 +120,26 @@
 - 深色标题栏、跟随主题；
 - 播放时阻止屏幕/系统休眠。
 
+### 自动更新
+
+- **检查更新**（`帮助 → 检查更新…`）：向自研的 **MVP Update Manager** 查询最新版本
+  （服务地址 `https://updateman.mvpclub.cc/`，产品标识 `MVP-Versatile-Player`），
+  有新版本时弹出对话框（版本号与更新说明），确认后走**下载 → 校验 → 交给外置更新器替换 → 自动重启**。
+- **启动时静默检查**（默认开启，设置 → 通用可关闭）：窗口出现后约 2 秒查一次，
+  只有发现新版本才提示，不打断播放；服务端尚未发布任何版本时（HTTP 404）按「已是最新」处理，
+  不报错、不打扰。
+- **整包 SHA-256 校验**：下载的发布包先与服务端登记的哈希比对，不匹配就删除重下；
+  解压时再逐文件校验 CRC32，**全部通过后才进入替换阶段**，安装目录全程不被触碰。
+- **只替换变化的文件**：外置更新器读取 zip 内的文件清单，与安装目录逐一比对（体积 + CRC32），
+  日常更新通常只写盘变化的主程序与更新器本身；用户自行放进目录的文件不会被删除。
+- **失败可回滚**：替换时先把旧文件改名为 `.old`，任一步失败即按记录反向还原并重启旧版；
+  更新日志在 `%APPDATA%\MVP-Versatile-Player\update\updater.log`。
+- **更新器是独立小程序**（`mvp-updater.exe`，随发布包一并分发）：不链接界面与 FFmpeg，体积很小；
+  它等主程序退出后再替换文件，因此能覆盖正在运行的主程序。
+- **旧版安装（发布包里没有 `mvp-updater.exe`）**：首次需手动下载完整包解压覆盖一次，
+  之后即可自动更新。
+- **不触碰用户数据**：更新只写安装目录，`%APPDATA%` 下的设置与播放记录不受影响。
+
 ### 界面
 
 - 暗色、低干扰的配色：画面才是主角，界面不与之竞争。
@@ -245,8 +265,17 @@ Visual Studio 自带的 LLVM。如果把 LLVM 装到 `C:\Program Files\LLVM`
 .\scripts\package.ps1
 ```
 
-产物在 `dist\MVP-Versatile-Player\`，包含可执行文件、全部 FFmpeg DLL、
-图标与说明文件。整个目录可以直接拷贝到别的机器运行，无需安装。
+产物有两份：
+
+- `dist\MVP-Versatile-Player\`：可执行文件、外置更新器、全部 FFmpeg DLL、图标与说明文件。
+  整个目录可以直接拷贝到别的机器运行，无需安装。
+- `dist\MVP-Versatile-Player<VERSION>.zip`：**发布用**的全量包，所有文件平铺在压缩包根目录——
+  外置更新器正是解压这个 zip 来替换文件的（zip 自身的文件清单即清单，不需要额外的 `manifest.json`）。
+
+脚本结束时会打印 `version` / `file_size` / `sha256` 三行，直接填进更新管理后台的「创建版本」表单即可
+（`sha256` 为整包哈希，客户端下载后会强制校验），上传 zip 后由后台生成 `download_url`。
+版本号取自 `Cargo.toml` 的 `[workspace.package].version`（语义化、**不带 `v` 前缀**），
+必须与后台登记的 `version` 完全一致——客户端就靠它判断是否需要更新。
 
 ---
 
@@ -306,6 +335,7 @@ crates/
 ├── mvp-core/       媒体引擎（FFmpeg 绑定、A/V 时钟、播放列表、图片查看器）
 ├── mvp-platform/   Windows 集成（文件关联、单实例 IPC、外壳、电源）
 ├── mvp-subtitle/   字幕解析（SRT / ASS / VTT / MicroDVD + 编码识别）
+├── mvp-updater/    自动更新（检查 + 下载 + 外置替换器 mvp-updater.exe）
 └── mvp-player/     egui 界面与应用程序
 ```
 
@@ -461,6 +491,8 @@ $env:RUST_LOG = "mvp_core=debug"   # 需要看内部细节时
 ## 已知限制
 
 - **仅支持 Windows**。`mvp-platform` 的其他平台分支可以编译，但功能是空实现。
+- **自动更新要求安装目录可写**（绿色版默认满足）：不做代码签名也不提权；安装到
+  `Program Files` 之类受保护目录时，更新器会明确报错并建议手动解压覆盖。
 - **图形字幕的坐标基于源字幕画布**：PGS 的坐标就是视频像素，位置精确；VobSub 使用
   自己的 DVD 画布（如 720×480），在分辨率差异较大的片源上会有轻微缩放偏差。
 - **HDR 色调映射是 CPU 上的近似实现**：按亮度曲线 + BT.2020→BT.709 矩阵逐像素换算，
@@ -509,6 +541,7 @@ $env:RUST_LOG = "mvp_core=debug"   # 需要看内部细节时
 │   ├── mvp-core/      FFmpeg 引擎、图片查看器、播放列表
 │   ├── mvp-platform/  Windows 集成
 │   ├── mvp-subtitle/  字幕解析
+│   ├── mvp-updater/   自动更新（外置更新器 mvp-updater.exe）
 │   └── mvp-player/    egui 界面（可执行文件）
 ├── scripts/           构建、打包、图标与测试素材生成（ffmpeg-env.ps1 是本机路径探测）
 ├── testdata/          端到端测试用的媒体文件（约 500 KB）

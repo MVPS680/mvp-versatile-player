@@ -1,0 +1,48 @@
+[package]
+name = "mvp-updater"
+description = "External updater for MVP-Versatile-Player: checks the update service, verifies the package, replaces files and restarts the player"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mvp-updater"
+path = "src/main.rs"
+# The binary is the *apply* half; the library's default is the *check* half that
+# the player links against. Building the binary therefore needs `apply` on.
+required-features = ["apply"]
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Whole-package integrity check; streaming, so it lives in the always-on part.
+sha2.workspace = true
+
+# Only the `apply` half understands the zip itself, so the archive reader and
+# the CRC32 the comparison is built on stay behind the feature.
+zip = { workspace = true, optional = true }
+crc32fast = { workspace = true, optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    # WinHTTP is the whole transport: system Schannel TLS, no extra crate.
+    "Win32_Networking_WinHttp",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[features]
+# `check` is the default so that a plain dependency on this crate carries just
+# the transport, the version maths and the API model — never `zip`.
+default = ["check"]
+check = []
+# `apply` is the external updater proper: unpack, compare, replace, roll back.
+# It implies `check` because the standalone mode drives the same API.
+apply = ["check", "dep:zip", "dep:crc32fast"]

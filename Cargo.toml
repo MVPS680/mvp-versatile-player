@@ -5,10 +5,11 @@ members = [
     "crates/mvp-platform",
     "crates/mvp-player",
     "crates/mvp-subtitle",
+    "crates/mvp-updater",
 ]
 
 [workspace.package]
-version = "1.0.2"
+version = "1.1.0"
 edition = "2021"
 rust-version = "1.85"
 license = "GPL-3.0-or-later"
@@ -32,6 +33,13 @@ bytemuck = "1.21"
 
 # FFI / platform
 windows = "0.62"
+
+# Updater: whole-package integrity + incremental file comparison
+sha2 = "0.10"
+crc32fast = "1.5"
+# Reading the release zip's central directory is all the updater needs, so only
+# the deflate codec is pulled in (the default feature set adds bzip2/zstd/aes).
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 # FFmpeg
 ffmpeg-next = "9.0.0"

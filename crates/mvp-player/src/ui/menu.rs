@@ -673,6 +673,12 @@ fn help_menu(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
         if item(ui, tokens, "键盘快捷键", "F1", true) {
             app.ui.open_overlay(Overlay::Shortcuts);
         }
+        // Disabled while a check or a download is already running: a second
+        // request would just be dropped, so it must not look clickable.
+        let update_busy = app.ui.update.is_busy();
+        if item(ui, tokens, "检查更新…", "", !update_busy) {
+            app.check_updates_async(false);
+        }
         if item(ui, tokens, "关于 MVP-Versatile-Player", "", true) {
             app.ui.open_overlay(Overlay::About);
         }
@@ -692,7 +698,7 @@ fn help_menu(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
         }
         if item(ui, tokens, "项目主页", "", true) {
             let _ = mvp_platform::shell::open_url(
-                "https://github.com/mvp-versatile-player/mvp-versatile-player",
+                "https://gitee.com/mvp-group1/mvp-versatile-player",
             );
         }
     });

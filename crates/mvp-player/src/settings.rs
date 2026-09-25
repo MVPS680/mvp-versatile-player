@@ -613,6 +613,12 @@ pub struct Settings {
     pub resume_min_seconds: f64,
     /// What to do at the end of the last file.
     pub end_action: EndAction,
+    /// Check the update service for a newer release shortly after start-up.
+    ///
+    /// On by default, but the check only ever *offers* an update; a silent
+    /// failure stays silent and a launch with nothing new to install is never
+    /// interrupted.
+    pub check_updates_on_startup: bool,
 
     // ---- video -----------------------------------------------------------
     /// Try hardware decoding.
@@ -761,6 +767,7 @@ impl Default for Settings {
             remember_position: true,
             resume_min_seconds: 15.0,
             end_action: EndAction::Playlist,
+            check_updates_on_startup: true,
 
             hardware_decoding: true,
             hdr_tone_map: true,

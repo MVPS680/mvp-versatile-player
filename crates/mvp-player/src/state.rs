@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use mvp_core::playlist::RepeatMode;
 use mvp_core::PlaybackState;
+use mvp_updater::UpdateInfo;
 
 use crate::icons::Icon;
 use crate::settings::SidebarTab;
@@ -194,6 +195,84 @@ pub enum Overlay {
     About,
     /// The keyboard shortcut reference.
     Shortcuts,
+    /// The check-update / download dialog.
+    Update,
+}
+
+/// The check-update flow, as the interface sees it.
+///
+/// The network work happens on threads of its own; this is the slice of that
+/// work the dialog needs to draw — a spinner, an offer, a progress bar. The
+/// terminal states are replaced by [`PlayerApp::poll_update`] as answers arrive
+/// on a channel.
+#[derive(Debug, Clone)]
+pub enum UpdateUi {
+    /// Nothing happening; no dialog.
+    Idle,
+    /// Asking the service; the dialog shows a spinner.
+    Checking,
+    /// A newer release is offered and may be postponed.
+    Available(UpdateInfo),
+    /// A newer release that cannot be postponed.
+    ForceAvailable(UpdateInfo),
+    /// The package is being downloaded; `total` is `None` when the server did
+    /// not declare a length.
+    Downloading {
+        /// Bytes received so far.
+        received: u64,
+        /// Declared total, when the server supplied a `Content-Length`.
+        total: Option<u64>,
+    },
+    /// The package is verified and the external updater has been launched; the
+    /// player is about to exit.
+    Launching,
+    /// The last attempt failed, with a message to show.
+    Failed(String),
+}
+
+impl UpdateUi {
+    /// Whether a check or a download is in progress, so a second one must be
+    /// refused and the menu entry disabled.
+    pub fn is_busy(&self) -> bool {
+        matches!(
+            self,
+            UpdateUi::Checking | UpdateUi::Downloading { .. } | UpdateUi::Launching
+        )
+    }
+
+    /// Whether the dialog may be dismissed right now.
+    ///
+    /// A forced update, and the window between "download finished" and the
+    /// process actually exiting, offer no way out.
+    pub fn blocks_close(&self) -> bool {
+        matches!(
+            self,
+            UpdateUi::ForceAvailable(_) | UpdateUi::Downloading { .. } | UpdateUi::Launching
+        )
+    }
+}
+
+/// What the background check thread reports back.
+pub enum UpdateCheck {
+    /// A newer release is available.
+    Available(UpdateInfo),
+    /// The running version is the latest (or nothing is published).
+    UpToDate,
+    /// The check could not be completed, with the reason.
+    Failed(String),
+}
+
+/// What the background download thread reports back.
+pub enum UpdateEvent {
+    /// Download progress.
+    Progress {
+        /// Bytes received so far.
+        received: u64,
+        /// Declared total, when known.
+        total: Option<u64>,
+    },
+    /// The download finished: the verified package path, or the failure reason.
+    Done(Result<PathBuf, String>),
 }
 
 /// A single row in the media-information list.
@@ -509,6 +588,8 @@ pub struct UiState {
 
     /// Currently open overlay.
     pub overlay: Overlay,
+    /// State of the check-update / download flow.
+    pub update: UpdateUi,
     /// Whether the picture-adjustment panel is open.
     ///
     /// Not an overlay on purpose: the panel must not dim the picture it is used to
@@ -700,6 +781,7 @@ impl Default for UiState {
             subtitle_textures: Vec::new(),
             playlist_selection: None,
             overlay: Overlay::None,
+            update: UpdateUi::Idle,
             picture_panel_open: false,
             audio_enhance_open: false,
             settings_tab: SettingsTab::default(),

@@ -19,7 +19,7 @@ on `PATH`. Use the wrapper instead of bare `cargo`:
 | Test one crate | `.\scripts\dev.ps1 test -p mvp-core` |
 | Clippy | `.\scripts\dev.ps1 clippy --workspace --all-targets` |
 | Registry tests (writes HKCU) | `.\scripts\dev.ps1 test -p mvp-platform --test registry_live -- --ignored --test-threads=1` |
-| Package | `.\scripts\package.ps1` → `dist\MVP-Versatile-Player\` |
+| Package | `.\scripts\package.ps1` → `dist\MVP-Versatile-Player\` **and** `dist\MVP-Versatile-Player<VERSION>.zip`; prints the `version` / `file_size` / `sha256` the update service's "create version" form wants |
 | Probe one file/URL | `cargo run -p mvp-core --example seek_probe -- <file-or-url> [seconds]` |
 
 `crates/mvp-core/examples/seek_probe.rs` is the smallest working example of
@@ -72,12 +72,26 @@ Custom repo scripts (not cargo): `scripts\setup-ffmpeg.ps1`,
 ```
 mvp-subtitle   pure parsing (no internal deps, #![forbid(unsafe_code)])
 mvp-platform   Windows integration only (no internal deps; stubs elsewhere)
+mvp-updater    update check + apply; also the `mvp-updater.exe` binary (no internal deps)
 mvp-core       FFmpeg engine, image viewer, playlist, probe, HDR  → mvp-subtitle
-mvp-player     egui UI + the only binary                        → all three
+mvp-player     egui UI + the only binary                    → all three + mvp-updater (check)
 ```
 
 Dependencies point one way only; `mvp-core` re-exports `mvp_subtitle as subtitle`
 so callers need only depend on `mvp-core`.
+
+- **The updater is two halves of one mechanism.** `mvp-player` links `mvp-updater`
+  with its `check` feature (WinHTTP transport + version maths) to ask the service,
+  download and verify the package; `mvp-updater.exe` — the same crate's binary,
+  built with the `apply` feature — waits for the player to exit, unpacks the flat
+  release zip, replaces only the files that actually changed and restarts the
+  player. The zip's own central directory **is** the manifest (no `manifest.json`),
+  the whole package is checked against the service's SHA-256 *before* unpacking,
+  and `404` from the service means "no version published yet", not an error.
+  `%APPDATA%\MVP-Versatile-Player\update\` holds the download, the staging area,
+  `install.json` (the fast path of the next comparison) and `updater.log`;
+  `config.rs` is the single place the service host and product id live. The
+  player disables the `apply` feature so it never links the zip reader.
 
 - **`mvp-core/src/engine.rs` and `mvp-core/src/engine/` coexist on purpose.**
   Rust 2018 layout: `engine.rs` *is* the `engine` module and declares
@@ -170,6 +184,9 @@ so callers need only depend on `mvp-core`.
 - **Reintroduce glass / blur / acrylic / translucency.** `ui/glass.rs` was
   deliberately deleted and replaced by the opaque `ui/surface.rs`; the product
   owner asked for this explicitly.
+- Do not add `egui`/`eframe` or any FFmpeg dependency to `mvp-updater`. It runs
+  headless (no window) and links no FFmpeg; staying small (release target is a few
+  MB) is a requirement, not a nicety.
 - Add UI for `AspectMode::Source` — a dead variant kept only to migrate old
   `settings.json` files.
 - "Clean up" unused declared dependencies; several are intentionally kept.
