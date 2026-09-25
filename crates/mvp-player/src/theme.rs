@@ -75,9 +75,9 @@ const fn hex(value: u32) -> Color32 {
 
 /// The colour palettes the player ships with, one at a time.
 ///
-/// [`Palette::Blue`] is what the player looked like before this was a setting, kept
-/// because that look is a legitimate preference. The rest are Morandi ones, which
-/// is what the interface is designed around; [`Palette::Clay`] is the default.
+/// [`Palette::Blue`] is what the player looked like before this was a setting, and
+/// it is the default again: what a fresh install gets. The rest are Morandi ones,
+/// which stay one click away in the settings page.
 ///
 /// Every variant is a *dark* palette. There is deliberately no light one and no
 /// "follow the system": `Theme::install` documents what following the OS theme
@@ -85,9 +85,9 @@ const fn hex(value: u32) -> Color32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum Palette {
     /// The original: Apple blue on neutral, faintly blue-grey surfaces.
+    #[default]
     Blue,
     /// Warm grey with a dusty clay accent.
-    #[default]
     Clay,
     /// Warm grey with a muted sage-green accent.
     Sage,
@@ -127,8 +127,8 @@ impl Palette {
     /// the marker on the palette that is actually the default.
     pub fn label(self) -> &'static str {
         match self {
-            Palette::Blue => "原版蓝",
-            Palette::Clay => "陶土灰（默认）",
+            Palette::Blue => "原版蓝（默认）",
+            Palette::Clay => "陶土灰",
             Palette::Sage => "灰绿",
             Palette::Slate => "雾蓝",
             Palette::Mauve => "藕紫",
@@ -1571,11 +1571,12 @@ mod tests {
         );
     }
 
-    /// The default is a Morandi palette: what the interface is designed around is
-    /// what a fresh install gets, and the original is the opt-in.
+    /// The default is the original palette: what a fresh install gets is the look
+    /// the player shipped with, and the Morandi ones are the opt-in.
     #[test]
-    fn the_default_palette_is_a_morandi_one() {
-        assert!(Palette::default().is_muted());
+    fn the_default_palette_is_the_original_one() {
+        assert!(!Palette::default().is_muted());
+        assert_eq!(Palette::default(), Palette::Blue);
         assert_eq!(Tokens::default(), Tokens::for_palette(Palette::default()));
     }
 

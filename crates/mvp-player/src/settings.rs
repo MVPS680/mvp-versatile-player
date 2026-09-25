@@ -1661,7 +1661,7 @@ mod tests {
     }
 
     /// A settings file written before the palette was a setting still loads, and
-    /// gives the user the palette the interface is designed around.
+    /// gives the user the default palette.
     #[test]
     fn a_document_from_before_the_palette_existed_gets_the_default_one() {
         assert_eq!(Palette::default(), Settings::default().palette);
