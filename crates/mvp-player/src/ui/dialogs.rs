@@ -211,7 +211,7 @@ fn about_dialog(app: &mut PlayerApp, ctx: &Context) {
                 }
                 if ui.button(RichText::new("项目主页").size(font::SMALL)).clicked() {
                     let _ = mvp_platform::shell::open_url(
-                        "https://github.com/mvp-versatile-player/mvp-versatile-player",
+                        "https://ffplayer.mvpclub.cc",
                     );
                 }
             });

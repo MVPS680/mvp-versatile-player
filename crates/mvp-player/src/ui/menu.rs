@@ -692,7 +692,7 @@ fn help_menu(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
         }
         if item(ui, tokens, "项目主页", "", true) {
             let _ = mvp_platform::shell::open_url(
-                "https://github.com/mvp-versatile-player/mvp-versatile-player",
+                "https://ffplayer.mvpclub.cc",
             );
         }
     });

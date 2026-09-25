@@ -921,7 +921,7 @@ fn about_page(app: &mut PlayerApp, ui: &mut Ui, tokens: &Tokens) {
     ui.horizontal(|ui| {
         if ui.button(RichText::new("项目主页").size(font::SMALL)).clicked() {
             let _ = mvp_platform::shell::open_url(
-                "https://github.com/mvp-versatile-player/mvp-versatile-player",
+                "https://ffplayer.mvpclub.cc",
             );
         }
         if ui.button(RichText::new("查看快捷键").size(font::SMALL)).clicked() {
