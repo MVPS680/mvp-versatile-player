@@ -1,0 +1,32 @@
+# 知识卡导出索引文件
+schema_version: 1
+locale: zh-CN
+branch: master
+nodes_managed: true
+exported_at: "2026-09-26T06:17:06Z"
+modules:
+    "":
+        dir_name: MVP-Versatile-Player Rust 工作区
+        title: MVP-Versatile-Player Rust 工作区
+        scope:
+            - README.md
+            - AGENTS.md
+            - .gitignore
+            - Cargo.toml
+            - Cargo.lock
+            - 9.24MVP-Versatile-Player2.0PPT.pptx
+            - LICENSE
+        source_files: []
+        children:
+            - scripts
+        depends_on: []
+        related_to: []
+    scripts:
+        dir_name: Windows 构建与打包辅助脚本集
+        title: Windows 构建与打包辅助脚本集
+        scope:
+            - scripts/
+        source_files: []
+        children: []
+        depends_on: []
+        related_to: []

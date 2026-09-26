@@ -1,0 +1,14 @@
+schema_version: 1
+module_path: ""
+title: MVP-Versatile-Player Rust 工作区
+scope:
+    - README.md
+    - AGENTS.md
+    - .gitignore
+    - Cargo.toml
+    - Cargo.lock
+    - 9.24MVP-Versatile-Player2.0PPT.pptx
+    - LICENSE
+source_files: []
+depends_on: []
+related_to: []
